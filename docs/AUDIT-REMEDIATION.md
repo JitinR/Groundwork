@@ -1,6 +1,6 @@
 # Groundwork audit remediation
 
-Implementation updated: **30 October 2026**. Baseline: `1a4a2b72194dedc5b2d98b1dffb4ba14b8dcc0bc` (the inspected deployment). Work is isolated on `codex/audit-priority-fixes`.
+Implementation updated: **2 November 2026**. Baseline: `1a4a2b72194dedc5b2d98b1dffb4ba14b8dcc0bc` (the inspected deployment). Application fixes were merged through PR #28; the patched pytest 9.0.3 dependency was merged through PR #29. Native runtime acceptance is isolated on `codex/native-runtime-acceptance`.
 
 This records the response to the 28 October application/AEC audit. It distinguishes implemented source changes and bounded verification from live deployment configuration, professional approval and operator decisions. No production data, subscriptions or permissions were changed. A tested branch does not establish that the public deployment has received its changes.
 
@@ -27,6 +27,8 @@ Groundwork remains a concept-design and preliminary-review workspace. The implem
 | Medium | Native feature readiness could be unclear | DWG status distinguishes loading, lookup failure, unavailable and available, with retry and stale-response cancellation. Plan copy explains that entitlement does not configure a worker. Free Linux runtime provisioning/acceptance is tracked separately from web capability availability. | Native DWG/OpenSees availability requires trusted pinned runtimes, enforced isolation, resource limits and an operationally connected worker. Do not infer live readiness from a local Linux installation or CI runner. The workbench remains the live status authority. |
 
 ## Verification evidence
+
+Real LibreDWG 0.13.4 and OpenSees 3.8.0 source builds and five native acceptance groups now pass on the existing WSL2 Ubuntu 26.04.1 host: measured confinement/resource limits, two closed-form solver cases, an actual application DXF/DWG round trip preserving a 10 m line and its units, and rejection/cancellation checks. No cloud account was provisioned or production worker enabled. See [native runtime evidence and scope](NATIVE-LINUX-ACCEPTANCE.md). GitHub also reports the pytest tmpdir alert #1 as fixed; the full external IFC schema/geometry check passes with pytest 9.0.3.
 
 The complete application suite passes **346 tests**: 155 server, 153 client, 12 studio, 2 mail-setup and 24 operations. `npm run lint` and `npm run build` pass. The integrated build preflight, isolated PostgreSQL-engine API flow and bounded SQLite/PostgreSQL-engine capacity checks have also passed. These are synthetic checks, not production latency measurements or an audit of the live managed database.
 

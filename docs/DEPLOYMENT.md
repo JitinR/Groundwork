@@ -144,6 +144,11 @@ backup restoration test. Record the release commit and rollback backup.
 
 ## Native worker status
 
+The pinned adapters now have executable, synthetic Linux runtime acceptance.
+See [Native Linux acceptance](NATIVE-LINUX-ACCEPTANCE.md) for the source hashes,
+isolation model, actual DWG/OpenSees reference results and reproduction commands.
+This verification is separate from connecting or releasing a live queue worker.
+
 `Dockerfile.worker` and the `native-worker-unverified` Compose profile are
 explicitly disabled scaffolding and are not a supported production worker.
 They do not start a second web authority. Do not enable the profile as an
