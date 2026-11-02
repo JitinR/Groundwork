@@ -1,0 +1,62 @@
+name: Native runtime acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.gitattributes'
+      - '.github/workflows/native-acceptance.yml'
+      - 'scripts/*native*'
+      - 'server/src/nativeAdapters.ts'
+      - 'server/src/engineeringBasis.ts'
+      - 'package-lock.json'
+  pull_request:
+    paths:
+      - '.gitattributes'
+      - '.github/workflows/native-acceptance.yml'
+      - 'scripts/*native*'
+      - 'server/src/nativeAdapters.ts'
+      - 'server/src/engineeringBasis.ts'
+      - 'package-lock.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  isolated-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build -w server
+      - run: node --import tsx scripts/generate-native-validation-fixtures.mjs
+      - name: Install Ubuntu source-build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential gfortran cmake curl ca-certificates xz-utils pkg-config tcl-dev tk-dev libblas-dev liblapack-dev libeigen3-dev libhdf5-dev zlib1g-dev python3 python3-dev util-linux
+      - name: Verify source hashes and build supported native versions
+        run: sudo env GROUNDWORK_NATIVE_BUILD_JOBS=4 bash scripts/build-native-acceptance.sh > native-build.log 2>&1
+      - name: Run real adapters without host data, credentials or network
+        run: sudo env GROUNDWORK_NATIVE_NODE_PATH="$(command -v node)" bash scripts/run-native-acceptance.sh
+      - name: Save synthetic native acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-acceptance-${{ github.sha }}
+          path: |
+            artifacts/native-acceptance/
+            native-build.log
+          retention-days: 14
+          if-no-files-found: error

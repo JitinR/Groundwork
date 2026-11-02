@@ -1,0 +1,2 @@
+# Shell scripts must run in WSL as well as native Linux checkouts.
+*.sh text eol=lf
