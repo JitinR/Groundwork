@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
     paths:
+      - '.gitattributes'
       - '.github/workflows/native-acceptance.yml'
       - 'scripts/*native*'
       - 'server/src/nativeAdapters.ts'
@@ -12,6 +13,7 @@ on:
       - 'package-lock.json'
   pull_request:
     paths:
+      - '.gitattributes'
       - '.github/workflows/native-acceptance.yml'
       - 'scripts/*native*'
       - 'server/src/nativeAdapters.ts'
