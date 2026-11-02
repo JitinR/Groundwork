@@ -130,6 +130,7 @@ test("session listing excludes expired, revoked, stale-epoch, pending and other-
     assert.equal((await pending.client.request("GET", "/api/auth/sessions")).status, 401);
     assert.equal((await expired.client.request("GET", "/api/auth/sessions")).status, 401);
     assert.equal((await markedRevoked.client.request("GET", "/api/auth/sessions")).status, 401);
+    assert.equal((await markedRevoked.client.request("GET", "/api/auth/me")).status, 401);
     assert.equal((await new Client("", "").request("GET", "/api/auth/sessions")).status, 401);
 });
 test("legacy seeds migrate and previous-key seeds reseal without disabling MFA", async () => {

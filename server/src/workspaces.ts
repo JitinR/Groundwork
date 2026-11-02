@@ -98,7 +98,8 @@ async function authorize(projectId: string, actor: WorkspaceActor, write = false
     access: ProjectAccess;
     project: ProjectRow;
 }> {
-    const session = await db.prepare("SELECT status,expires_at FROM sessions WHERE id=? AND user_id=?").get(actor.sessionId, actor.userId) as {
+    const session = await db.prepare(`SELECT s.status,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id
+        WHERE s.id=? AND s.user_id=? AND s.revoked_at IS NULL AND s.credential_version=u.credential_version`).get(actor.sessionId, actor.userId) as {
         status: string;
         expires_at: number;
     } | undefined;

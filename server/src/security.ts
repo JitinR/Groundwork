@@ -139,7 +139,7 @@ export async function resolveSession(req: Request): Promise<SessionRow | null> {
   const row = (await db
     .prepare(`SELECT s.id,s.user_id,s.csrf_token,s.status,s.expires_at,s.credential_version,s.totp_attempts
       FROM sessions s JOIN users u ON u.id=s.user_id
-      WHERE s.token_hash=? AND s.credential_version=u.credential_version`)
+      WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.credential_version=u.credential_version`)
     .get(sha256Hex(raw))) as SessionRow | undefined;
   if (!row) return null;
   if (row.status === "revoked") return null;
