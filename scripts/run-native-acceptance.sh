@@ -36,7 +36,7 @@ printf '{"type":"module"}\n' > "$rootfs/app/package.json"
 printf 'root:x:0:0:root:/:/nonexistent\nnative:x:10001:10001:native:/jobs:/nonexistent\n' > "$rootfs/etc/passwd"
 printf 'root:x:0:\nnative:x:10001:\n' > "$rootfs/etc/group"
 python3 - "$rootfs" "$root/runtime" "$nodebinary" <<'PY'
-import os, pathlib, re, shutil, subprocess, sys
+import os, pathlib, re, shutil, stat, subprocess, sys
 dest, runtime = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 queue = [(pathlib.Path(sys.argv[3]), '/usr/bin/node'), (pathlib.Path('/usr/bin/prlimit'), '/usr/bin/prlimit')]
 queue += [(runtime / 'bin' / name, '/runtime/bin/' + name) for name in ('OpenSees', 'dwg2dxf', 'dxf2dwg')]
@@ -63,7 +63,16 @@ for source in ('/usr/share/nodejs/acorn-walk/dist/walk.js', '/usr/share/nodejs/a
         target = dest / source.lstrip('/')
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
+# Do not inherit writable modes/ACL masks from copied files or directory
+# creation policies. Preserve private scratch directories and fail on links or
+# unexpected owners before the unprivileged native child sees this filesystem.
+for target in (dest, *dest.rglob('*')):
+    info = target.lstat()
+    if info.st_uid != 0 or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise RuntimeError(f'Unexpected native staging entry: {target.relative_to(dest)}')
+    os.chmod(target, stat.S_IMODE(info.st_mode) & ~0o022)
 PY
+stat --format='Staged runtime: %F %a %U %n' "$rootfs/runtime" "$rootfs/runtime/bin"
 mknod -m 0666 "$rootfs/dev/null" c 1 3
 mknod -m 0666 "$rootfs/dev/urandom" c 1 9
 hostnet=$(readlink /proc/self/ns/net)

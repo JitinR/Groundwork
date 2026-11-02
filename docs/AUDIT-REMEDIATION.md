@@ -1,6 +1,6 @@
 # Groundwork audit remediation
 
-Implementation updated: **2 November 2026**. Baseline: `1a4a2b72194dedc5b2d98b1dffb4ba14b8dcc0bc` (the inspected deployment). Application fixes were merged through PR #28; the patched pytest 9.0.3 dependency was merged through PR #29. Native runtime acceptance is isolated on `codex/native-runtime-acceptance`.
+Implementation updated: **3 November 2026**. Baseline: `1a4a2b72194dedc5b2d98b1dffb4ba14b8dcc0bc` (the inspected deployment). Application fixes were merged through PR #28; the patched pytest 9.0.3 dependency was merged through PR #29. Native runtime acceptance is isolated on `codex/native-runtime-acceptance`.
 
 This records the response to the 28 October application/AEC audit. It distinguishes implemented source changes and bounded verification from live deployment configuration, professional approval and operator decisions. No production data, subscriptions or permissions were changed. A tested branch does not establish that the public deployment has received its changes.
 

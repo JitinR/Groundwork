@@ -1,6 +1,6 @@
 # Native Linux acceptance
 
-On **2 November 2026**, the real Groundwork adapters passed five bounded acceptance groups on the existing **WSL2 Ubuntu 26.04.1 LTS x86_64** installation, using Node 22.22.1. This uses a local Linux installation without a cloud account. It is an acceptance host, not a connected production worker; the public application's native configuration remains disabled.
+On **3 November 2026**, the real Groundwork adapters passed five bounded acceptance groups on the existing **WSL2 Ubuntu 26.04.1 LTS x86_64** installation, using Node 22.22.1. This uses a local Linux installation without a cloud account. It is an acceptance host, not a connected production worker; the public application's native configuration remains disabled.
 
 ## Reproduce
 
@@ -39,7 +39,7 @@ Binary hashes depend on the platform/toolchain and are recorded with each run, r
 
 The resource envelope matches the adapter: 512 MiB virtual address space, 60 CPU seconds, 32 MiB file size, 32 processes, 64 open files and a 90-second job wall limit. This acceptance does not claim to have forced every limit or cancellation race to exhaustion.
 
-The launcher creates a temporary minimal filesystem with only the trusted adapter modules, Zod, required executable/library files, Tcl runtime, synthetic fixtures and required Ubuntu externalized Node builtin sources. It clears the supervisor environment before entering the chroot. Both scripts explicitly set their creation umask; the acceptance preflight checks protected root-owned executable paths even when the calling environment uses umask 0002. Scratch/evidence directories remain private; runtime files remain root-owned. Temporary files are removed from the validated invocation-specific path after the namespace exits. Positive-case failures emit only bounded synthetic diagnostics and still fail acceptance.
+The launcher creates a temporary minimal filesystem with only the trusted adapter modules, Zod, required executable/library files, Tcl runtime, synthetic fixtures and required Ubuntu externalized Node builtin sources. It clears the supervisor environment before entering the chroot. Both scripts explicitly set their creation umask. After copying, staging rejects unexpected links/owners and explicitly removes group/other write access from every regular file and directory, preserving private scratch/evidence modes. The acceptance preflight independently checks protected root-owned executable files and ancestor directories, including their file types; a caller using umask 0002 also passes locally. Temporary files are removed from the validated invocation-specific path after the namespace exits. Positive-case failures emit only bounded synthetic diagnostics and still fail acceptance.
 
 Evidence is written to `artifacts/native-acceptance/report.json`, `binary-sha256.txt`, `source.dxf` and `source.json`. The report includes the distribution, Node/runtime versions, binary hashes, source fingerprint, measured kernel limits and check results. CI's `Native runtime acceptance` workflow builds from the same pinned sources on Ubuntu 24.04, runs on relevant PRs/main changes or manual dispatch, uses no application secrets and retains synthetic evidence for 14 days. It is a validation job, not production hosting.
 

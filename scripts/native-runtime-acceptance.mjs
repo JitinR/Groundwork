@@ -10,7 +10,9 @@ assert.equal(process.platform, 'linux');
 assert.equal(process.getuid(), 0, 'Trusted acceptance supervisor must be able to drop the native UID');
 for (const filename of ['/', '/runtime', '/runtime/bin', '/runtime/bin/OpenSees', '/runtime/bin/dwg2dxf', '/runtime/bin/dxf2dwg', '/usr', '/usr/bin', '/usr/bin/prlimit']) {
   const info = await lstat(filename);
-  assert.ok(info.uid === 0 && (info.mode & 0o022) === 0, `Runtime path ${filename} must be root-owned and protected, received UID ${info.uid} mode ${(info.mode & 0o777).toString(8)}`);
+  const executable = ['OpenSees', 'dwg2dxf', 'dxf2dwg', 'prlimit'].includes(filename.split('/').at(-1));
+  assert.ok((executable ? info.isFile() : info.isDirectory()) && info.uid === 0 && (info.mode & 0o022) === 0,
+    `Runtime path ${filename} must be a protected root-owned ${executable ? 'file' : 'directory'}, received UID ${info.uid} mode ${(info.mode & 0o777).toString(8)} directory=${info.isDirectory()} symlink=${info.isSymbolicLink()}`);
 }
 const namespaces = {};
 for (const [index, name] of ['net', 'mnt', 'pid'].entries()) {
