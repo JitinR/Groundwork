@@ -2,12 +2,16 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { access, mkdir, readFile, readlink, writeFile } from 'node:fs/promises';
+import { access, lstat, mkdir, readFile, readlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import { runNativeJob, getNativeCapabilities, validateNativeInput } from './nativeAdapters.js';
 
 assert.equal(process.platform, 'linux');
 assert.equal(process.getuid(), 0, 'Trusted acceptance supervisor must be able to drop the native UID');
+for (const filename of ['/', '/runtime', '/runtime/bin', '/runtime/bin/OpenSees', '/runtime/bin/dwg2dxf', '/runtime/bin/dxf2dwg', '/usr', '/usr/bin', '/usr/bin/prlimit']) {
+  const info = await lstat(filename);
+  assert.ok(info.uid === 0 && (info.mode & 0o022) === 0, `Runtime path ${filename} must be root-owned and protected, received UID ${info.uid} mode ${(info.mode & 0o777).toString(8)}`);
+}
 const namespaces = {};
 for (const [index, name] of ['net', 'mnt', 'pid'].entries()) {
   namespaces[name] = await readlink(`/proc/self/ns/${name}`);

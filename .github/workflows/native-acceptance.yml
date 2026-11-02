@@ -47,7 +47,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends build-essential gfortran cmake curl ca-certificates xz-utils pkg-config tcl-dev tk-dev libblas-dev liblapack-dev libeigen3-dev libhdf5-dev zlib1g-dev python3 python3-dev util-linux
       - name: Verify source hashes and build supported native versions
-        run: sudo bash scripts/build-native-acceptance.sh > native-build.log 2>&1
+        run: sudo env GROUNDWORK_NATIVE_BUILD_JOBS=4 bash scripts/build-native-acceptance.sh > native-build.log 2>&1
       - name: Run real adapters without host data, credentials or network
         run: sudo env GROUNDWORK_NATIVE_NODE_PATH="$(command -v node)" bash scripts/run-native-acceptance.sh
       - name: Save synthetic native acceptance evidence

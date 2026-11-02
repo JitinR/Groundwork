@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Create an ephemeral minimal rootfs; no application secrets or project data enter it.
 set -euo pipefail
+umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 [[ $(uname -s) = Linux && $(uname -m) = x86_64 && $(id -u) = 0 ]] || { echo 'Requires root on x86_64 Linux.' >&2; exit 1; }
 chrootbinary=$(command -v chroot)

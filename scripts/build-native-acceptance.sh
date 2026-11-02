@@ -2,6 +2,7 @@
 # Build the two adapter-contract versions from official source archives.
 # This does not start or enable the application worker.
 set -euo pipefail
+umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 [[ $(uname -s) = Linux && $(uname -m) = x86_64 && $(id -u) = 0 ]] || { echo 'Requires root on x86_64 Linux.' >&2; exit 1; }
 root=/opt/groundwork-native-acceptance
