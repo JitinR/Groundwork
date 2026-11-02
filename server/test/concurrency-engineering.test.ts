@@ -19,7 +19,8 @@ const { app } = await import("../src/index.js");
 const { db, now } = await import("../src/db.js");
 const { createSession } = await import("../src/security.js");
 const { randomId } = await import("../src/crypto.js");
-const { createWorkspaceArtifact, saveWorkspace } = await import("../src/workspaces.js");
+const { createWorkspaceArtifact, readWorkspace, readWorkspaceArtifact, saveWorkspace } = await import("../src/workspaces.js");
+const { claimNativeJob, finishNativeJob, listNativeJobs, readNativeJob, readNativeJobArtifact, renewNativeJob } = await import("../src/nativeJobs.js");
 const { reserveProjectSubscription, releaseProjectSubscription, subscribeProject } = await import("../src/collaboration.js");
 const server = app.listen(0, "127.0.0.1");
 await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -148,6 +149,70 @@ test("workspace saves validate all 17 scoped artifacts in one read and persist e
     const refs = await db.prepare("SELECT artifact_id FROM project_workspace_artifact_refs WHERE project_id=? AND kind='geometry'").all(id) as { artifact_id: string }[];
     assert.deepEqual(refs.map((row) => row.artifact_id).sort(), artifacts.slice(1).map((artifact) => artifact.id).sort());
   } finally { db.prepare = original; }
+});
+
+test("atomic workspace operations reject credential-stale and explicitly revoked sessions", async () => {
+  const id = await project(), actor = actors[0];
+  const artifact = await createWorkspaceArtifact(id, "geometry", actor, "session-fixture.txt", Buffer.from("private workspace fixture"));
+  const save = { baseWorkspaceRevision: 0, sourceRevision: 0, payloadArtifactId: artifact.id, referencedArtifactIds: [] };
+  assert.equal((await readWorkspace(id, "geometry", actor)).workspace, null);
+  assert.equal((await readWorkspaceArtifact(id, artifact.id, actor)).artifact.id, artifact.id);
+  for (const fence of ["credential-version", "revoked-at"]) {
+    try {
+      // Keep status active to exercise the independent durable-operation fences.
+      if (fence === "credential-version") await db.prepare("UPDATE sessions SET credential_version=credential_version+1 WHERE id=?").run(actor.sessionId);
+      else await db.prepare("UPDATE sessions SET revoked_at=? WHERE id=?").run(now(), actor.sessionId);
+      await assert.rejects(readWorkspace(id, "geometry", actor), { code: "SESSION_EXPIRED" });
+      await assert.rejects(readWorkspaceArtifact(id, artifact.id, actor), { code: "SESSION_EXPIRED" });
+      await assert.rejects(createWorkspaceArtifact(id, "geometry", actor, "denied.txt", Buffer.from("denied")), { code: "SESSION_EXPIRED" });
+      await assert.rejects(saveWorkspace(id, "geometry", actor, save), { code: "SESSION_EXPIRED" });
+    } finally {
+      await db.prepare("UPDATE sessions SET revoked_at=NULL,credential_version=(SELECT credential_version FROM users WHERE id=?) WHERE id=?").run(actor.userId, actor.sessionId);
+    }
+  }
+  assert.equal((await saveWorkspace(id, "geometry", actor, save)).workspace?.revision, 1);
+  assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM project_workspace_artifacts WHERE project_id=?").get(id) as { count: number }).count, 1);
+});
+
+test("native claims, heartbeats, publication and artifact reads recheck session fences", async () => {
+  const id = await project(), actor = actors[0];
+  const source = await createWorkspaceArtifact(id, "engineering", actor, "source.json", Buffer.from("{}"));
+  async function seed(state: "queued" | "running") {
+    const jobId = randomId(), token = randomId(), timestamp = now();
+    await db.prepare(`INSERT INTO project_native_jobs(id,project_id,kind,workspace_kind,state,input_artifact_id,input_sha256,source_revision,idempotency_key,request_hash,created_by,session_id,created_at,updated_at,expires_at,attempts,claim_token,claim_until)
+      VALUES (?,?,'opensees-static','engineering',?,?,?,0,?,?,?,?,?,?,?,?,?,?)`)
+      .run(jobId, id, state, source.id, source.sha256, randomId(), "synthetic-session-fixture", actor.userId, actor.sessionId, timestamp, timestamp, timestamp + 600, state === "running" ? 1 : 0, state === "running" ? token : null, state === "running" ? timestamp + 20 : 0);
+    return { id: jobId, token, projectId: id, kind: "opensees-static" as const, actor, artifactId: source.id, sha256: source.sha256 };
+  }
+  const summary = { kind: "opensees-static" as const, adapter: "OpenSees" as const, declaredVersion: "3.8.0", sourceArtifactId: source.id, sourceSha256: source.sha256, verification: "computed-unvalidated" as const, warnings: [] };
+  const { sha256Hex } = await import("../src/crypto.js");
+  const bytes = Buffer.from("synthetic output; no native runtime executed");
+  const outputs = [{ filename: "session-fixture.txt", mediaType: "text/plain", bytes, sha256: sha256Hex(bytes) }];
+  const valid = await seed("running");
+  assert.equal(await renewNativeJob(valid), true);
+  assert.equal(await finishNativeJob(valid, outputs, summary), true);
+  assert.equal((await readNativeJob(id, valid.id, actor)).state, "succeeded");
+  for (const fence of ["credential-version", "revoked-at"]) {
+    const queued = await seed("queued"), running = await seed("running");
+    try {
+      if (fence === "credential-version") await db.prepare("UPDATE sessions SET credential_version=credential_version+1 WHERE id=?").run(actor.sessionId);
+      else await db.prepare("UPDATE sessions SET revoked_at=? WHERE id=?").run(now(), actor.sessionId);
+      await assert.rejects(listNativeJobs(id, actor), { code: "SESSION_EXPIRED" });
+      await assert.rejects(readNativeJob(id, running.id, actor), { code: "SESSION_EXPIRED" });
+      await assert.rejects(readNativeJobArtifact(id, running.id, source.id, actor), { code: "SESSION_EXPIRED" });
+      await assert.rejects(finishNativeJob(running, outputs, summary), { code: "SESSION_EXPIRED" });
+      assert.equal(await renewNativeJob(running), false);
+      assert.equal(await claimNativeJob(), null);
+      for (const claim of [queued, running]) {
+        const row = await db.prepare("SELECT state,error_code FROM project_native_jobs WHERE id=?").get(claim.id) as { state: string; error_code: string };
+        assert.equal(row.state, "failed");
+        assert.equal(row.error_code, "ACCESS_CHANGED");
+      }
+    } finally {
+      await db.prepare("UPDATE sessions SET revoked_at=NULL,credential_version=(SELECT credential_version FROM users WHERE id=?) WHERE id=?").run(actor.userId, actor.sessionId);
+    }
+  }
+  assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM project_native_job_artifacts WHERE project_id=?").get(id) as { count: number }).count, 1);
 });
 
 test("concurrent SSE reservations admit at most ten connections and expired leases never restore capacity", async () => {
