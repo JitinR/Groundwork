@@ -42,7 +42,7 @@ export function toLocalMetres(p: LatLng, origin: LatLng): { x: number; y: number
 
 export function localToLatLng(x: number, y: number, origin: LatLng): LatLng {
   const lat = origin.lat + (y / EARTH_R) * (180 / Math.PI);
-  const lng = origin.lng + (x / (EARTH_R * Math.cos(rad(origin.lat)))) * (180 / Math.PI);
+  const lng = origin.lng + (x / (EARTH_R * Math.cos(rad((lat + origin.lat) / 2)))) * (180 / Math.PI);
   return { lat, lng };
 }
 
@@ -95,7 +95,7 @@ export interface BoundaryMetrics {
  * the convex hull), so dimensions match the surveyor's "frontage × depth"
  * even when the plot is not north-aligned.
  */
-export function boundaryMetrics(points: LatLng[]): BoundaryMetrics | null {
+export function boundaryMetrics(points: LatLng[], dimensionDigits = 1): BoundaryMetrics | null {
   if (points.length < 3) return null;
   const c = centroid(points);
   const local = points.map((p) => toLocalMetres(p, c));
@@ -129,13 +129,13 @@ export function boundaryMetrics(points: LatLng[]): BoundaryMetrics | null {
 
   const widthM = Math.min(best.w, best.d);
   const depthM = Math.max(best.w, best.d);
-  const rotationDeg = ((best.angle * 180) / Math.PI + 180) % 180;
+  const rotationDeg = ((best.angle * 180) / Math.PI + (best.w > best.d ? 90 : 0) + 180) % 180;
 
   return {
     center: c,
-    widthM: rounded(widthM, 1),
-    depthM: rounded(depthM, 1),
-    rotationDeg: rounded(rotationDeg, 1),
+    widthM: rounded(widthM, dimensionDigits),
+    depthM: rounded(depthM, dimensionDigits),
+    rotationDeg: rounded(rotationDeg, 1) % 180,
     areaM2: rounded(polygonAreaM2(points), 0),
   };
 }
