@@ -21,6 +21,7 @@ import { CommunityScene, type SceneContextTarget } from "../editor/CommunityScen
 import { RoomEditor } from "../editor/RoomEditor";
 import { SiteLocator } from "../editor/SiteLocator";
 import { type BoundaryMetrics } from "../lib/geo";
+import { communityAtSite } from "../lib/siteLocation";
 import { useToast } from "../components/Toast";
 import { cn } from "../lib/cn";
 import { SectionControls } from "../components/SectionControls";
@@ -447,11 +448,8 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
       <Section title="Plot size">
       <SiteLocator
         location={c.location}
-        onChange={(loc) => update({ location: loc })}
+        onChange={(loc, metrics) => commitDesign(communityAtSite(c, loc, metrics))}
         onApplyBoundary={(m: BoundaryMetrics) => {
-          const factor = land.unit === "m" ? 1 : land.unit === "yd" ? 1 / 0.9144 : 1 / 0.3048;
-          const round1 = (n: number) => Math.max(Math.round(n * factor * 10) / 10, 1);
-          update({ land: { ...land, width: round1(m.widthM), depth: round1(m.depthM) } });
           toast.push({ title: "Plot size applied", description: `${m.widthM} × ${m.depthM} m from boundary`, tone: "success" });
         }}
       />

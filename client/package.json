@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit -p tsconfig.json && vite build",
-    "test": "node --import tsx --test test/browser-security.test.ts test/request-resilience.test.ts test/cad-coordination.test.ts test/cad-exchange.test.ts test/cad-model.test.ts test/cad-networks.test.ts test/cad-viewport.test.ts test/auth-verification.test.ts test/documentation-output.test.ts test/export-readiness.test.ts test/guided-engineering.test.ts test/offline-capacity.test.ts test/offline-shell-policy.test.ts test/workspace-preview.test.ts test/cad-documentation-projection.test.ts test/engineering-reference-validation.test.ts",
+    "test": "node --import tsx --test test/browser-security.test.ts test/request-resilience.test.ts test/cad-coordination.test.ts test/cad-exchange.test.ts test/cad-model.test.ts test/cad-networks.test.ts test/cad-viewport.test.ts test/auth-verification.test.ts test/documentation-output.test.ts test/export-readiness.test.ts test/guided-engineering.test.ts test/offline-capacity.test.ts test/offline-shell-policy.test.ts test/workspace-preview.test.ts test/cad-documentation-projection.test.ts test/engineering-reference-validation.test.ts test/site-location.test.ts test/map-ground.test.ts",
     "preview": "vite preview",
     "test:studio": "node --test test/studio/*.test.js",
     "test:cad": "node --import tsx --test test/cad-coordination.test.ts test/cad-exchange.test.ts test/cad-model.test.ts test/cad-networks.test.ts test/cad-viewport.test.ts"

@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AirportDesign, AssistantPlan, DamDesign, DraftElement, HighwayDesign, InfraDesign, InfraFacility, InfraKind, PortDesign } from "../types";
+import type { AirportDesign, AssistantPlan, DamDesign, DraftElement, HighwayDesign, InfraDesign, InfraFacility, InfraKind, PortDesign, SiteLocation } from "../types";
 import { Button, Modal, Select, Toggle } from "../components/ui";
 import { ParametricControls } from "../components/ParametricControls";
 import { CadToolPalette, type CadTool } from "../components/CadToolPalette";
 import { InfraScene } from "../editor/InfraScene";
 import { SiteLocator, type LocatorMode } from "../editor/SiteLocator";
+import { infraAtSite } from "../lib/siteLocation";
 import { useToast } from "../components/Toast";
 import { requestAssistantPlan } from "../api";
 import { DesignAssistantPanel, type AssistantMessage } from "../components/DesignAssistantPanel";
@@ -358,42 +359,33 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
   );
 
   /* ------------------------------ Location step ----------------------------- */
-  const applyFromLocation = () => {
-    const loc = infra.location;
+  const applyFromLocation = (loc: SiteLocation | undefined = infra.location) => {
     if (!loc) return;
+    const next = infraAtSite(infra, loc);
+    commitInfra(next);
     if (kind === "airport") {
       const span = Math.max(loc.boundaryWidthM ?? 0, loc.boundaryDepthM ?? 0);
       if (span > 200) {
-        patchAirport({
-          runwayLengthM: clamp(Math.round(span / 50) * 50, 1200, 4500),
-          runwayHeadingDeg: Math.round((loc.boundaryRotationDeg ?? 90) % 180),
-        });
-        toast.push({ title: "Runway fitted to site", description: `${clamp(Math.round(span / 50) * 50, 1200, 4500)} m runway · heading ${Math.round((loc.boundaryRotationDeg ?? 90) % 180)}°`, tone: "success" });
+        toast.push({ title: "Preliminary runway dimensions set", description: `${next.airport!.runwayLengthM} m runway · stored heading ${next.airport!.runwayHeadingDeg}°`, tone: "success" });
       } else {
-        toast.push({ title: "Trace a boundary first", tone: "info" });
+        toast.push({ title: "Enter site dimensions over 200 m to fit the runway", tone: "info" });
       }
     } else if (kind === "ports") {
       const area = (loc.boundaryWidthM ?? 0) * (loc.boundaryDepthM ?? 0);
       if (area > 5000) {
-        const berthLength = infra.ports!.berthLengthM || 250;
-        patchPort({
-          containerYardM2: clamp(Math.round(area * 0.45), 20000, 800000),
-          berths: clamp(Math.round((loc.boundaryWidthM ?? 0) / berthLength), 1, 12),
-        });
         toast.push({ title: "Yard & berths fitted", description: `${clamp(Math.round(area * 0.45), 20000, 800000).toLocaleString()} m² yard`, tone: "success" });
       } else {
-        toast.push({ title: "Trace a boundary first", tone: "info" });
+        toast.push({ title: "Enter site dimensions covering over 5,000 m² to fit the yard", tone: "info" });
       }
     } else if (kind === "dams") {
       const route = loc.routeLengthM ?? 0;
       if (route > 40) {
-        patchDam({ crestLengthM: clamp(Math.round(route), 60, 2000) });
-        toast.push({ title: "Crest length applied", description: `${clamp(Math.round(route), 60, 2000)} m from the traced axis`, tone: "success" });
+        toast.push({ title: "Crest length applied", description: `${clamp(Math.round(route), 60, 2000)} m from the entered axis`, tone: "success" });
       } else {
-        toast.push({ title: "Trace the dam axis first", tone: "info" });
+        toast.push({ title: "Enter a dam-axis length over 40 m first", tone: "info" });
       }
     } else {
-      toast.push({ title: "Route drives the model", description: loc.routeLengthM ? `${Math.round(loc.routeLengthM)} m captured` : "Trace the alignment", tone: "info" });
+      toast.push({ title: "Route drives the model", description: loc.routeLengthM ? `${Math.round(loc.routeLengthM)} m entered` : "Enter the measured alignment length", tone: "info" });
     }
   };
 
@@ -409,18 +401,19 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
       <CivilControls value={infra} onChange={(civil) => update({ civil })} />
       <p className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-xs leading-relaxed text-slate-400">
         {kind === "highway"
-          ? "Search the corridor and trace the road alignment on the satellite map. The captured length and bearing set the model and the takeoff."
+          ? "Enter the corridor coordinates, measured length and bearing to set the local model reference. Map imagery is not loaded."
           : kind === "dams"
-            ? "Find the valley on the map and trace the dam axis. The axis length becomes the crest length."
-            : "Find the site on the map and trace its boundary. The best-fit rectangle sizes the works."}
+            ? "Enter the site coordinates and measured dam-axis length. The entered axis can set the preliminary crest length. Map imagery is not loaded."
+            : kind === "airport"
+              ? "Enter site coordinates and measured dimensions or boundary corners. Runway heading is stored as metadata; the schematic preview keeps its local axes. Map imagery is not loaded."
+              : "Enter the site coordinates and measured dimensions or boundary corners to size the preliminary works. Map imagery is not loaded."}
       </p>
       <SiteLocator
         location={infra.location}
         mode={LOCATOR_MODE[kind]}
-        onChange={(loc) => update({ location: loc })}
-        onApplyBoundary={() => applyFromLocation()}
+        onChange={(loc) => loc ? applyFromLocation(loc) : update({ location: undefined })}
       />
-      <Button size="sm" variant="secondary" onClick={applyFromLocation} disabled={!infra.location}>
+      <Button size="sm" variant="secondary" onClick={() => applyFromLocation()} disabled={!infra.location}>
         {applyLabel}
       </Button>
     </Section>

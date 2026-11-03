@@ -851,17 +851,19 @@ export interface SiteLocation {
   zoom?: number;
   /** Plot boundary vertices in declaration order (WGS84). */
   boundary?: { lat: number; lng: number }[];
+  /** Authored shape; legacy corner lists without this marker reopen as polygons. */
+  boundaryShape?: "rectangle" | "polygon" | "corridor";
   /** Best-fit boundary width, metres. */
   boundaryWidthM?: number;
   /** Best-fit boundary depth, metres. */
   boundaryDepthM?: number;
-  /** Best-fit boundary rotation from north, degrees. */
+  /** Width-axis rotation counterclockwise from east, degrees in [0, 180). */
   boundaryRotationDeg?: number;
   /** Traced route centreline (WGS84), used by linear works such as highways. */
   route?: { lat: number; lng: number }[];
   /** Measured route length, metres. */
   routeLengthM?: number;
-  /** Compass bearing of the route's first segment, degrees from north. */
+  /** Compass bearing from north of the route's first segment or measured corridor's long axis. */
   routeBearingDeg?: number;
 }
 
