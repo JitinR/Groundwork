@@ -120,6 +120,15 @@ test("new references reject sub-metre extents before the model minimum can silen
   assert.equal(createSiteReference({ ...measured, width: "1", depth: "1" }).metrics.widthM, 1);
 });
 
+test("a one-metre site remains valid after conversion to feet without admitting genuinely undersized extents", () => {
+  const feet = siteMeasuresInUnit({ width: "1", depth: "1", unit: "m" }, "ft");
+  const { location, metrics } = createSiteReference({ ...measured, ...feet });
+  assert.ok(Math.abs(metrics.widthM - 1) < 1e-8);
+  assert.ok(Math.abs(metrics.depthM - 1) < 1e-8);
+  assert.ok(Math.abs(haversine(location.boundary![0], location.boundary![1]) - 1) < 1e-8);
+  assert.throws(() => createSiteReference({ ...measured, width: "0.9999" }), /at least 1 m/);
+});
+
 test("infrastructure fitting uses the current action's site and preserves unrelated settings", () => {
   const location: SiteLocation = { lat: 0, lng: 0, boundaryWidthM: 1000, boundaryDepthM: 1800, boundaryRotationDeg: 42, routeLengthM: 375, routeBearingDeg: 42 };
   for (const kind of ["airport", "ports", "dams", "highway"] as const) {

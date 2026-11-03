@@ -90,7 +90,9 @@ export function createSiteReference(input: SiteReferenceInput): { location: Site
     metrics = { center, widthM, depthM, rotationDeg, areaM2: widthM * depthM };
   }
   const { center, widthM, depthM, rotationDeg } = metrics;
-  if (widthM < 1 || depthM < 1) throw new Error("The modeled site canvas needs width and depth of at least 1 m (about 3.281 ft). Smaller extents would be enlarged by the canvas minimum.");
+  // Decimal input-unit conversion can put exactly 1 m a few picometres below
+  // the limit. This tolerance is smaller than the supported geometry precision.
+  if (widthM < 1 - 1e-8 || depthM < 1 - 1e-8) throw new Error("The modeled site canvas needs width and depth of at least 1 m (about 3.281 ft). Smaller extents would be enlarged by the canvas minimum.");
   const location: SiteLocation = {
     ...center, zoom: 18, boundary, boundaryShape: input.shape, boundaryWidthM: widthM, boundaryDepthM: depthM, boundaryRotationDeg: rotationDeg,
     ...(input.mode === "route" ? {
