@@ -81,6 +81,17 @@ the current branch and newest CI attempt, then calls the single project-scoped
 installation or dependency lifecycle code receives that hook. A failed or
 ambiguous hook acknowledgment is not retried automatically; inspect Vercel first.
 
+Read-only GitHub evidence requests permit at most two attempts, with a 250 ms
+backoff and a 15-second limit per attempt. The retry helper rejects non-GET
+methods, request bodies and non-GitHub destinations. Preview reads also respect
+their existing wait deadline. The hook POST is made exactly once, with up to
+60 seconds to acknowledge it; a pending acknowledgement is not a READY release.
+Fixed diagnostic codes distinguish unavailable/rejected evidence, invalid
+configuration and `HOOK_ACK_UNCONFIRMED` without printing provider bodies,
+request URLs, credentials or underlying exception messages. If acknowledgement
+is unconfirmed, inspect deployments for the exact SHA before deciding on further
+delivery; never automatically rerun the hook to resolve that uncertainty.
+
 The Vercel build command runs `scripts/deploy-after-ci.mjs --build-guard` before
 building. It verifies matching repository/branch/commit metadata against current
 successful CI evidence; production requires `main`. This second check refuses

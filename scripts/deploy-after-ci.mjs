@@ -1,12 +1,37 @@
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { latestGate, releaseReadiness, requestReleaseJson, validateRelease } from './release-readiness.mjs';
+import { latestGate, releaseReadiness, requestReleaseJson, requestReleaseEvidence, ReleaseEvidenceError, validateRelease } from './release-readiness.mjs';
 
 export const DEPLOYMENT_REPOSITORY = 'jitinraavi/Secure-Nexus';
 export const DEPLOYMENT_PROJECT = 'prj_1blxFgztH32acCvngFaCVr4MqdGJ';
 export const PREVIEW_CI_WAIT_MS = 30 * 60_000;
 export const PREVIEW_CI_POLL_MS = 2 * 60_000;
 export const PREVIEW_CI_MAX_POLLS = 16;
+export const DEPLOY_HOOK_ACK_TIMEOUT_MS = 60_000;
+
+const deliveryMessages = Object.freeze({
+  RELEASE_CONFIGURATION_INVALID: 'Release event, target or build configuration is invalid; no hook was sent.',
+  EVIDENCE_UNAVAILABLE: 'Read-only CI evidence is unavailable after bounded attempts; no hook was sent.',
+  EVIDENCE_REJECTED: 'Exact current commit and required successful CI evidence were not confirmed; no hook was sent.',
+  HOOK_CONFIGURATION_INVALID: 'The project-scoped deploy hook configuration is invalid; no hook was sent.',
+  HOOK_ACK_UNCONFIRMED: 'Deploy hook acknowledgement was not confirmed; inspect Vercel before retrying. The POST is never retried automatically.',
+  PREVIEW_CI_BLOCKED: 'Preview CI is unavailable, pending beyond its deadline, stale or rejected; the build remains blocked.',
+  DELIVERY_UNEXPECTED: 'Delivery did not complete; inspect the verified target before taking further action.',
+});
+export class DeploymentDeliveryError extends Error {
+  constructor(code) {
+    const safeCode = Object.hasOwn(deliveryMessages, code) ? code : 'DELIVERY_UNEXPECTED';
+    super(deliveryMessages[safeCode]); this.name = 'DeploymentDeliveryError'; this.code = safeCode;
+  }
+}
+export function deploymentFailureDiagnostic(error) {
+  const code = error instanceof DeploymentDeliveryError && Object.hasOwn(deliveryMessages, error.code) ? error.code : error instanceof PreviewCiWaitError ? 'PREVIEW_CI_BLOCKED' : 'DELIVERY_UNEXPECTED';
+  return `Deployment gate refused [${code}]: ${deliveryMessages[code]}`;
+}
+async function verifiedRelease(env, request, evidenceOptions) {
+  try { return await releaseReadiness(env, request, evidenceOptions); }
+  catch (error) { throw new DeploymentDeliveryError(error instanceof ReleaseEvidenceError ? error.code === 'EVIDENCE_REQUEST_INVALID' ? 'RELEASE_CONFIGURATION_INVALID' : 'EVIDENCE_UNAVAILABLE' : 'EVIDENCE_REJECTED'); }
+}
 
 export class PreviewCiWaitError extends Error {
   constructor(message) { super(message); this.name = 'PreviewCiWaitError'; }
@@ -19,11 +44,12 @@ export async function waitForPreviewCi(target, request = fetch, {
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   now = Date.now,
   onProgress = () => undefined,
+  evidenceOptions = {},
 } = {}) {
   const started = now(), deadline = started + PREVIEW_CI_WAIT_MS;
   const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'Groundwork-preview-gate' };
   async function get(path) {
-    try { return await requestReleaseJson(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers }); }
+    try { return await requestReleaseEvidence(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers }, { ...evidenceOptions, sleep, now, deadlineMs: deadline }); }
     catch { throw new PreviewCiWaitError('Preview CI evidence is unavailable; deployment remains blocked.'); }
   }
   const branch = await get(`branches/${encodeURIComponent(target.branch)}`);
@@ -77,23 +103,28 @@ export function vercelBuildTarget(env) {
  * commits require successful CI for their own branch; production requires main.
  * Public GitHub evidence needs no persistent Vercel-side GitHub credential. */
 export async function guardVercelBuild(env = process.env, request = fetch, waitOptions = {}) {
-  const target = vercelBuildTarget(env);
+  let target;
+  try { target = vercelBuildTarget(env); } catch { throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID'); }
   if (env.VERCEL_ENV === 'preview') await waitForPreviewCi(target, request, waitOptions);
-  const evidence = await releaseReadiness({ GITHUB_REPOSITORY: target.repository, RELEASE_COMMIT: target.commit, RELEASE_BRANCH: target.branch }, request);
+  const evidence = await verifiedRelease({ GITHUB_REPOSITORY: target.repository, RELEASE_COMMIT: target.commit, RELEASE_BRANCH: target.branch }, request, waitOptions.evidenceOptions);
   return { ...evidence, environment: env.VERCEL_ENV, buildPermitted: true };
 }
 /** A workflow_run job receives only its short-lived read-only GitHub token and
  * this one project-scoped hook. A lost POST acknowledgement is never retried. */
-export async function deployAfterCi(env = process.env, request = fetch, { checkOnly = false } = {}) {
+export async function deployAfterCi(env = process.env, request = fetch, { checkOnly = false, evidenceOptions = {}, hookTimeoutMs = DEPLOY_HOOK_ACK_TIMEOUT_MS } = {}) {
   if (env.GITHUB_EVENT_NAME !== 'workflow_run' || env.GITHUB_REPOSITORY !== DEPLOYMENT_REPOSITORY || env.RELEASE_BRANCH !== 'main' ||
-      !/^[1-9]\d*$/.test(env.RELEASE_RUN_ID || '') || !/^[1-9]\d*$/.test(env.RELEASE_RUN_ATTEMPT || '')) throw new Error('Production deployment requires the matching completed main CI event');
-  const evidence = await releaseReadiness(env, request);
+      !/^[1-9]\d*$/.test(env.RELEASE_RUN_ID || '') || !/^[1-9]\d*$/.test(env.RELEASE_RUN_ATTEMPT || '') ||
+      !Number.isSafeInteger(hookTimeoutMs) || hookTimeoutMs < 1 || hookTimeoutMs > DEPLOY_HOOK_ACK_TIMEOUT_MS) throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID');
+  try { validateRelease({ repository: env.GITHUB_REPOSITORY, commit: env.RELEASE_COMMIT, branch: env.RELEASE_BRANCH }); }
+  catch { throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID'); }
+  const evidence = await verifiedRelease(env, request, evidenceOptions);
   if (checkOnly) return { ...evidence, hookTriggered: false };
-  const hook = approvedDeployHook(env.VERCEL_DEPLOY_HOOK);
+  let hook;
+  try { hook = approvedDeployHook(env.VERCEL_DEPLOY_HOOK); } catch { throw new DeploymentDeliveryError('HOOK_CONFIGURATION_INVALID'); }
   let result;
-  try { result = await requestReleaseJson(request, hook.href, { method: 'POST', headers: { accept: 'application/json' } }, 16_384); }
-  catch { throw new Error('Deploy hook acknowledgement was not confirmed; inspect Vercel before retrying'); }
-  if (!result?.job || typeof result.job.id !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(result.job.id) || result.job.state !== 'PENDING') throw new Error('Deploy hook acknowledgement was not confirmed; inspect Vercel before retrying');
+  try { result = await requestReleaseJson(request, hook.href, { method: 'POST', headers: { accept: 'application/json' } }, 16_384, hookTimeoutMs); }
+  catch { throw new DeploymentDeliveryError('HOOK_ACK_UNCONFIRMED'); }
+  if (!result?.job || typeof result.job.id !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(result.job.id) || result.job.state !== 'PENDING') throw new DeploymentDeliveryError('HOOK_ACK_UNCONFIRMED');
   return { ...evidence, hookTriggered: true, deploymentJobId: result.job.id, deploymentState: result.job.state };
 }
 
@@ -101,5 +132,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const args = process.argv.slice(2);
   const action = args.length === 1 && args[0] === '--build-guard' ? (env => guardVercelBuild(env, fetch, { onProgress: ({ status }) => console.log(`Preview CI ${status}; waiting for the exact commit before building (up to 30 minutes).`) })) : args.length === 1 && args[0] === '--check' ? (env => deployAfterCi(env, fetch, { checkOnly: true })) : args.length === 0 ? deployAfterCi : null;
   if (!action) { console.error('Use --build-guard, --check, or no arguments for the authorized CI hook trigger.'); process.exitCode = 1; }
-  else action().then(result => console.log(JSON.stringify(result))).catch(error => { console.error(error instanceof PreviewCiWaitError ? error.message : 'Deployment gate refused: exact current branch commit, latest successful CI, required verification jobs and configured target are required. Hook failures require inspection before retry.'); process.exitCode = 1; });
+  else action().then(result => console.log(JSON.stringify(result))).catch(error => { console.error(deploymentFailureDiagnostic(error)); process.exitCode = 1; });
 }
