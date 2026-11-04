@@ -10,7 +10,7 @@ import type { MeshClashReport } from "../lib/meshClash";
 interface Props { design: Design; readOnly: boolean; onRecord: (record: CadAnalysisRecord) => void; onFocus: (ids: string[]) => void; }
 export function CadCoordinationPanel({ design, readOnly, onRecord, onFocus }: Props) {
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
-  const worker = useRef<Worker | null>(null), timeout = useRef<ReturnType<typeof setTimeout>>();
+  const worker = useRef<Worker | null>(null), timeout = useRef<ReturnType<typeof setTimeout>>(undefined);
   const latest = useRef(design); latest.current = design;
   useEffect(() => () => { worker.current?.terminate(); if (timeout.current) clearTimeout(timeout.current); }, []);
   const record = design.cad?.analyses?.find(item => item.id === "cad-mesh-coordination");
