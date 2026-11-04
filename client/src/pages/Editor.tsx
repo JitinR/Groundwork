@@ -139,7 +139,7 @@ export function Editor() {
   const acknowledged = useRef<MergeDocument | null>(null);
   const recoveryOrigin = useRef<PendingDraft | null>(null);
   const latestDraft = useRef<PendingDraft | null>(null);
-  const blockedSaveStatus = useRef<number | undefined>();
+  const blockedSaveStatus = useRef<number | undefined>(undefined);
   const loadGeneration = useRef(0);
   const scope = (user?.id ?? "") + ":" + (id ?? "");
   const scopeRef = useRef(scope);
