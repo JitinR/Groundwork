@@ -159,3 +159,9 @@ and a dedicated durable-job entry point. Those operations are not validated by
 the web build. Keep `NATIVE_WORKER_ENABLED=false` and
 `NATIVE_ISOLATION_ACKNOWLEDGED=false` until that runtime passes acceptance testing.
 Running the web application as root is not a solution to these prerequisites.
+HTTP authorities enforce that restriction by rejecting native enablement before
+canonical startup loads database/key configuration; the HTTP server no longer
+imports or starts the native queue worker. The lifecycle module is separately
+testable and waits for leases/in-flight work at shutdown. It does not supply a
+deployable scoped worker or per-job sandbox. See
+[the worker boundary](NATIVE-WORKER-BOUNDARY.md) before implementing that service.

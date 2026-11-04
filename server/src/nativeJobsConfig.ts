@@ -33,7 +33,8 @@ export const nativeAdapterConfig: NativeAdapterConfig = {
   maximumOutputBytes: 32 * 1024 * 1024,
 };
 
-// One bounded worker per API process, maximum four leased jobs in the shared SQLite authority.
-// Never point independent hosts at independent database copies and call that a shared queue.
+// Reserved for an independently confined queue supervisor, never an HTTP API.
+// The web topology rejects enablement. A remote transport/executor is still
+// required; independent database copies are not a shared queue.
 export const NATIVE_WORKER_ENABLED = process.env.NATIVE_WORKER_ENABLED === "true";
 export const NATIVE_JOBS_ROOT = path.join(DATA_DIR, "native-jobs");

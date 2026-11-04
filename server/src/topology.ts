@@ -69,6 +69,11 @@ function boundedInteger(name: string, fallback: number, minimum: number, maximum
 }
 export function requireAuthorityConfiguration(): AuthorityConfiguration {
   if (role() !== "authority") throw new Error("Secondary hosts must use start:secondary; authority modules are disabled for this role");
+  // The direct adapter needs privileged identity transition. An HTTP authority
+  // must never acquire that privilege just to run a queue in its own process.
+  if (process.env.NATIVE_WORKER_ENABLED && process.env.NATIVE_WORKER_ENABLED !== "false") {
+    throw new Error("Native execution is disabled in HTTP authorities; keep NATIVE_WORKER_ENABLED=false and provision a separately isolated worker service");
+  }
   const mode = process.env.GROUNDWORK_AUTHORITY_GATEWAY_MODE || "direct";
   if (mode !== "direct" && mode !== "required") throw new Error("GROUNDWORK_AUTHORITY_GATEWAY_MODE must be direct or required");
   if (mode === "required" && process.env.NODE_ENV !== "production") throw new Error("Authenticated gateway authority requires NODE_ENV=production so session cookies are Secure");
