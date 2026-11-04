@@ -366,7 +366,7 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
     if (kind === "airport") {
       const span = Math.max(loc.boundaryWidthM ?? 0, loc.boundaryDepthM ?? 0);
       if (span > 200) {
-        toast.push({ title: "Preliminary runway dimensions set", description: `${next.airport!.runwayLengthM} m runway · stored heading ${next.airport!.runwayHeadingDeg}°`, tone: "success" });
+        toast.push({ title: "Preliminary runway dimensions set", description: `${next.airport!.runwayLengthM} m runway · axis bearing ${next.airport!.runwayHeadingDeg}° from north`, tone: "success" });
       } else {
         toast.push({ title: "Enter site dimensions over 200 m to fit the runway", tone: "info" });
       }
@@ -405,7 +405,7 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
           : kind === "dams"
             ? "Enter the site coordinates and measured dam-axis length. The entered axis can set the preliminary crest length. Map imagery is not loaded."
             : kind === "airport"
-              ? "Enter site coordinates and measured dimensions or boundary corners. Runway heading is stored as metadata; the schematic preview keeps its local axes. Map imagery is not loaded."
+              ? "Enter site coordinates and measured dimensions or boundary corners. The generated airport follows its runway axis bearing, clockwise from local north (0° north, 90° east). Terrain and authored annotations keep their coordinates. Map imagery is not loaded."
               : "Enter the site coordinates and measured dimensions or boundary corners to size the preliminary works. Map imagery is not loaded."}
       </p>
       <SiteLocator
@@ -471,7 +471,7 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
           <Num label="Runway width" value={a.runwayWidthM} onChange={(v) => patchAirport({ runwayWidthM: clamp(Math.round(v) || 45, 23, 60) })} min={23} max={60} step={1} unit=" m" />
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <Num label="Heading" value={a.runwayHeadingDeg} onChange={(v) => patchAirport({ runwayHeadingDeg: clamp(Math.round(v) || 0, 0, 179) })} min={0} max={179} step={1} unit=" °" />
+          <Num label="Runway axis bearing" value={a.runwayHeadingDeg} onChange={(v) => patchAirport({ runwayHeadingDeg: clamp(Math.round(v) || 0, 0, 179) })} min={0} max={179} step={1} unit=" ° from north" />
           <Num label="Taxiways" value={a.taxiways} onChange={(v) => patchAirport({ taxiways: clamp(Math.round(v) || 1, 1, 8) })} min={1} max={8} step={1} unit=" no" />
         </div>
         <div className="grid grid-cols-2 gap-3">
