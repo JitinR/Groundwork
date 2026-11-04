@@ -5,22 +5,23 @@ import { NativeAdapterError, runNativeJob } from "./nativeAdapters.js";
 import { nativeAdapterConfig, NATIVE_JOBS_ROOT, NATIVE_WORKER_ENABLED } from "./nativeJobsConfig.js";
 import { claimNativeJob, failNativeJob, finishNativeJob, renewNativeJob, type NativeJobClaim } from "./nativeJobs.js";
 import { readWorkspaceArtifact, WorkspaceError } from "./workspaces.js";
+import { startNativeWorkerLoop } from "./nativeWorkerLoop.js";
 const ROOT = path.resolve(NATIVE_JOBS_ROOT);
-let started = false;
+let runningWorker: { stop: () => Promise<void> } | null = null;
 function attemptPath(directory: string): boolean {
     return path.dirname(path.resolve(directory)) === ROOT && /^job-[a-f0-9]{32}-[a-f0-9]{32}-[A-Za-z0-9]{6}$/.test(path.basename(directory));
 }
 async function removeAttempt(directory: string): Promise<void> {
     if (!attemptPath(directory))
         throw new Error("Native job cleanup path is outside the attempt root");
-    // rm removes symlink entries without recursively following their targets. The parent is API-owned.
+    // rm removes symlink entries without following their targets. The parent is supervisor-owned.
     await rm(directory, { recursive: true, force: true });
 }
 async function prepareRoot(): Promise<void> {
     await mkdir(ROOT, { recursive: true, mode: 0o700 });
     const stat = await lstat(ROOT);
     if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(ROOT) !== ROOT || (process.getuid && (stat.uid !== process.getuid() || stat.uid === nativeAdapterConfig.sandbox?.uid)))
-        throw new Error("Native job root must be a private real directory owned by the API account");
+        throw new Error("Native job root must be a private real directory owned by the queue supervisor");
     await chmod(ROOT, 0o700);
 }
 async function removeExpiredAttempts(): Promise<void> {
@@ -38,48 +39,34 @@ async function removeExpiredAttempts(): Promise<void> {
             await removeAttempt(directory);
     }
 }
-/** Single bounded loop; workers share durable, transactionally fenced claims. */
+/** Legacy durable adapter for an independently reviewed supervisor. Never
+ * started by an HTTP authority; this does not supply per-job OS confinement. */
 export function startNativeJobWorker(): {
     stop: () => Promise<void>;
 } {
-    if (started || !NATIVE_WORKER_ENABLED)
+    if (!NATIVE_WORKER_ENABLED)
         return { stop: async () => undefined };
-    started = true;
-    let stopping = false, initialized = false, active: AbortController | null = null;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let inFlight: Promise<void> | null = null;
+    if (runningWorker)
+        return runningWorker;
     let cleanAt = 0;
-    async function execute(claim: NativeJobClaim): Promise<void> {
-        const controller = new AbortController();
-        active = controller;
+    async function execute(claim: NativeJobClaim, signal: AbortSignal, renew: () => Promise<boolean>): Promise<void> {
         let directory: string | null = null;
-        const heartbeat = setInterval(async () => {
-            try {
-                if (!await renewNativeJob(claim))
-                    controller.abort();
-            }
-            catch {
-                controller.abort();
-            }
-        }, 3000);
         try {
-            if (stopping || !await renewNativeJob(claim)) {
-                controller.abort();
+            if (!await renew() || signal.aborted) {
                 return;
             }
             const { artifact, bytes } = await readWorkspaceArtifact(claim.projectId, claim.artifactId, claim.actor);
             if (artifact.sha256 !== claim.sha256)
                 throw new WorkspaceError(500, "Job source integrity changed", "ARTIFACT_INTEGRITY");
             directory = await mkdtemp(path.join(ROOT, `job-${claim.id}-${claim.token}-`));
-            if (stopping || controller.signal.aborted || !await renewNativeJob(claim)) {
-                controller.abort();
+            if (!await renew() || signal.aborted) {
                 return;
             }
             const result = await runNativeJob({
                 kind: claim.kind, config: nativeAdapterConfig, workingDirectory: directory,
-                input: { bytes, sourceArtifactId: claim.artifactId, sha256: claim.sha256 }, signal: controller.signal,
+                input: { bytes, sourceArtifactId: claim.artifactId, sha256: claim.sha256 }, signal,
             });
-            if (!stopping && !controller.signal.aborted)
+            if (!signal.aborted)
                 await finishNativeJob(claim, result.artifacts, result.summary);
             else
                 await failNativeJob(claim, "WORKER_STOPPED", "Worker stopped before completion; submit again if needed");
@@ -104,8 +91,6 @@ export function startNativeJobWorker(): {
             catch { /* Persisted lease recovery fences an attempt whose authority could not be reached. */ }
         }
         finally {
-            clearInterval(heartbeat);
-            active = null;
             if (directory) {
                 try {
                     await removeAttempt(directory);
@@ -116,38 +101,25 @@ export function startNativeJobWorker(): {
             }
         }
     }
-    async function tick(): Promise<void> {
-        if (stopping)
-            return;
-        try {
-            if (!initialized) {
-                await prepareRoot();
-                initialized = true;
-            }
+    const loop = startNativeWorkerLoop<NativeJobClaim>({
+        initialize: prepareRoot,
+        beforeClaim: async () => {
             if (Date.now() > cleanAt) {
                 await removeExpiredAttempts();
                 cleanAt = Date.now() + 60000;
             }
-            const claim = await claimNativeJob();
-            if (claim)
-                await execute(claim);
-        }
-        catch {
+        },
+        claim: claimNativeJob,
+        renew: renewNativeJob,
+        execute,
+        onError: () => {
             console.warn("[groundwork] Native job worker is unavailable; queued records remain durable");
-        }
-        finally {
-            if (!stopping)
-                timer = setTimeout(dispatch, 1000);
-        }
-    }
-    function dispatch(): void { inFlight = tick(); }
-    dispatch();
-    return { stop: async () => {
-            stopping = true;
-            if (timer)
-                clearTimeout(timer);
-            active?.abort();
-            await inFlight;
-            started = false;
-        } };
+        },
+    });
+    const handle = { stop: async () => {
+        await loop.stop();
+        if (runningWorker === handle) runningWorker = null;
+    } };
+    runningWorker = handle;
+    return handle;
 }

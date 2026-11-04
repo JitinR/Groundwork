@@ -19,7 +19,6 @@ import auditRoutes from "./routes/audit.js";
 import projectRoutes from "./routes/projects.js";
 import workspaceRoutes from "./routes/workspaces.js";
 import nativeJobRoutes from "./routes/nativeJobs.js";
-import { startNativeJobWorker } from "./nativeJobWorker.js";
 import paymentRoutes from "./routes/payments.js";
 import assistantRoutes from "./routes/assistant.js";
 import shareRoutes from "./routes/share.js";
@@ -239,13 +238,12 @@ export async function startAuthorityServer() {
     }
   });
 
-  const nativeWorker = startNativeJobWorker();
   let resourceCleanup: Promise<void> | undefined;
   function stopResources(): Promise<void> {
     if (!resourceCleanup) {
       stopDatabaseScheduler();
       clearInterval(reconciliationTimer);
-      resourceCleanup = nativeWorker.stop().then(async () => {
+      resourceCleanup = (async () => {
         try {
           await checkpointDatabase("TRUNCATE");
         } catch (err) {
@@ -253,7 +251,7 @@ export async function startAuthorityServer() {
         }
         await drainTelemetry();
         await db.close();
-      });
+      })();
     }
     return resourceCleanup;
   }
