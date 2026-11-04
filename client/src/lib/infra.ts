@@ -192,6 +192,22 @@ export interface InfraExtent {
   h: number;
 }
 
+function airportLocalExtent(a: AirportDesign): InfraExtent {
+  const spacing = a.runwayWidthM + 400;
+  return {
+    w: a.runwayLengthM + 600,
+    d: a.runways > 1 ? a.runwayWidthM + a.apronDepthM * 2 + spacing + 600 : a.runwayWidthM + a.apronDepthM * 2 + 700,
+    h: 120,
+  };
+}
+
+/** Generated runways start along +X (east). Site/CAD north is -Z, so a
+ * clockwise compass bearing becomes (90 - bearing) about Three's +Y axis. */
+function airportRotation(heading: number): number {
+  const bearing = Number.isFinite(heading) ? ((heading % 360) + 360) % 360 : 90;
+  return (90 - bearing) * Math.PI / 180;
+}
+
 export function infraExtent(infra: InfraDesign): InfraExtent {
   switch (infra.kind) {
     case "highway": {
@@ -202,11 +218,12 @@ export function infraExtent(infra: InfraDesign): InfraExtent {
     }
     case "airport": {
       const a = infra.airport!;
-      const spacing = a.runwayWidthM + 400;
+      const local = airportLocalExtent(a), angle = airportRotation(a.runwayHeadingDeg);
+      const cos = Math.abs(Math.cos(angle)), sin = Math.abs(Math.sin(angle));
       return {
-        w: a.runwayLengthM + 600,
-        d: a.runways > 1 ? a.runwayWidthM + a.apronDepthM * 2 + spacing + 600 : a.runwayWidthM + a.apronDepthM * 2 + 700,
-        h: 120,
+        w: local.w * cos + local.d * sin,
+        d: local.w * sin + local.d * cos,
+        h: local.h,
       };
     }
     case "ports": {
@@ -339,6 +356,8 @@ function buildHighway(h: HighwayDesign, ext: InfraExtent, loc: InfraDesign["loca
 
 function buildAirport(a: AirportDesign, ext: InfraExtent): THREE.Group {
   const g = new THREE.Group();
+  g.name = "airport-layout";
+  g.rotation.y = airportRotation(a.runwayHeadingDeg);
 
   const concrete = material("#b9bcc0", { rough: 0.85 });
   const runwayMat = material("#4a4f56", { rough: 0.8 });
@@ -357,7 +376,9 @@ function buildAirport(a: AirportDesign, ext: InfraExtent): THREE.Group {
     const z = (i - (a.runways - 1) / 2) * spacing;
     // Runway + shoulders
     g.add(prismAt(0, 0.06, z, rl + 120, 0.12, rw + 2 * 7.5, concrete));
-    g.add(prismAt(0, 0.1, z, rl, 0.14, rw, runwayMat));
+    const runway = prismAt(0, 0.1, z, rl, 0.14, rw, runwayMat);
+    runway.name = `airport-runway-${i + 1}`;
+    g.add(runway);
     // Centreline dashes
     const n = Math.max(10, Math.floor(rl / 30));
     g.add(dashedLine(n, -rl / 2, z, rl / n, 0, 4, 0.5, markMat));
@@ -408,7 +429,9 @@ function buildAirport(a: AirportDesign, ext: InfraExtent): THREE.Group {
     }
   }
 
-  g.add(prismAt(0, -0.05, 0, ext.w, 0.1, ext.d, grass));
+  const pad = prismAt(0, -0.05, 0, ext.w, 0.1, ext.d, grass);
+  pad.name = "airport-layout-pad";
+  g.add(pad);
   return g;
 }
 
@@ -602,12 +625,16 @@ export function buildInfraScene(infra: InfraDesign, visualization?: Visualizatio
   const scene = infra.kind === "highway"
     ? buildHighway(infra.highway!, ext, infra.location)
     : infra.kind === "airport"
-      ? buildAirport(infra.airport!, ext)
+      ? new THREE.Group().add(buildAirport(infra.airport!, airportLocalExtent(infra.airport!)))
       : infra.kind === "ports"
         ? buildPort(infra.ports!, ext)
         : buildDam(infra.dams!, ext);
-  scene.add(buildTerrainVisualization(ext.w, ext.d, infra.terrain));
-  if (layerVisible("facilities")) addFacilities(scene, infra, ext, visualization);
+  const terrain = buildTerrainVisualization(ext.w, ext.d, infra.terrain);
+  terrain.name = "infrastructure-terrain";
+  scene.add(terrain);
+  // Authored/world-coordinate layers do not inherit the airport's rotation.
+  // Scheduled facilities retain their existing local-envelope placement.
+  if (layerVisible("facilities")) addFacilities(scene, infra, infra.kind === "airport" ? airportLocalExtent(infra.airport!) : ext, visualization);
   if (layerVisible("drafting")) for (const draft of infra.drafts ?? []) {
     const node = buildCivilDraft(draft);
     setScenePhase(node, draft.phaseId, visualization);

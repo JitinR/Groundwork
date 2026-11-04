@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { Box3, Vector3, type Group, type Mesh, type Object3D } from "three";
 import { defaultCommunity } from "../src/lib/community";
-import { defaultInfra } from "../src/lib/infra";
+import { buildInfraScene, defaultInfra, infraExtent, normalizeInfra } from "../src/lib/infra";
 import { communityAtSite, createSiteReference, infraAtSite, siteLocationValue, siteMeasuresInUnit, siteReferenceFields, type SiteReferenceInput } from "../src/lib/siteLocation";
 import { boundaryMetrics, haversine, localToLatLng, toLocalMetres } from "../src/lib/geo";
-import type { SiteLocation } from "../src/types";
+import type { AirportDesign, InfraDesign, SiteLocation } from "../src/types";
 
 test("one community site replacement preserves new coordinates and measured dimensions in every display unit", () => {
   const location: SiteLocation = { lat: 0, lng: 0, boundaryWidthM: 30.48, boundaryDepthM: 60.96, boundaryRotationDeg: 27 };
@@ -75,7 +76,7 @@ test("corridor bearing uses compass direction of the long axis", () => {
   assert.equal(createSiteReference({ ...measured, width: "20", depth: "80", rotation: "30", mode: "route" }).location.routeBearingDeg, 150);
   assert.equal(createSiteReference({ ...measured, width: "80", depth: "20", rotation: "30", mode: "route" }).location.routeBearingDeg, 60);
   const area = createSiteReference({ ...measured, width: "1800", depth: "1000", rotation: "30" });
-  assert.equal(infraAtSite(defaultInfra("airport"), area.location).airport!.runwayHeadingDeg, 60, "stored runway heading follows the measured long axis; renderer support is separate");
+  assert.equal(infraAtSite(defaultInfra("airport"), area.location).airport!.runwayHeadingDeg, 60, "runway axis bearing follows the measured long axis");
 });
 
 test("authored and legacy polygon corners survive reopen and reapply without becoming rectangles", () => {
@@ -151,4 +152,107 @@ test("infrastructure fitting uses the current action's site and preserves unrela
     assert.deepEqual(before.location, { lat: 40, lng: -74, boundaryWidthM: 10, boundaryDepthM: 10, routeLengthM: 20 });
     assert.equal(next.facilities, before.facilities);
   }
+});
+
+const near = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-7, `${actual} should equal ${expected}`);
+function airportAtHeading(heading: number): InfraDesign {
+  const infra = defaultInfra("airport");
+  return { ...infra, modelReady: true, airport: { ...infra.airport!, runwayHeadingDeg: heading }, terrain: { ...infra.terrain!, enabled: false } };
+}
+function runwayMesh(scene: Group): Mesh {
+  const runway = scene.getObjectByName("airport-runway-1") as Mesh | undefined;
+  assert.ok(runway?.isMesh);
+  return runway;
+}
+
+test("generated runway cardinal and oblique bearings preserve actual length and width in world coordinates", () => {
+  // Independent compass convention: east=+X, north=-Z. These expectations use
+  // known unit vectors, rather than reproducing the renderer's rotation formula.
+  for (const [heading, east, north] of [[0, 0, 1], [90, 1, 0], [180, 0, -1], [270, -1, 0], [30, 0.5, Math.sqrt(3) / 2]] as const) {
+    const infra = airportAtHeading(heading), before = structuredClone(infra);
+    const scene = buildInfraScene(infra);
+    scene.updateMatrixWorld(true);
+    const runway = runwayMesh(scene);
+    runway.geometry.computeBoundingBox();
+    const bounds = runway.geometry.boundingBox!;
+    const start = runway.localToWorld(new Vector3(bounds.min.x, 0, 0));
+    const end = runway.localToWorld(new Vector3(bounds.max.x, 0, 0));
+    const widthStart = runway.localToWorld(new Vector3(0, 0, bounds.min.z));
+    const widthEnd = runway.localToWorld(new Vector3(0, 0, bounds.max.z));
+    near(start.distanceTo(end), 3000);
+    near(widthStart.distanceTo(widthEnd), 45);
+    near(end.x - start.x, 3000 * east);
+    near(end.z - start.z, -3000 * north);
+    near(end.y - start.y, 0);
+    assert.deepEqual(infra, before, "rendering does not migrate saved project data");
+    near(scene.rotation.y, 0);
+  }
+});
+
+test("airport terrain/camera extents cover the rotated pad without rescaling its local dimensions", () => {
+  for (const heading of [0, 30, 45, 90]) {
+    const infra = airportAtHeading(heading), scene = buildInfraScene(infra);
+    const pad = scene.getObjectByName("airport-layout-pad") as Mesh;
+    assert.ok(pad);
+    pad.geometry.computeBoundingBox();
+    const local = pad.geometry.boundingBox!.getSize(new Vector3());
+    near(local.x, 3600); near(local.z, 1185);
+    scene.updateMatrixWorld(true);
+    const measured = new Box3().setFromObject(pad).getSize(new Vector3()), extent = infraExtent(infra);
+    near(extent.w, measured.x); near(extent.d, measured.z);
+    if (heading === 0) { near(extent.w, 1185); near(extent.d, 3600); }
+    if (heading === 90) { near(extent.w, 3600); near(extent.d, 1185); }
+  }
+});
+
+test("fitting a rotated geographic site turns the airport once and leaves authored world geometry unchanged", () => {
+  const site = createSiteReference({ ...measured, width: "1800", depth: "1000", rotation: "30" }).location;
+  const baseline = airportAtHeading(90);
+  const infra = infraAtSite({ ...baseline,
+    drafts: [{ id: "world-draft", kind: "line", x: 17, z: -23, w: 12, d: 0.2, rotationDeg: 18 }],
+    facilities: [{ id: "world-facility", kind: "warehouse", count: 1, lengthM: 11, widthM: 13, heightM: 17 }],
+    terrain: { ...baseline.terrain!, enabled: true, source: "survey", contoursVisible: false, samples: [
+      { x: 10, z: 20, elevationM: 2 }, { x: 80, z: 20, elevationM: 5 }, { x: 10, z: 90, elevationM: 10 },
+    ] },
+  }, site);
+  assert.equal(infra.airport!.runwayHeadingDeg, 60);
+  const before = structuredClone(infra), scene = buildInfraScene(infra);
+  scene.updateMatrixWorld(true);
+  const runway = runwayMesh(scene);
+  const axisStart = runway.localToWorld(new Vector3(-900, 0, 0)), axisEnd = runway.localToWorld(new Vector3(900, 0, 0));
+  near(axisEnd.x - axisStart.x, 900 * Math.sqrt(3));
+  near(axisEnd.z - axisStart.z, -900);
+  let draft: Object3D | undefined, facility: Object3D | undefined;
+  scene.traverse(node => {
+    if (node.userData.selectId === "world-draft") draft = node;
+    const parameters = ((node as Mesh).geometry as { parameters?: { width?: number; height?: number; depth?: number } } | undefined)?.parameters;
+    if (parameters?.width === 11 && parameters.height === 17 && parameters.depth === 13) facility = node;
+  });
+  assert.ok(draft && facility);
+  const draftPoint = draft.getWorldPosition(new Vector3());
+  near(draftPoint.x, 17); near(draftPoint.z, -23);
+  near(draft.rotation.y, 18 * Math.PI / 180);
+  const facilityPoint = facility.getWorldPosition(new Vector3());
+  near(facilityPoint.x, -(1800 + 600) / 2 + 20);
+  near(facilityPoint.z, -1185 / 2 + 20);
+  const terrain = scene.getObjectByName("infrastructure-terrain");
+  assert.ok(terrain);
+  const terrainBounds = new Box3().setFromObject(terrain);
+  near(terrainBounds.min.x, 10); near(terrainBounds.max.x, 80);
+  near(terrainBounds.min.z, 20); near(terrainBounds.max.z, 90);
+  assert.deepEqual(infra, before, "site boundary and saved world coordinates remain intact");
+});
+
+test("default and legacy airport bearings keep the existing east-west layout and empty projects remain empty", () => {
+  const original = airportAtHeading(90);
+  const { runwayHeadingDeg: _heading, ...legacy } = original.airport!;
+  const normalized = normalizeInfra({ ...original, airport: legacy as AirportDesign }, "airport");
+  assert.equal(normalized.airport!.runwayHeadingDeg, 90);
+  for (const infra of [original, normalized, airportAtHeading(Number.NaN)]) {
+    const scene = buildInfraScene(infra);
+    scene.updateMatrixWorld(true);
+    const runway = runwayMesh(scene), size = new Box3().setFromObject(runway).getSize(new Vector3());
+    near(size.x, 3000); near(size.z, 45);
+  }
+  assert.equal(buildInfraScene({ ...airportAtHeading(0), modelReady: false }).getObjectByName("airport-layout"), undefined);
 });
