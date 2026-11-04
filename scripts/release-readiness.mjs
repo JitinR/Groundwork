@@ -1,6 +1,17 @@
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+export const EVIDENCE_REQUEST_TIMEOUT_MS = 15_000;
+export const EVIDENCE_RETRY_DELAY_MS = 250;
+const defaultSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+export class ReleaseEvidenceError extends Error {
+  constructor(code) {
+    const valid = code === 'EVIDENCE_REQUEST_INVALID' || code === 'EVIDENCE_UNAVAILABLE';
+    super(valid && code === 'EVIDENCE_REQUEST_INVALID' ? 'Release evidence requires a body-free GitHub GET request' : 'Release evidence is unavailable after bounded read attempts');
+    this.name = 'ReleaseEvidenceError'; this.code = valid ? code : 'EVIDENCE_UNAVAILABLE';
+  }
+}
+
 export function validateRelease({ repository, commit, branch = 'main' }) {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository || '') || !/^[a-f0-9]{40}$/.test(commit || '') || !/^[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}$/.test(branch) || branch.includes('..') || branch.includes('//') || branch.endsWith('/')) throw new Error('Supply repository, full commit SHA and protected production branch');
   return { repository, commit, branch };
@@ -17,7 +28,7 @@ export function successfulGate(runs, commit, branch) {
 }
 /** Dependency-free, bounded reads work before npm installation and keep hook
  * credentials out of redirects, error messages, logs and provider responses. */
-export async function requestReleaseJson(request, url, init = {}, maximumBytes = 2_000_000, timeoutMs = 15_000) {
+export async function requestReleaseJson(request, url, init = {}, maximumBytes = 2_000_000, timeoutMs = EVIDENCE_REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('Release evidence request timed out')), timeoutMs);
   let onAbort;
@@ -51,11 +62,36 @@ export async function requestReleaseJson(request, url, init = {}, maximumBytes =
     return await Promise.race([work(), aborted]);
   } finally { clearTimeout(timer); if (onAbort) controller.signal.removeEventListener('abort', onAbort); }
 }
-export async function releaseReadiness(env = process.env, request = fetch) {
+
+/** One retry is reserved for read-only GitHub evidence. Deploy hooks cannot
+ * enter this path, even if somebody passes a GET method by mistake. */
+export async function requestReleaseEvidence(request, url, init = {}, {
+  sleep = defaultSleep, now = Date.now, timeoutMs = EVIDENCE_REQUEST_TIMEOUT_MS, deadlineMs = Infinity,
+} = {}) {
+  let endpoint;
+  try { endpoint = new URL(url); } catch { throw new ReleaseEvidenceError('EVIDENCE_REQUEST_INVALID'); }
+  if ((init.method ?? 'GET') !== 'GET' || init.body !== undefined || endpoint.origin !== 'https://api.github.com' ||
+      endpoint.username || endpoint.password || !endpoint.pathname.startsWith('/repos/') || endpoint.hash ||
+      !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > EVIDENCE_REQUEST_TIMEOUT_MS ||
+      !(deadlineMs === Infinity || Number.isFinite(deadlineMs))) throw new ReleaseEvidenceError('EVIDENCE_REQUEST_INVALID');
+  const deadline = Math.min(deadlineMs, now() + 2 * timeoutMs + EVIDENCE_RETRY_DELAY_MS);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const remaining = Math.min(timeoutMs, deadline - now());
+    if (remaining <= 0) break;
+    try { return await requestReleaseJson(request, endpoint.href, { ...init, method: 'GET' }, 2_000_000, remaining); }
+    catch {
+      if (attempt || now() + EVIDENCE_RETRY_DELAY_MS >= deadline) break;
+      await sleep(EVIDENCE_RETRY_DELAY_MS);
+    }
+  }
+  throw new ReleaseEvidenceError('EVIDENCE_UNAVAILABLE');
+}
+
+export async function releaseReadiness(env = process.env, request = fetch, evidenceOptions = {}) {
   const target = validateRelease({ repository: env.GITHUB_REPOSITORY, commit: env.RELEASE_COMMIT, branch: env.RELEASE_BRANCH || 'main' });
   const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'Groundwork-release-gate', ...(env.GITHUB_TOKEN ? { authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}) };
   async function get(path) {
-    return requestReleaseJson(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers });
+    return requestReleaseEvidence(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers }, evidenceOptions);
   }
   const branch = await get(`branches/${encodeURIComponent(target.branch)}`);
   if (branch.commit?.sha !== target.commit) throw new Error('Requested release is not the current production branch commit');
@@ -80,5 +116,8 @@ export async function releaseReadiness(env = process.env, request = fetch) {
   return { ok: true, ...target, ciRunId: run.id, ciRunAttempt: run.run_attempt, deploymentPerformed: false, checkedAt: new Date().toISOString() };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  releaseReadiness().then(result => console.log(JSON.stringify(result))).catch(() => { console.error('Release gate refused: current production-branch commit and successful matching CI evidence are required.'); process.exitCode = 1; });
+  releaseReadiness().then(result => console.log(JSON.stringify(result))).catch(error => {
+    const code = error instanceof ReleaseEvidenceError ? error.code : 'EVIDENCE_REJECTED';
+    console.error(`Release gate refused [${code}]: current production-branch commit and successful matching CI evidence are required.`); process.exitCode = 1;
+  });
 }
