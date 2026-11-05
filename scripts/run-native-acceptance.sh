@@ -7,7 +7,8 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 chrootbinary=$(command -v chroot)
 [[ $chrootbinary = /* && -x $chrootbinary ]] || { echo 'Requires the system chroot executable.' >&2; exit 1; }
 repo=$(cd "$(dirname "$0")/.." && pwd -P)
-root=/opt/groundwork-native-acceptance
+source "$repo/scripts/native-acceptance-root.sh"
+root=$(native_acceptance_root)
 mkdir -p "$root"
 exec 9>"$root/build.lock"
 flock -n 9 || { echo 'Another native build or acceptance run is active.' >&2; exit 1; }

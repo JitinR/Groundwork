@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { latestGate, releaseReadiness, requestReleaseJson, requestReleaseEvidence, ReleaseEvidenceError, validateRelease } from './release-readiness.mjs';
+import { latestGate, releaseReadiness, requestReleaseJson, requestReleaseEvidence, ReleaseEvidenceError, releaseEvidenceFailureDetail, validateRelease } from './release-readiness.mjs';
 
 export const DEPLOYMENT_REPOSITORY = 'jitinraavi/Secure-Nexus';
 export const DEPLOYMENT_PROJECT = 'prj_1blxFgztH32acCvngFaCVr4MqdGJ';
@@ -10,31 +10,53 @@ export const PREVIEW_CI_MAX_POLLS = 16;
 export const DEPLOY_HOOK_ACK_TIMEOUT_MS = 60_000;
 
 const deliveryMessages = Object.freeze({
-  RELEASE_CONFIGURATION_INVALID: 'Release event, target or build configuration is invalid; no hook was sent.',
-  EVIDENCE_UNAVAILABLE: 'Read-only CI evidence is unavailable after bounded attempts; no hook was sent.',
-  EVIDENCE_REJECTED: 'Exact current commit and required successful CI evidence were not confirmed; no hook was sent.',
-  HOOK_CONFIGURATION_INVALID: 'The project-scoped deploy hook configuration is invalid; no hook was sent.',
-  HOOK_ACK_UNCONFIRMED: 'Deploy hook acknowledgement was not confirmed; inspect Vercel before retrying. The POST is never retried automatically.',
-  PREVIEW_CI_BLOCKED: 'Preview CI is unavailable, pending beyond its deadline, stale or rejected; the build remains blocked.',
-  DELIVERY_UNEXPECTED: 'Delivery did not complete; inspect the verified target before taking further action.',
+  RELEASE_CONFIGURATION_INVALID: 'Release event, target or build configuration is invalid.',
+  EVIDENCE_UNAVAILABLE: 'Read-only CI evidence is unavailable after bounded attempts.',
+  EVIDENCE_REJECTED: 'Exact current commit and required successful CI evidence were not confirmed.',
+  HOOK_CONFIGURATION_INVALID: 'The project-scoped deploy hook configuration is invalid.',
+  HOOK_ACK_UNCONFIRMED: 'Deploy hook acknowledgement was not confirmed. Inspect Vercel before retrying. The POST is never retried automatically.',
+  PREVIEW_CI_BLOCKED: 'Preview CI is unavailable, pending beyond its deadline, stale or rejected. The build remains blocked.',
+  DELIVERY_UNEXPECTED: 'Delivery did not complete. Inspect the verified target before taking further action.',
 });
+const preDeliveryRefusals = new Set(['RELEASE_CONFIGURATION_INVALID', 'EVIDENCE_UNAVAILABLE', 'EVIDENCE_REJECTED', 'HOOK_CONFIGURATION_INVALID']);
+function deliveryMessage(code, stage) {
+  const message = deliveryMessages[code];
+  if (!preDeliveryRefusals.has(code)) return message;
+  return `${message} ${stage === 'build' ? 'The build remains blocked.' : 'No hook was sent.'}`;
+}
 export class DeploymentDeliveryError extends Error {
-  constructor(code) {
+  constructor(code, stage = 'hook', evidenceError) {
     const safeCode = Object.hasOwn(deliveryMessages, code) ? code : 'DELIVERY_UNEXPECTED';
-    super(deliveryMessages[safeCode]); this.name = 'DeploymentDeliveryError'; this.code = safeCode;
+    const safeStage = stage === 'build' ? 'build' : 'hook';
+    super(deliveryMessage(safeCode, safeStage));
+    this.name = 'DeploymentDeliveryError'; this.code = safeCode; this.stage = safeStage;
+    this.evidenceError = evidenceError instanceof ReleaseEvidenceError ? evidenceError : undefined;
   }
 }
 export function deploymentFailureDiagnostic(error) {
-  const code = error instanceof DeploymentDeliveryError && Object.hasOwn(deliveryMessages, error.code) ? error.code : error instanceof PreviewCiWaitError ? 'PREVIEW_CI_BLOCKED' : 'DELIVERY_UNEXPECTED';
-  return `Deployment gate refused [${code}]: ${deliveryMessages[code]}`;
+  if (error instanceof PreviewCiWaitError) return `Vercel build guard refused [PREVIEW_CI_BLOCKED]. ${deliveryMessages.PREVIEW_CI_BLOCKED}${releaseEvidenceFailureDetail(error.evidenceError)}`;
+  if (error instanceof DeploymentDeliveryError && Object.hasOwn(deliveryMessages, error.code) && error.code !== 'DELIVERY_UNEXPECTED') {
+    const gate = error.stage === 'build' ? 'Vercel build guard' : 'Deploy hook gate';
+    return `${gate} refused [${error.code}]. ${deliveryMessage(error.code, error.stage)}${releaseEvidenceFailureDetail(error.evidenceError)}`;
+  }
+  return `Deployment gate refused [DELIVERY_UNEXPECTED]. ${deliveryMessages.DELIVERY_UNEXPECTED}`;
 }
-async function verifiedRelease(env, request, evidenceOptions) {
+async function verifiedRelease(env, request, evidenceOptions, stage) {
   try { return await releaseReadiness(env, request, evidenceOptions); }
-  catch (error) { throw new DeploymentDeliveryError(error instanceof ReleaseEvidenceError ? error.code === 'EVIDENCE_REQUEST_INVALID' ? 'RELEASE_CONFIGURATION_INVALID' : 'EVIDENCE_UNAVAILABLE' : 'EVIDENCE_REJECTED'); }
+  catch (error) {
+    if (error instanceof ReleaseEvidenceError) {
+      const code = error.code === 'EVIDENCE_REQUEST_INVALID' ? 'RELEASE_CONFIGURATION_INVALID' : 'EVIDENCE_UNAVAILABLE';
+      throw new DeploymentDeliveryError(code, stage, error);
+    }
+    throw new DeploymentDeliveryError('EVIDENCE_REJECTED', stage);
+  }
 }
 
 export class PreviewCiWaitError extends Error {
-  constructor(message) { super(message); this.name = 'PreviewCiWaitError'; }
+  constructor(message, evidenceError) {
+    super(message); this.name = 'PreviewCiWaitError';
+    this.evidenceError = evidenceError instanceof ReleaseEvidenceError ? evidenceError : undefined;
+  }
 }
 
 /** Git starts previews before Actions finishes. Wait on one bounded public
@@ -48,17 +70,17 @@ export async function waitForPreviewCi(target, request = fetch, {
 } = {}) {
   const started = now(), deadline = started + PREVIEW_CI_WAIT_MS;
   const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'Groundwork-preview-gate' };
-  async function get(path) {
-    try { return await requestReleaseEvidence(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers }, { ...evidenceOptions, sleep, now, deadlineMs: deadline }); }
-    catch { throw new PreviewCiWaitError('Preview CI evidence is unavailable; deployment remains blocked.'); }
+  async function get(endpointLabel, path) {
+    try { return await requestReleaseEvidence(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers }, { ...evidenceOptions, sleep, now, deadlineMs: deadline, endpointLabel }); }
+    catch (error) { throw new PreviewCiWaitError('Preview CI evidence is unavailable. Deployment remains blocked.', error); }
   }
-  const branch = await get(`branches/${encodeURIComponent(target.branch)}`);
+  const branch = await get('branch', `branches/${encodeURIComponent(target.branch)}`);
   if (branch.commit?.sha !== target.commit) throw new PreviewCiWaitError('Preview commit is no longer the current branch head; deployment remains blocked.');
   const pending = new Set(['queued', 'in_progress', 'requested', 'waiting', 'pending']);
   const paths = new Set(['.github/workflows/ci.yml', `.github/workflows/ci.yml@${target.branch}`, `.github/workflows/ci.yml@refs/heads/${target.branch}`]);
   for (let attempt = 1; attempt <= PREVIEW_CI_MAX_POLLS; attempt += 1) {
     if (attempt > 1 && now() >= deadline) break;
-    const evidence = await get(`actions/workflows/ci.yml/runs?head_sha=${target.commit}&event=push&per_page=100`);
+    const evidence = await get('workflow-runs', `actions/workflows/ci.yml/runs?head_sha=${target.commit}&event=push&per_page=100`);
     if (!Array.isArray(evidence.workflow_runs) || evidence.workflow_runs.length > 100) throw new PreviewCiWaitError('Preview CI evidence is malformed; deployment remains blocked.');
     for (const item of evidence.workflow_runs) {
       if (!item || !Number.isSafeInteger(item.id) || item.id < 1 || !Number.isSafeInteger(item.run_number) || item.run_number < 1 ||
@@ -104,9 +126,9 @@ export function vercelBuildTarget(env) {
  * Public GitHub evidence needs no persistent Vercel-side GitHub credential. */
 export async function guardVercelBuild(env = process.env, request = fetch, waitOptions = {}) {
   let target;
-  try { target = vercelBuildTarget(env); } catch { throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID'); }
+  try { target = vercelBuildTarget(env); } catch { throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID', 'build'); }
   if (env.VERCEL_ENV === 'preview') await waitForPreviewCi(target, request, waitOptions);
-  const evidence = await verifiedRelease({ GITHUB_REPOSITORY: target.repository, RELEASE_COMMIT: target.commit, RELEASE_BRANCH: target.branch }, request, waitOptions.evidenceOptions);
+  const evidence = await verifiedRelease({ GITHUB_REPOSITORY: target.repository, RELEASE_COMMIT: target.commit, RELEASE_BRANCH: target.branch }, request, waitOptions.evidenceOptions, 'build');
   return { ...evidence, environment: env.VERCEL_ENV, buildPermitted: true };
 }
 /** A workflow_run job receives only its short-lived read-only GitHub token and
@@ -117,7 +139,7 @@ export async function deployAfterCi(env = process.env, request = fetch, { checkO
       !Number.isSafeInteger(hookTimeoutMs) || hookTimeoutMs < 1 || hookTimeoutMs > DEPLOY_HOOK_ACK_TIMEOUT_MS) throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID');
   try { validateRelease({ repository: env.GITHUB_REPOSITORY, commit: env.RELEASE_COMMIT, branch: env.RELEASE_BRANCH }); }
   catch { throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID'); }
-  const evidence = await verifiedRelease(env, request, evidenceOptions);
+  const evidence = await verifiedRelease(env, request, evidenceOptions, 'hook');
   if (checkOnly) return { ...evidence, hookTriggered: false };
   let hook;
   try { hook = approvedDeployHook(env.VERCEL_DEPLOY_HOOK); } catch { throw new DeploymentDeliveryError('HOOK_CONFIGURATION_INVALID'); }

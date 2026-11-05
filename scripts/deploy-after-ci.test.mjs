@@ -136,6 +136,35 @@ test('exhausted evidence reads stop after two attempts without sending the hook 
   assert.equal(expiredCalls.length, 1);
 });
 
+test('hook and build refusals retain the evidence endpoint and HTTP status with distinct delivery context', async () => {
+  const buildEnv = { VERCEL_ENV: 'production', VERCEL_GIT_COMMIT_SHA: commit, VERCEL_GIT_COMMIT_REF: 'main', GITHUB_TOKEN: 'private-build-token' };
+  const privateBody = 'private provider response', privateStatus = 'Private status text', privateHeader = 'private header value';
+  for (const stage of ['hook', 'build']) {
+    const fake = fakeGithub(), calls = [], waits = [];
+    const request = async (url, init) => {
+      calls.push({ url: String(url), method: init.method });
+      if (String(url).includes('/jobs?')) return new Response(privateBody, { status: 403, statusText: privateStatus, headers: { 'x-private-debug': privateHeader } });
+      return fake.request(url, init);
+    };
+    const options = { evidenceOptions: { sleep: async ms => waits.push(ms) } };
+    const failure = stage === 'hook' ? deployAfterCi(environment(), request, options) : guardVercelBuild(buildEnv, request, options);
+    await assert.rejects(failure, error => {
+      assert.equal(error.code, 'EVIDENCE_UNAVAILABLE');
+      const diagnostic = deploymentFailureDiagnostic(error);
+      assert.match(diagnostic, stage === 'hook' ? /^Deploy hook gate refused / : /^Vercel build guard refused /);
+      assert.match(diagnostic, /\[endpoint=jobs reason=http httpStatus=403\]$/);
+      assert.equal(diagnostic.includes('No hook was sent.'), stage === 'hook');
+      assert.equal(diagnostic.includes('The build remains blocked.'), stage === 'build');
+      assert.doesNotMatch(diagnostic, /throttl|rate.limit/i);
+      for (const secret of [hook, privateBody, privateStatus, privateHeader, buildEnv.GITHUB_TOKEN, environment().GITHUB_TOKEN, 'https://api.github.com']) assert.ok(!diagnostic.includes(secret));
+      return true;
+    });
+    assert.equal(calls.filter(call => call.url.includes('/jobs?')).length, 2);
+    assert.deepEqual(waits, [250]);
+    assert.ok(calls.every(call => call.method === 'GET'));
+  }
+});
+
 test('delivery diagnostics distinguish rejected evidence, configuration and ambiguous POST using only fixed codes', async () => {
   const rejected = fakeGithub({ branchCommits: [otherCommit] });
   await assert.rejects(deployAfterCi(environment(), rejected.request), { code: 'EVIDENCE_REJECTED' });
@@ -225,6 +254,20 @@ test('preview waits for CI registration and completion, then checks fresh jobs a
   assert.equal(fixture.calls.filter(url => url.includes('/jobs?')).length, 1);
   assert.equal(fixture.calls.filter(url => url.includes('/branches/')).length, 3);
   assert.equal(fixture.calls.length, 10, 'pending polls must not repeat the full five-request verification');
+});
+
+test('preview polling keeps the failed evidence endpoint and redacts malformed response text', async () => {
+  const fixture = previewFixture([[]]), body = 'private malformed GitHub response';
+  const request = async (url, init) => String(url).includes('/branches/') ? fixture.request(url, init) : new Response(body);
+  await assert.rejects(guardVercelBuild(fixture.env, request, fixture.options), error => {
+    const diagnostic = deploymentFailureDiagnostic(error);
+    assert.match(diagnostic, /^Vercel build guard refused \[PREVIEW_CI_BLOCKED\]/);
+    assert.match(diagnostic, /\[endpoint=workflow-runs reason=invalid-response\]$/);
+    assert.ok(!diagnostic.includes(body));
+    assert.ok(!diagnostic.includes('No hook was sent.'));
+    return true;
+  });
+  assert.deepEqual(fixture.sleeps, [250]);
 });
 
 test('preview rejects failed or cancelled CI and malformed or foreign evidence without waiting', async () => {

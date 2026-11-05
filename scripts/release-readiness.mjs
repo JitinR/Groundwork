@@ -4,12 +4,35 @@ import { pathToFileURL } from 'node:url';
 export const EVIDENCE_REQUEST_TIMEOUT_MS = 15_000;
 export const EVIDENCE_RETRY_DELAY_MS = 250;
 const defaultSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const evidenceEndpoints = new Set(['branch', 'workflow-runs', 'jobs']);
+const evidenceReasons = new Set(['http', 'transport', 'timeout', 'invalid-response', 'response-limit', 'deadline']);
+const validHttpStatus = status => Number.isInteger(status) && status >= 100 && status <= 599;
+
+class ReleaseReadError extends Error {
+  constructor(message, reason, httpStatus) {
+    super(message);
+    this.reason = reason;
+    this.httpStatus = httpStatus;
+  }
+}
 export class ReleaseEvidenceError extends Error {
-  constructor(code) {
+  constructor(code, { endpoint, reason, httpStatus } = {}) {
     const valid = code === 'EVIDENCE_REQUEST_INVALID' || code === 'EVIDENCE_UNAVAILABLE';
     super(valid && code === 'EVIDENCE_REQUEST_INVALID' ? 'Release evidence requires a body-free GitHub GET request' : 'Release evidence is unavailable after bounded read attempts');
     this.name = 'ReleaseEvidenceError'; this.code = valid ? code : 'EVIDENCE_UNAVAILABLE';
+    this.endpoint = evidenceEndpoints.has(endpoint) ? endpoint : undefined;
+    this.reason = evidenceReasons.has(reason) ? reason : undefined;
+    this.httpStatus = reason === 'http' && validHttpStatus(httpStatus) ? httpStatus : undefined;
   }
+}
+export function releaseEvidenceFailureDetail(error) {
+  if (!(error instanceof ReleaseEvidenceError) || error.code !== 'EVIDENCE_UNAVAILABLE') return '';
+  const { endpoint, reason, httpStatus } = error;
+  const fields = [];
+  if (evidenceEndpoints.has(endpoint)) fields.push(`endpoint=${endpoint}`);
+  if (evidenceReasons.has(reason)) fields.push(`reason=${reason}`);
+  if (reason === 'http' && validHttpStatus(httpStatus)) fields.push(`httpStatus=${httpStatus}`);
+  return fields.length ? ` [${fields.join(' ')}]` : '';
 }
 
 export function validateRelease({ repository, commit, branch = 'main' }) {
@@ -30,18 +53,22 @@ export function successfulGate(runs, commit, branch) {
  * credentials out of redirects, error messages, logs and provider responses. */
 export async function requestReleaseJson(request, url, init = {}, maximumBytes = 2_000_000, timeoutMs = EVIDENCE_REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('Release evidence request timed out')), timeoutMs);
+  const timer = setTimeout(() => controller.abort(new ReleaseReadError('Release evidence request timed out', 'timeout')), timeoutMs);
   let onAbort;
   try {
     const aborted = new Promise((_, reject) => { onAbort = () => reject(controller.signal.reason); controller.signal.addEventListener('abort', onAbort, { once: true }); });
     const work = async () => {
       const response = await request(url, { ...init, redirect: 'error', signal: controller.signal });
-      if (!response.ok || Number(response.headers.get('content-length')) > maximumBytes) {
+      if (!response.ok) {
         void response.body?.cancel().catch(() => undefined);
-        throw new Error('Release evidence request was rejected');
+        throw new ReleaseReadError('Release evidence request was rejected', 'http', response.status);
+      }
+      if (Number(response.headers.get('content-length')) > maximumBytes) {
+        void response.body?.cancel().catch(() => undefined);
+        throw new ReleaseReadError('Release evidence response exceeded its limit', 'response-limit');
       }
       const reader = response.body?.getReader();
-      if (!reader) throw new Error('Release evidence response was empty');
+      if (!reader) throw new ReleaseReadError('Release evidence response was empty', 'invalid-response');
       const chunks = []; let total = 0;
       const cancel = () => { void reader.cancel(controller.signal.reason).catch(() => undefined); };
       controller.signal.addEventListener('abort', cancel, { once: true });
@@ -52,10 +79,11 @@ export async function requestReleaseJson(request, url, init = {}, maximumBytes =
           controller.signal.throwIfAborted();
           if (part.done) break;
           total += part.value.byteLength;
-          if (total > maximumBytes) throw new Error('Release evidence response exceeded its limit');
+          if (total > maximumBytes) throw new ReleaseReadError('Release evidence response exceeded its limit', 'response-limit');
           chunks.push(part.value);
         }
-        return JSON.parse(Buffer.concat(chunks, total).toString('utf8'));
+        try { return JSON.parse(Buffer.concat(chunks, total).toString('utf8')); }
+        catch { throw new ReleaseReadError('Release evidence response was not valid JSON', 'invalid-response'); }
       } catch (error) { void reader.cancel(error).catch(() => undefined); throw error; }
       finally { controller.signal.removeEventListener('abort', cancel); reader.releaseLock(); }
     };
@@ -66,7 +94,7 @@ export async function requestReleaseJson(request, url, init = {}, maximumBytes =
 /** One retry is reserved for read-only GitHub evidence. Deploy hooks cannot
  * enter this path, even if somebody passes a GET method by mistake. */
 export async function requestReleaseEvidence(request, url, init = {}, {
-  sleep = defaultSleep, now = Date.now, timeoutMs = EVIDENCE_REQUEST_TIMEOUT_MS, deadlineMs = Infinity,
+  sleep = defaultSleep, now = Date.now, timeoutMs = EVIDENCE_REQUEST_TIMEOUT_MS, deadlineMs = Infinity, endpointLabel,
 } = {}) {
   let endpoint;
   try { endpoint = new URL(url); } catch { throw new ReleaseEvidenceError('EVIDENCE_REQUEST_INVALID'); }
@@ -75,49 +103,51 @@ export async function requestReleaseEvidence(request, url, init = {}, {
       !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > EVIDENCE_REQUEST_TIMEOUT_MS ||
       !(deadlineMs === Infinity || Number.isFinite(deadlineMs))) throw new ReleaseEvidenceError('EVIDENCE_REQUEST_INVALID');
   const deadline = Math.min(deadlineMs, now() + 2 * timeoutMs + EVIDENCE_RETRY_DELAY_MS);
+  let failure = { reason: 'deadline' };
   for (let attempt = 0; attempt < 2; attempt++) {
     const remaining = Math.min(timeoutMs, deadline - now());
     if (remaining <= 0) break;
     try { return await requestReleaseJson(request, endpoint.href, { ...init, method: 'GET' }, 2_000_000, remaining); }
-    catch {
+    catch (error) {
+      failure = error instanceof ReleaseReadError ? { reason: error.reason, httpStatus: error.httpStatus } : { reason: 'transport' };
       if (attempt || now() + EVIDENCE_RETRY_DELAY_MS >= deadline) break;
       await sleep(EVIDENCE_RETRY_DELAY_MS);
     }
   }
-  throw new ReleaseEvidenceError('EVIDENCE_UNAVAILABLE');
+  throw new ReleaseEvidenceError('EVIDENCE_UNAVAILABLE', { endpoint: endpointLabel, ...failure });
 }
 
 export async function releaseReadiness(env = process.env, request = fetch, evidenceOptions = {}) {
   const target = validateRelease({ repository: env.GITHUB_REPOSITORY, commit: env.RELEASE_COMMIT, branch: env.RELEASE_BRANCH || 'main' });
   const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', 'user-agent': 'Groundwork-release-gate', ...(env.GITHUB_TOKEN ? { authorization: `Bearer ${env.GITHUB_TOKEN}` } : {}) };
-  async function get(path) {
-    return requestReleaseEvidence(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers }, evidenceOptions);
+  async function get(endpointLabel, path) {
+    return requestReleaseEvidence(request, `https://api.github.com/repos/${target.repository}/${path}`, { headers }, { ...evidenceOptions, endpointLabel });
   }
-  const branch = await get(`branches/${encodeURIComponent(target.branch)}`);
+  const branch = await get('branch', `branches/${encodeURIComponent(target.branch)}`);
   if (branch.commit?.sha !== target.commit) throw new Error('Requested release is not the current production branch commit');
-  const evidence = await get(`actions/workflows/ci.yml/runs?head_sha=${target.commit}&event=push&per_page=100`);
+  const evidence = await get('workflow-runs', `actions/workflows/ci.yml/runs?head_sha=${target.commit}&event=push&per_page=100`);
   if (!Array.isArray(evidence.workflow_runs)) throw new Error('GitHub CI evidence is invalid');
   const run = latestGate(evidence.workflow_runs, target.commit, target.branch);
   if (!run || !successfulGate([run], target.commit, target.branch)) throw new Error('Latest matching CI run has not passed');
   if (!Number.isSafeInteger(run.id) || run.id < 1 || !Number.isSafeInteger(run.run_attempt) || run.run_attempt < 1 ||
       run.repository?.full_name?.toLowerCase() !== target.repository.toLowerCase() || run.head_repository?.full_name?.toLowerCase() !== target.repository.toLowerCase()) throw new Error('CI run does not belong to the release repository');
   if (env.RELEASE_RUN_ID && String(run.id) !== env.RELEASE_RUN_ID || env.RELEASE_RUN_ATTEMPT && String(run.run_attempt) !== env.RELEASE_RUN_ATTEMPT) throw new Error('The triggering CI run is no longer the latest successful attempt');
-  const jobs = await get(`actions/runs/${run.id}/jobs?filter=latest&per_page=100`);
+  const jobs = await get('jobs', `actions/runs/${run.id}/jobs?filter=latest&per_page=100`);
   if (!Array.isArray(jobs.jobs) || jobs.jobs.length > 100 || jobs.total_count !== jobs.jobs.length) throw new Error('CI job evidence is incomplete');
   for (const name of ['verify', 'backup-drill', 'release-gate']) {
     const matching = jobs.jobs.filter(job => job.name === name);
     if (matching.length !== 1 || matching[0].run_id !== run.id || matching[0].head_sha !== target.commit || matching[0].status !== 'completed' || matching[0].conclusion !== 'success') throw new Error('Required CI verification or backup drill has not passed');
   }
-  const refreshedEvidence = await get(`actions/workflows/ci.yml/runs?head_sha=${target.commit}&event=push&per_page=100`);
+  const refreshedEvidence = await get('workflow-runs', `actions/workflows/ci.yml/runs?head_sha=${target.commit}&event=push&per_page=100`);
   const refreshed = Array.isArray(refreshedEvidence.workflow_runs) ? latestGate(refreshedEvidence.workflow_runs, target.commit, target.branch) : null;
   if (!refreshed || refreshed.id !== run.id || refreshed.run_attempt !== run.run_attempt || refreshed.status !== 'completed' || refreshed.conclusion !== 'success') throw new Error('CI evidence changed during release verification');
-  const current = await get(`branches/${encodeURIComponent(target.branch)}`);
+  const current = await get('branch', `branches/${encodeURIComponent(target.branch)}`);
   if (current.commit?.sha !== target.commit) throw new Error('Production branch advanced during release verification');
   return { ok: true, ...target, ciRunId: run.id, ciRunAttempt: run.run_attempt, deploymentPerformed: false, checkedAt: new Date().toISOString() };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   releaseReadiness().then(result => console.log(JSON.stringify(result))).catch(error => {
     const code = error instanceof ReleaseEvidenceError ? error.code : 'EVIDENCE_REJECTED';
-    console.error(`Release gate refused [${code}]: current production-branch commit and successful matching CI evidence are required.`); process.exitCode = 1;
+    console.error(`Release gate refused [${code}]. Current production-branch commit and successful matching CI evidence are required.${releaseEvidenceFailureDetail(error)}`); process.exitCode = 1;
   });
 }
