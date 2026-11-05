@@ -5,7 +5,8 @@ set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 [[ $(uname -s) = Linux && $(uname -m) = x86_64 && $(id -u) = 0 ]] || { echo 'Requires root on x86_64 Linux.' >&2; exit 1; }
-root=/opt/groundwork-native-acceptance
+source "$(dirname -- "${BASH_SOURCE[0]}")/native-acceptance-root.sh"
+root=$(native_acceptance_root)
 mkdir -p "$root/downloads" "$root/sources" "$root/build" "$root/runtime/bin"
 exec 9>"$root/build.lock"
 flock -n 9 || { echo 'Another native acceptance build is running.' >&2; exit 1; }

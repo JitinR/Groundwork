@@ -52,7 +52,7 @@ def protected_directory(filename):
     for target in (path, *path.parents):
         info = target.lstat()
         require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
-                info.st_mode & 0o7022 == 0, "Root-owned protected directories are required")
+                info.st_mode & 0o7022 == 0, f"Native acceptance directory is not protected: {target}")
     return path
 
 
@@ -108,14 +108,23 @@ def stage_source(repo, root):
 
 
 def write_report(directory, value):
+    created = not directory.exists()
     directory.mkdir(parents=True, exist_ok=True)
     require(directory.resolve(strict=True) == directory and not directory.is_symlink(),
             "Evidence directory must be canonical")
-    descriptor = os.open(directory / "report.json", os.O_WRONLY | os.O_CREAT |
-                         os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
-    with os.fdopen(descriptor, "w", encoding="utf8") as handle:
-        json.dump(value, handle, indent=2)
-        handle.write("\n")
+    if created:
+        os.chmod(directory, 0o755)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=".report-", encoding="utf8", delete=False) as handle:
+            temporary = pathlib.Path(handle.name)
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            os.fchmod(handle.fileno(), 0o644)
+        temporary.replace(directory / "report.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def terminate(process, seconds=15):
@@ -228,6 +237,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent.parent)
     parser.add_argument("--runtime", type=pathlib.Path, default=pathlib.Path("/opt/groundwork-native-acceptance/runtime"))
+    parser.add_argument("--acceptance-root", type=pathlib.Path, default=pathlib.Path("/opt/groundwork-native-worker-acceptance"))
     parser.add_argument("--cgroup-parent", type=pathlib.Path, default=pathlib.Path("/sys/fs/cgroup"))
     parser.add_argument("--node", type=pathlib.Path, default=pathlib.Path(os.environ.get("GROUNDWORK_NATIVE_NODE_PATH", "/usr/bin/node")))
     parser.add_argument("--with-authority", action="store_true", help="also exercise the sealed worker and real HTTPS API on synthetic local data")
@@ -249,10 +259,13 @@ def main():
     require(stat.S_ISREG(node_info.st_mode) and node_info.st_uid == 0 and
             node_info.st_mode & 0o7022 == 0 and node_info.st_nlink == 1,
             "A protected root-owned Node executable is required")
-    root = pathlib.Path("/opt/groundwork-native-worker-acceptance")
+    root = options.acceptance_root
+    require(root.is_absolute() and root.resolve() == root and root.name.startswith("groundwork-native-worker-acceptance"),
+            "Use a canonical dedicated native worker acceptance root")
     protected_directory(root.parent)
     if not root.exists():
         root.mkdir(mode=0o755)
+        os.chmod(root, 0o755)
     protected_directory(root)
     mirror, hashes = stage_source(repo, root)
     install = root / ("groundwork-native-executor-" + mirror.name[7:])

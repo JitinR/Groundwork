@@ -18,6 +18,8 @@ sudo env GROUNDWORK_NATIVE_NODE_PATH="$(command -v node)" bash scripts/run-nativ
 
 Node 22 must be installed first. On WSL when dependencies were installed with Windows Node, generate the fixture and build TypeScript on Windows, then run the two shell scripts inside Ubuntu against the shared checkout. Do not reuse Windows native npm binaries as Linux executables. The launcher accepts an absolute `GROUNDWORK_NATIVE_NODE_PATH` for standalone Node installations, including CI's setup-node tool cache.
 
+The two scripts share `GROUNDWORK_NATIVE_ACCEPTANCE_ROOT`. CI sets it to `/var/lib/groundwork-native-acceptance-ci` so every ancestor of the built runtime and staged Node binary can pass the worker's ownership checks. The local default remains `/opt/groundwork-native-acceptance`. A custom path must be canonical, use the `groundwork-native-acceptance` directory prefix and have root-owned ancestors without group or other write permission.
+
 Source build concurrency defaults to two and is bounded to one through four by `GROUNDWORK_NATIVE_BUILD_JOBS`. Build and acceptance runs share an exclusive lock. Source downloads use HTTPS and exact SHA-256 checks:
 
 | Runtime | Official source | SHA-256 |
