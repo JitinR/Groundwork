@@ -55,8 +55,6 @@ jobs:
           stat -c '%a %u %g %n' /opt /var /var/lib
           sudo install -d -m 0755 "$GROUNDWORK_NATIVE_ACCEPTANCE_ROOT"
           mkdir -p artifacts/native-worker-acceptance
-          sudo setpriv --reuid=10003 --regid=10003 --clear-groups --bounding-set=-all --no-new-privs \
-            /usr/bin/test -r "$GITHUB_WORKSPACE/scripts/native-worker-authority-acceptance.mjs"
       - name: Install Ubuntu source-build dependencies
         run: |
           sudo apt-get update -qq
@@ -82,8 +80,9 @@ jobs:
               printf "+cpu +memory +pids\n" > "$parent/cgroup.subtree_control"
               exec /usr/bin/python3 -I -S "$1/scripts/run-native-worker-acceptance.py" \
                 --repo "$1" --node "$2" --cgroup-parent "$parent" --with-authority \
-                --runtime "$3/runtime" --acceptance-root "$3/groundwork-native-worker-acceptance"
-            ' -- "$GITHUB_WORKSPACE" "$native_node" "$GROUNDWORK_NATIVE_ACCEPTANCE_ROOT"
+                --runtime "$3/runtime" --acceptance-root "$3/groundwork-native-worker-acceptance" \
+                --authority-uid "$4" --authority-gid "$5"
+            ' -- "$GITHUB_WORKSPACE" "$native_node" "$GROUNDWORK_NATIVE_ACCEPTANCE_ROOT" "$(id -u)" "$(id -g)"
       - name: Save synthetic native acceptance evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

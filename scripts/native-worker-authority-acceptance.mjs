@@ -5,9 +5,12 @@ import { createHash, randomBytes } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createServer, request as httpsRequest } from 'node:https';
 import dotenv from 'dotenv';
+import { requireUnprivilegedNativeWorkerStatus } from '../server/dist/nativeWorkerClientConfig.js';
 
 const [certificatePath, keyPath, directory, statePath, tokenSha256, drawingPath] = process.argv.slice(2);
-assert.equal(process.platform, 'linux'); assert.equal(process.getuid(), 10003);
+assert.equal(process.platform, 'linux');
+for (const identity of [process.getuid(), process.getgid()]) assert.ok(identity > 0 && ![10001, 10002].includes(identity));
+requireUnprivilegedNativeWorkerStatus(await readFile('/proc/self/status', 'utf8'));
 assert.match(tokenSha256, /^[a-f0-9]{64}$/);
 dotenv.config = () => ({ parsed: {} });
 Object.assign(process.env, {

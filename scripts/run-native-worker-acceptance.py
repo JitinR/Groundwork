@@ -137,7 +137,7 @@ def terminate(process, seconds=15):
             process.wait(timeout=5)
 
 
-def local_authority_flow(repo, root, mirror, node, socketdir):
+def local_authority_flow(repo, root, mirror, node, socketdir, authority_uid, authority_gid):
     """Exercise the shipped launcher against the real API on local HTTPS."""
     worker_install = root / ("groundwork-native-worker-" + mirror.name[7:])
     with tempfile.TemporaryDirectory(prefix="tls-flow-", dir=root) as temporary:
@@ -163,7 +163,7 @@ def local_authority_flow(repo, root, mirror, node, socketdir):
         resolver = credentials / "resolver.conf"
         resolver.write_text("nameserver 127.0.0.1\n")
         for item in (authority_data, cert, key):
-            os.chown(item, 10003, 10003)
+            os.chown(item, authority_uid, authority_gid)
         subprocess.run(["/usr/bin/bash", str(mirror / "scripts/stage-native-worker.sh"), str(worker_install)],
                        check=True, cwd="/", env={"GROUNDWORK_NATIVE_NODE_PATH": str(node), "GROUNDWORK_NATIVE_CA_BUNDLE": str(ca),
                                                 "GROUNDWORK_NATIVE_RESOLVER_FILE": str(resolver)},
@@ -179,7 +179,7 @@ def local_authority_flow(repo, root, mirror, node, socketdir):
         authority, worker = None, None
         with open(flow / "authority.log", "w+b") as authority_log, open(flow / "worker.log", "w+b") as worker_log:
             try:
-                authority = subprocess.Popen(["/usr/bin/setpriv", "--reuid=10003", "--regid=10003", "--clear-groups",
+                authority = subprocess.Popen(["/usr/bin/setpriv", f"--reuid={authority_uid}", f"--regid={authority_gid}", "--clear-groups",
                     "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", "--", str(node),
                     str(repo / "scripts/native-worker-authority-acceptance.mjs"), str(cert), str(key), str(authority_data), str(state),
                     fingerprint, str(mirror / "artifacts/native-acceptance/source.dxf")], cwd="/", env={}, stdin=subprocess.DEVNULL,
@@ -241,9 +241,13 @@ def main():
     parser.add_argument("--cgroup-parent", type=pathlib.Path, default=pathlib.Path("/sys/fs/cgroup"))
     parser.add_argument("--node", type=pathlib.Path, default=pathlib.Path(os.environ.get("GROUNDWORK_NATIVE_NODE_PATH", "/usr/bin/node")))
     parser.add_argument("--with-authority", action="store_true", help="also exercise the sealed worker and real HTTPS API on synthetic local data")
+    parser.add_argument("--authority-uid", type=int, default=10003, help="unprivileged identity for the synthetic API fixture")
+    parser.add_argument("--authority-gid", type=int, default=10003, help="unprivileged group for the synthetic API fixture")
     options = parser.parse_args()
     require(sys.platform == "linux" and os.geteuid() == 0 and os.uname().machine == "x86_64",
             "Acceptance requires root on x86_64 Linux")
+    require(all(0 < value < 2**31 and value not in (10001, 10002) for value in (options.authority_uid, options.authority_gid)),
+            "Synthetic API fixture requires a distinct unprivileged UID and GID")
     os.umask(0o077)
     repo = options.repo.resolve(strict=True)
     output = repo / "artifacts/native-worker-acceptance"
@@ -329,7 +333,7 @@ def main():
                 "Cancellation was not observed")
         report["checks"].append({"name": "client-EOF-cancels-active-namespace-and-cleans-cgroup", "passed": True})
         if options.with_authority:
-            flow = local_authority_flow(repo, root, mirror, node, socketdir)
+            flow = local_authority_flow(repo, root, mirror, node, socketdir, options.authority_uid, options.authority_gid)
             report["checks"].extend(flow["checks"])
     finally:
         terminate(probe, 5)
