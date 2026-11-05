@@ -26,6 +26,7 @@
     "db:import": "node --disable-warning=ExperimentalWarning server/dist/databaseCommand.js import",
     "db:verify": "node --disable-warning=ExperimentalWarning server/dist/databaseCommand.js verify",
     "test:postgres-flow": "node --disable-warning=ExperimentalWarning --import tsx scripts/postgres-integration-check.cjs",
+    "test:native-worker:postgres": "node scripts/test-native-worker-postgres.mjs",
     "test:operations": "node --test scripts/operational-tools.test.mjs scripts/backup-tools.test.mjs scripts/release-readiness.test.mjs scripts/deploy-after-ci.test.mjs",
     "ops:health": "node scripts/operational-health.mjs",
     "ops:performance": "node scripts/operational-performance.mjs",

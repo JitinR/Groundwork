@@ -50,6 +50,8 @@ yarn-debug.log*
 yarn-error.log*
 .serverless/
 artifacts/
+__pycache__/
+*.pyc
 
 # OS metadata
 .DS_Store

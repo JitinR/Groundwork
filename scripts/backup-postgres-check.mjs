@@ -18,6 +18,7 @@ try {
   await source.connect(); await target.connect();
   await source.query(await readFile('server/supabase/migrations/20261019191555_groundwork_private_database.sql', 'utf8'));
   await source.query(await readFile('server/supabase/migrations/20261021153936_engineering_runtime.sql', 'utf8'));
+  await source.query(await readFile('server/supabase/migrations/20261104191702_native_worker_transport.sql', 'utf8'));
   await source.query("INSERT INTO groundwork.users(id,email,password_salt,password_hash,password_changed_at,created_at,updated_at) VALUES ('backup-fixture','synthetic@example.test','synthetic-salt','synthetic-hash',1,1,1)");
   await source.query("CREATE ROLE groundwork_backup_fixture LOGIN PASSWORD 'synthetic-ci-only' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS IN ROLE groundwork_runtime");
   await source.query("ALTER ROLE groundwork_backup_fixture SET extra_float_digits=0");

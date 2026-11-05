@@ -71,6 +71,17 @@ test("serverless browser mutations require the configured origin or trusted depl
   assert.equal(request({ ...headers, origin: "https://attacker.example.com" }, "POST", "/payments/webhook").status, 403);
 });
 
+test("native machine origin exceptions cover only exact versioned POST actions", () => {
+  const headers = { "x-vercel-forwarded-for": "203.0.113.8" }, job = "a".repeat(32);
+  for (const suffix of ["claim", ...["renew", "input", "output", "complete", "fail"].map(action => `jobs/${job}/${action}`)]) {
+    assert.equal(request(headers, "POST", `/native-worker/v1/${suffix}`).nextCalled, true);
+  }
+  for (const pathname of ["/native-worker/v1/claim/extra", "/native-worker/v1//claim", `/native-worker/v1/jobs/${job}/delete`, "/native-worker/v2/claim", "/projects"]) {
+    assert.equal(request(headers, "POST", pathname).status, 403);
+  }
+  assert.equal(request(headers, "DELETE", `/native-worker/v1/jobs/${job}/complete`).status, 403);
+});
+
 class StreamResponse extends EventEmitter {
   destroyed = false;
   writableEnded = false;

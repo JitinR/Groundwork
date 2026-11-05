@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { isIP } from "node:net";
-import type { RequestHandler } from "express";
+import type { Request, RequestHandler } from "express";
 import { MASTER_KEY } from "./config.js";
 import { db, type Db } from "./db.js";
 
@@ -24,6 +24,7 @@ export function rateLimitIdentity(address: string): string {
 export function sharedRateLimiter(options: {
   namespace: string; limit: number; windowMs: number; message: string;
   database?: Db; clock?: () => number;
+  identity?: (request: Request) => string;
 }): RequestHandler {
   const database = options.database ?? db;
   const clock = options.clock ?? Date.now;
@@ -33,7 +34,8 @@ export function sharedRateLimiter(options: {
       const time = clock();
       const start = Math.floor(time / options.windowMs) * options.windowMs;
       const reset = Math.ceil((start + options.windowMs - time) / 1000);
-      const identity = createHmac("sha256", MASTER_KEY).update(`rate:v1:${options.namespace}:${rateLimitIdentity(req.ip || req.socket.remoteAddress || "unknown")}`).digest("hex");
+      const subject = options.identity ? options.identity(req) : rateLimitIdentity(req.ip || req.socket.remoteAddress || "unknown");
+      const identity = createHmac("sha256", MASTER_KEY).update(`rate:v1:${options.namespace}:${subject.slice(0, 256)}`).digest("hex");
       const result = await database.prepare(`INSERT INTO runtime_rate_windows (bucket_key,window_start,hits,expires_at)
         VALUES (?,?,1,?) ON CONFLICT(bucket_key,window_start) DO UPDATE SET hits=runtime_rate_windows.hits+1 RETURNING hits`)
         .get(identity, start, start + options.windowMs * 2) as { hits: number };

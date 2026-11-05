@@ -48,6 +48,7 @@ async function run() {
   try {
     await engine.exec(fs.readFileSync(path.join(root, 'server/supabase/migrations/20261019191555_groundwork_private_database.sql'), 'utf8'));
     await engine.exec(fs.readFileSync(path.join(root, 'server/supabase/migrations/20261021153936_engineering_runtime.sql'), 'utf8'));
+    await engine.exec(fs.readFileSync(path.join(root, 'server/supabase/migrations/20261104191702_native_worker_transport.sql'), 'utf8'));
     await engine.exec('SET ROLE groundwork_runtime');
     const load = file => import(pathToFileURL(path.join(root, file)).href);
     const [{ app }, { db, now }, { hashPassword }] = await Promise.all([

@@ -342,6 +342,7 @@ CREATE TABLE IF NOT EXISTS project_native_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_native_jobs_due ON project_native_jobs(state,claim_until,created_at,id);
 CREATE INDEX IF NOT EXISTS idx_native_jobs_project ON project_native_jobs(project_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS idx_native_jobs_scoped_queue ON project_native_jobs(project_id,state,kind,created_at,id);
 CREATE TABLE IF NOT EXISTS project_native_job_artifacts (
   job_id TEXT NOT NULL,
   project_id TEXT NOT NULL,
@@ -352,6 +353,35 @@ CREATE TABLE IF NOT EXISTS project_native_job_artifacts (
   FOREIGN KEY(artifact_id,project_id,workspace_kind) REFERENCES project_workspace_artifacts(id,project_id,kind)
 );
 CREATE INDEX IF NOT EXISTS idx_native_job_artifacts_artifact ON project_native_job_artifacts(artifact_id,project_id);
+CREATE TABLE IF NOT EXISTS native_worker_outputs (
+  job_id TEXT NOT NULL REFERENCES project_native_jobs(id) ON DELETE CASCADE,
+  claim_token TEXT NOT NULL,
+  output_index INTEGER NOT NULL CHECK(output_index BETWEEN 0 AND 7),
+  filename TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  total_bytes INTEGER NOT NULL CHECK(total_bytes BETWEEN 1 AND 33554432),
+  sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+  received_bytes INTEGER NOT NULL DEFAULT 0 CHECK(received_bytes>=0 AND received_bytes<=total_bytes),
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(job_id,claim_token,output_index),
+  UNIQUE(job_id,claim_token,filename)
+);
+CREATE INDEX IF NOT EXISTS idx_native_worker_outputs_expiry ON native_worker_outputs(expires_at);
+CREATE TABLE IF NOT EXISTS native_worker_output_chunks (
+  job_id TEXT NOT NULL,
+  claim_token TEXT NOT NULL,
+  output_index INTEGER NOT NULL,
+  chunk_offset INTEGER NOT NULL CHECK(chunk_offset>=0 AND chunk_offset<33554432),
+  byte_length INTEGER NOT NULL CHECK(byte_length BETWEEN 1 AND 262144),
+  sha256 TEXT NOT NULL CHECK(length(sha256)=64),
+  iv BLOB NOT NULL CHECK(length(iv)=12),
+  tag BLOB NOT NULL CHECK(length(tag)=16),
+  ciphertext BLOB NOT NULL CHECK(length(ciphertext)=byte_length),
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(job_id,claim_token,output_index,chunk_offset),
+  FOREIGN KEY(job_id,claim_token,output_index) REFERENCES native_worker_outputs(job_id,claim_token,output_index) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_native_worker_chunks_expiry ON native_worker_output_chunks(expires_at);
 CREATE TABLE IF NOT EXISTS project_event_outbox (
   event_id INTEGER PRIMARY KEY REFERENCES project_collaboration_events(id) ON DELETE CASCADE,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
