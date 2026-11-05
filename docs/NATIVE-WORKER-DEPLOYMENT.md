@@ -36,7 +36,7 @@ sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
   /usr/bin/bash scripts/stage-native-worker.sh /opt/groundwork-native-worker-RELEASE
 ```
 
-Staging records a root-owned hash/mode/size manifest. The executor bundle contains the adapter, its validation dependency and pinned native runtimes and libraries. The network bundle contains five worker modules, Node and its libraries, CA and DNS files, and a token mount placeholder. Each launcher rechecks its manifest. Stage a new version for each release. The staging-only `GROUNDWORK_NATIVE_CA_BUNDLE` and `GROUNDWORK_NATIVE_RESOLVER_FILE` overrides accept reviewed root-owned files. Use a protected resolver copy if `/etc/resolv.conf` points through a writable directory. The runtime enforces TLS validation and pins requests to the configured HTTPS origin.
+Staging records a root-owned hash/mode/size manifest. The executor bundle contains the adapter, its validation dependency and pinned native runtimes and libraries. The optional third argument to `stage-native-executor.sh` supplies Tcl scripts from a protected directory. CI extracts the exact installed Tcl package version and checks the download against Ubuntu's signed APT metadata. The network bundle contains five worker modules, Node and its libraries, CA and DNS files, and a token mount placeholder. Each launcher rechecks its manifest. Stage a new version for each release. The staging-only `GROUNDWORK_NATIVE_CA_BUNDLE` and `GROUNDWORK_NATIVE_RESOLVER_FILE` overrides accept reviewed root-owned files. Use a protected resolver copy if `/etc/resolv.conf` points through a writable directory. The runtime enforces TLS validation and pins requests to the configured HTTPS origin.
 
 ## Authority configuration and credentials
 

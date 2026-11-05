@@ -237,6 +237,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent.parent)
     parser.add_argument("--runtime", type=pathlib.Path, default=pathlib.Path("/opt/groundwork-native-acceptance/runtime"))
+    parser.add_argument("--tcl-library", type=pathlib.Path, default=pathlib.Path("/usr/share/tcltk/tcl8.6"))
     parser.add_argument("--acceptance-root", type=pathlib.Path, default=pathlib.Path("/opt/groundwork-native-worker-acceptance"))
     parser.add_argument("--cgroup-parent", type=pathlib.Path, default=pathlib.Path("/sys/fs/cgroup"))
     parser.add_argument("--node", type=pathlib.Path, default=pathlib.Path(os.environ.get("GROUNDWORK_NATIVE_NODE_PATH", "/usr/bin/node")))
@@ -257,6 +258,7 @@ def main():
     require(CONTROLLERS.issubset(set((parent / "cgroup.subtree_control").read_text().split())),
             "Parent cgroup must already delegate cpu, memory and pids; no global controller changes are made")
     runtime = protected_directory(options.runtime)
+    tcl_library = protected_directory(options.tcl_library)
     node = options.node.resolve(strict=True)
     node_info = node.lstat()
     protected_directory(node.parent)
@@ -274,7 +276,7 @@ def main():
     mirror, hashes = stage_source(repo, root)
     install = root / ("groundwork-native-executor-" + mirror.name[7:])
     subprocess.run(["/usr/bin/bash", str(mirror / "scripts/stage-native-executor.sh"),
-                    str(install), str(runtime)], check=True, cwd="/", env={
+                    str(install), str(runtime), str(tcl_library)], check=True, cwd="/", env={
                         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
                         "GROUNDWORK_NATIVE_NODE_PATH": str(node),
                     }, stdin=subprocess.DEVNULL, close_fds=True)
