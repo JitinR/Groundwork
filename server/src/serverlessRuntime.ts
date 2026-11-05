@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import type { RequestHandler, Response } from "express";
+import { isNativeWorkerMachinePath } from "./nativeWorkerPaths.js";
 
 type Environment = Readonly<Record<string, string | undefined>>;
 
@@ -72,6 +73,7 @@ export function vercelRequestContext(env: Environment): RequestHandler {
       // Exact machine-only paths; their router requires a separate bearer token.
       if (!origin && req.method === "POST" && req.path === "/ops/backup-report") { next(); return; }
       if (!origin && req.method === "PATCH" && /^\/ops\/flags\/(assistant|uploads|collaboration|native|render)$/.test(req.path)) { next(); return; }
+      if (!origin && isNativeWorkerMachinePath(req.method, req.path)) { next(); return; }
       let source = origin;
       if (!source) {
         try { source = new URL(req.get("Referer") || "").origin; } catch { source = undefined; }

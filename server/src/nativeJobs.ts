@@ -3,6 +3,7 @@ import { randomId, sha256Hex } from "./crypto.js";
 import { db, now, withTransaction } from "./db.js";
 import { getNativeCapabilities, NativeAdapterError, validateNativeInput, type NativeJobKind, type NativeJobSummary, type NativeOutputArtifact } from "./nativeAdapters.js";
 import { nativeAdapterConfig, NATIVE_WORKER_ENABLED } from "./nativeJobsConfig.js";
+import { remoteNativeWorkerConfiguredFor } from "./nativeWorkerRemoteConfig.js";
 import { organizationAudit } from "./organization.js";
 import { canWriteProject, getProjectAccess, type ProjectAccess, type ProjectRole } from "./projectAccess.js";
 import { artifactIdSchema, createWorkspaceArtifact, readWorkspaceArtifact, WorkspaceError, type WorkspaceActor, type WorkspaceArtifact, type WorkspaceKind, } from "./workspaces.js";
@@ -68,6 +69,11 @@ export interface NativeJobClaim {
     actor: WorkspaceActor;
     artifactId: string;
     sha256: string;
+}
+export interface NativeJobClaimScope {
+    projectIds: readonly string[];
+    kinds: readonly NativeJobKind[];
+    remote: true;
 }
 const MAX_PROJECT_JOBS = 32;
 const LEASE_SECONDS = 20;
@@ -139,11 +145,16 @@ async function metadata(row: JobRow): Promise<NativeJob> {
         artifacts: artifacts.map(({ created_at, ...artifact }) => ({ ...artifact, createdAt: created_at })), summary,
     };
 }
-export function nativeJobCapabilities() {
-    return getNativeCapabilities(nativeAdapterConfig).map(capability => ({
-        ...capability, available: capability.available && NATIVE_WORKER_ENABLED,
-        reason: NATIVE_WORKER_ENABLED ? capability.reason : "Native worker is disabled by administrator configuration.",
-    }));
+export function nativeJobCapabilities(projectId?: string) {
+    return getNativeCapabilities(nativeAdapterConfig).map(capability => {
+        const remote = !!projectId && remoteNativeWorkerConfiguredFor(projectId, capability.kind);
+        return {
+            ...capability, configured: remote || capability.configured,
+            available: remote || (capability.available && NATIVE_WORKER_ENABLED),
+            reason: remote ? "A remote worker is configured for this project and kind; runtime/output acceptance is checked per job. Configuration does not guarantee current worker health."
+                : NATIVE_WORKER_ENABLED ? capability.reason : "No native worker is configured for this project and kind.",
+        };
+    });
 }
 async function audit(access: ProjectAccess, userId: string, action: string, detail: Record<string, unknown>): Promise<void> {
     if (access.organizationId)
@@ -156,7 +167,7 @@ export async function listNativeJobs(projectId: string, actor: WorkspaceActor) {
         const jobs: NativeJob[] = [];
         for (const row of rows)
             jobs.push(await metadata(row));
-        return { project, jobs, capabilities: nativeJobCapabilities() };
+        return { project, jobs, capabilities: nativeJobCapabilities(projectId) };
     });
 }
 export async function readNativeJob(projectId: string, jobId: string, actor: WorkspaceActor): Promise<NativeJob> {
@@ -172,7 +183,7 @@ export async function submitNativeJob(projectId: string, actor: WorkspaceActor, 
                 throw new WorkspaceError(409, "Retry key belongs to another job request", "IDEMPOTENCY_CONFLICT");
             return await metadata(previous);
         }
-        if (!nativeJobCapabilities().find(item => item.kind === input.kind)?.available)
+        if (!nativeJobCapabilities(projectId).find(item => item.kind === input.kind)?.available)
             throw new WorkspaceError(503, "Native runtime or isolation is not configured. Review native job capabilities.", "NATIVE_UNAVAILABLE");
         if (input.sourceRevision !== project.revision)
             throw new WorkspaceError(409, "Project changed. Refresh before submitting a new job.", "SOURCE_REVISION_CONFLICT", project.revision);
@@ -248,7 +259,11 @@ async function terminal(row: JobRow, state: "failed" | "cancelled", code: string
         .run(state, code, message, now(), row.id);
 }
 /** Lease recovery and claim share the database's serialized write transaction. */
-export async function claimNativeJob(): Promise<NativeJobClaim | null> {
+export async function claimNativeJob(scope?: NativeJobClaimScope): Promise<NativeJobClaim | null> {
+    const scoped = scope === undefined ? undefined : z.object({
+        projectIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,120}$/)).min(1).max(128),
+        kinds: z.array(z.enum(NATIVE_JOB_KINDS)).min(1).max(3), remote: z.literal(true),
+    }).strict().parse(scope);
     return await withTransaction(async () => {
         const timestamp = now();
         const stale = await db.prepare("SELECT * FROM project_native_jobs WHERE state='running' AND claim_until<=? LIMIT 64").all(timestamp) as unknown as JobRow[];
@@ -265,7 +280,11 @@ export async function claimNativeJob(): Promise<NativeJobClaim | null> {
         };
         if (running.count >= 4)
             return null;
-        const queued = await db.prepare("SELECT * FROM project_native_jobs WHERE state='queued' ORDER BY created_at,id LIMIT 64").all() as unknown as JobRow[];
+        // Filter before the bounded batch so unrelated queued projects cannot
+        // starve a scoped remote worker. Only configured IDs become parameters.
+        const queued = scoped
+            ? await db.prepare(`SELECT * FROM project_native_jobs WHERE state='queued' AND project_id IN (${scoped.projectIds.map(() => "?").join(",")}) AND kind IN (${scoped.kinds.map(() => "?").join(",")}) ORDER BY created_at,id LIMIT 64`).all(...scoped.projectIds, ...scoped.kinds) as unknown as JobRow[]
+            : await db.prepare("SELECT * FROM project_native_jobs WHERE state='queued' ORDER BY created_at,id LIMIT 64").all() as unknown as JobRow[];
         for (const row of queued) {
             if (row.cancel_requested || row.expires_at <= timestamp) {
                 await terminal(row, row.cancel_requested ? "cancelled" : "failed", row.cancel_requested ? "CANCELLED" : "QUEUE_EXPIRED", row.cancel_requested ? "Job was cancelled" : "Job exceeded its queue deadline");
@@ -279,7 +298,7 @@ export async function claimNativeJob(): Promise<NativeJobClaim | null> {
                 await terminal(row, "failed", "ACCESS_CHANGED", "Submitting session or project access changed");
                 continue;
             }
-            if (!getNativeCapabilities(nativeAdapterConfig).find(item => item.kind === row.kind)?.available) {
+            if (!scoped && !getNativeCapabilities(nativeAdapterConfig).find(item => item.kind === row.kind)?.available) {
                 await terminal(row, "failed", "NATIVE_UNAVAILABLE", "Native runtime or isolation is no longer configured");
                 continue;
             }
@@ -288,6 +307,27 @@ export async function claimNativeJob(): Promise<NativeJobClaim | null> {
             return { id: row.id, token, projectId: row.project_id, kind: row.kind, actor, artifactId: row.input_artifact_id, sha256: row.input_sha256 };
         }
         return null;
+    });
+}
+/** Authority-only grant seam: reconstruct the submitting identity from durable
+ * state, never from the worker. Every use is bound to one current attempt. */
+export async function resolveNativeWorkerClaim(binding: Omit<NativeJobClaim, "actor">): Promise<NativeJobClaim | null> {
+    return await withTransaction(async () => {
+        const row = await db.prepare("SELECT * FROM project_native_jobs WHERE id=? AND project_id=? AND state='running' AND claim_token=? AND claim_until>?")
+            .get(binding.id, binding.projectId, binding.token, now()) as unknown as JobRow | undefined;
+        if (!row || row.kind !== binding.kind || row.input_artifact_id !== binding.artifactId || row.input_sha256 !== binding.sha256)
+            return null;
+        if (row.cancel_requested || row.expires_at <= now()) {
+            await terminal(row, row.cancel_requested ? "cancelled" : "failed", row.cancel_requested ? "CANCELLED" : "JOB_DEADLINE_EXCEEDED", row.cancel_requested ? "Job was cancelled" : "Job exceeded its overall deadline");
+            return null;
+        }
+        const actor = { userId: row.created_by, sessionId: row.session_id };
+        try { await authorize(row.project_id, actor, true); }
+        catch {
+            await terminal(row, "failed", "ACCESS_CHANGED", "Submitting session or project access changed");
+            return null;
+        }
+        return { ...binding, actor };
     });
 }
 async function ownedRow(claim: NativeJobClaim): Promise<JobRow | null> {

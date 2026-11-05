@@ -19,6 +19,10 @@ import auditRoutes from "./routes/audit.js";
 import projectRoutes from "./routes/projects.js";
 import workspaceRoutes from "./routes/workspaces.js";
 import nativeJobRoutes from "./routes/nativeJobs.js";
+import nativeWorkerRoutes from "./routes/nativeWorker.js";
+import { authenticateNativeWorker } from "./nativeWorkerAuthority.js";
+import { isNativeWorkerMachinePath } from "./nativeWorkerPaths.js";
+import { sharedRateLimiter } from "./sharedRateLimit.js";
 import paymentRoutes from "./routes/payments.js";
 import assistantRoutes from "./routes/assistant.js";
 import shareRoutes from "./routes/share.js";
@@ -85,12 +89,26 @@ app.use("/api", telemetryMiddleware);
 if (SERVERLESS) app.use("/api", vercelRequestContext(process.env));
 app.use("/api", authorityGatewayMiddleware(topology));
 app.get("/api/live", (_req, res) => { res.json({ ok: true }); });
+const nativeWorkerLimiter = sharedRateLimiter({
+  namespace: "native-worker-v1", windowMs: 60_000, limit: 600,
+  identity: req => `worker:${req.get("x-groundwork-worker-id") || "unverified"}`,
+  message: "Worker request budget exceeded. Retry after the current window.",
+});
 app.use("/api", (req, res, next) => {
+  if (isNativeWorkerMachinePath(req.method, req.path) && req.headers.origin === undefined && req.headers.cookie === undefined) {
+    try {
+      authenticateNativeWorker(req.get("authorization"), req.get("x-groundwork-worker-id"));
+      return nativeWorkerLimiter(req, res, next);
+    } catch { /* Unauthenticated attempts keep the public IP rate budget. */ }
+  }
   const machinePath = /^\/ops\/(?:check|metrics|traces|backup-report|flags(?:\/[a-z]+)?)$/.test(req.path);
   const trusted = machinePath && (operationalTokenMatches(req.get("authorization"), process.env.OPERATIONS_TOKEN)
     || (req.path === "/ops/check" && req.method === "GET" && operationalTokenMatches(req.get("authorization"), process.env.CRON_SECRET)));
   if (trusted) next(); else apiLimiter(req, res, next);
 });
+// Own bounded parser and machine authentication, before browser cookies/CSRF.
+// A path exception alone never grants worker or browser authority.
+app.use("/api/native-worker/v1", nativeWorkerRoutes);
 app.use(cookieParser());
 app.use(express.json({
   limit: SERVERLESS ? "4mb" : "8mb",
@@ -123,7 +141,7 @@ app.use("/api/secrets", secretRoutes);
 app.use("/api/audit", auditRoutes);
 app.use("/api/projects/:projectId/workspaces", workspaceRoutes);
 app.use("/api/projects/:projectId/jobs", (req, res, next) => {
-  if (IS_PROD && !SERVERLESS && req.method === "POST" && req.path === "/") featureFlagGuard("native")(req, res, next); else next();
+  if (IS_PROD && req.method === "POST" && req.path === "/") featureFlagGuard("native")(req, res, next); else next();
 }, nativeJobRoutes);
 app.use("/api/projects/:projectId/renders", (req, res, next) => {
   if (IS_PROD && !SERVERLESS && req.method === "POST" && (req.path === "/" || /^\/[a-f0-9]{32}\/retry$/.test(req.path))) featureFlagGuard("render")(req, res, next); else next();

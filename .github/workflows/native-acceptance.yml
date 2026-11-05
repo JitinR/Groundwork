@@ -9,6 +9,9 @@ on:
       - '.github/workflows/native-acceptance.yml'
       - 'scripts/*native*'
       - 'server/src/nativeAdapters.ts'
+      - 'server/src/nativeWorker*.ts'
+      - 'server/src/nativeJobs.ts'
+      - 'server/src/routes/nativeWorker.ts'
       - 'server/src/engineeringBasis.ts'
       - 'package-lock.json'
   pull_request:
@@ -17,6 +20,9 @@ on:
       - '.github/workflows/native-acceptance.yml'
       - 'scripts/*native*'
       - 'server/src/nativeAdapters.ts'
+      - 'server/src/nativeWorker*.ts'
+      - 'server/src/nativeJobs.ts'
+      - 'server/src/routes/nativeWorker.ts'
       - 'server/src/engineeringBasis.ts'
       - 'package-lock.json'
 
@@ -50,6 +56,24 @@ jobs:
         run: sudo env GROUNDWORK_NATIVE_BUILD_JOBS=4 bash scripts/build-native-acceptance.sh > native-build.log 2>&1
       - name: Run real adapters without host data, credentials or network
         run: sudo env GROUNDWORK_NATIVE_NODE_PATH="$(command -v node)" bash scripts/run-native-acceptance.sh
+      - name: Verify executor request parser boundaries
+        run: python3 -I -S scripts/test-native-executor-broker.py
+      - name: Verify sealed worker, real HTTPS authority, native execution and cancellation
+        run: |
+          native_node=/opt/groundwork-native-acceptance/ci-node/node
+          sudo install -d -m 0755 "$(dirname "$native_node")"
+          sudo install -m 0755 "$(command -v node)" "$native_node"
+          cmp -- "$(command -v node)" "$native_node"
+          sudo systemd-run --wait --collect --pipe --unit=groundwork-native-ci \
+            --property='Delegate=cpu memory pids' --property=DelegateSubgroup=runner \
+            /usr/bin/bash -ceu '
+              parent=/sys/fs/cgroup/system.slice/groundwork-native-ci.service
+              IFS= read -r current < /proc/self/cgroup
+              test "$current" = "0::/system.slice/groundwork-native-ci.service/runner"
+              printf "+cpu +memory +pids\n" > "$parent/cgroup.subtree_control"
+              exec /usr/bin/python3 -I -S "$1/scripts/run-native-worker-acceptance.py" \
+                --repo "$1" --node "$2" --cgroup-parent "$parent" --with-authority
+            ' -- "$GITHUB_WORKSPACE" "$native_node"
       - name: Save synthetic native acceptance evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -57,6 +81,7 @@ jobs:
           name: native-acceptance-${{ github.sha }}
           path: |
             artifacts/native-acceptance/
+            artifacts/native-worker-acceptance/
             native-build.log
           retention-days: 14
           if-no-files-found: error

@@ -163,4 +163,6 @@ private production configuration on the target runtime. The helper prints no
 configuration values. [DEPLOYMENT.md](docs/DEPLOYMENT.md) covers Docker, Render,
 HTTPS/proxy identity, email, payments, backup restoration and offline upgrades.
 Production still requires owner-provided infrastructure and provider credentials;
-the optional native worker remains explicitly disabled and unverified.
+production native processing remains disabled. The dedicated scoped worker and
+per-job executor have separate synthetic acceptance; deployment instructions and
+remaining live acceptance are in [Native worker deployment](docs/NATIVE-WORKER-DEPLOYMENT.md).

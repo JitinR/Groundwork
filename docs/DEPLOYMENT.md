@@ -157,11 +157,14 @@ LibreDWG/OpenSees binaries, a distinct UID/GID, privileged identity transition
 through a separately reviewed launcher, constrained filesystem/network access,
 and a dedicated durable-job entry point. Those operations are not validated by
 the web build. Keep `NATIVE_WORKER_ENABLED=false` and
-`NATIVE_ISOLATION_ACKNOWLEDGED=false` until that runtime passes acceptance testing.
+`NATIVE_ISOLATION_ACKNOWLEDGED=false` on the HTTP authority.
 Running the web application as root is not a solution to these prerequisites.
 HTTP authorities enforce that restriction by rejecting native enablement before
 canonical startup loads database/key configuration; the HTTP server no longer
-imports or starts the native queue worker. The lifecycle module is separately
-testable and waits for leases/in-flight work at shutdown. It does not supply a
-deployable scoped worker or per-job sandbox. See
-[the worker boundary](NATIVE-WORKER-BOUNDARY.md) before implementing that service.
+imports or starts the native queue worker. The dedicated client uses a scoped
+HTTPS authority transport and a separate secret-free local executor. New remote
+registration is independently disabled by default; a registration indicates
+configured scope, not worker health or native acceptance. See
+[the worker boundary](NATIVE-WORKER-BOUNDARY.md) and
+[native worker deployment](NATIVE-WORKER-DEPLOYMENT.md) for the staged Linux
+service, synthetic acceptance and remaining live release requirements.

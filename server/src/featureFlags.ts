@@ -3,6 +3,7 @@ import type { RequestHandler } from "express";
 import { SERVERLESS } from "./config.js";
 import { db, now, withTransaction } from "./db.js";
 import type { AuthedRequest } from "./security.js";
+import { readNativeWorkerRegistrations } from "./nativeWorkerRemoteConfig.js";
 
 export const FEATURE_NAMES = ["assistant", "uploads", "collaboration", "native", "render"] as const;
 export type FeatureName = typeof FEATURE_NAMES[number];
@@ -10,6 +11,10 @@ export interface RuntimeFeatureFlag { name: FeatureName; enabled: boolean; rollo
 interface FlagRow { name: FeatureName; enabled: number; rollout_percent: number; revision: number; updated_at: number; }
 export function featureSupported(name: FeatureName): boolean {
   if (name !== "native" && name !== "render") return true;
+  if (name === "native") {
+    try { if (readNativeWorkerRegistrations().length > 0) return true; }
+    catch { return false; }
+  }
   return !SERVERLESS && process.env.DURABLE_WORKERS_ENABLED === "true" && (name !== "native" || process.env.NATIVE_WORKER_ENABLED === "true");
 }
 function flagValue(name: FeatureName, row?: FlagRow): RuntimeFeatureFlag {

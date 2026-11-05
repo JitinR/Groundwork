@@ -124,6 +124,24 @@ test("both adapters preserve typed rows, changes, identities and camelCase alias
   }
 });
 
+test("worker staging tables remain private, constrained and indexed on both engines", async () => {
+  for (const table of ["native_worker_outputs", "native_worker_output_chunks"]) {
+    const security = (await engine.query<{ browser_read: boolean; browser_write: boolean; runtime_write: boolean }>(
+      `SELECT has_table_privilege('anon',$1,'SELECT') AS browser_read,
+        has_table_privilege('authenticated',$1,'INSERT') AS browser_write,
+        has_table_privilege('groundwork_runtime',$1,'INSERT') AS runtime_write`, [`groundwork.${table}`])).rows[0];
+    assert.deepEqual(security, { browser_read: false, browser_write: false, runtime_write: true });
+  }
+  for (const adapter of [sqlite, postgres]) {
+    await assert.rejects(adapter.db.prepare(`INSERT INTO native_worker_output_chunks
+      (job_id,claim_token,output_index,chunk_offset,byte_length,sha256,iv,tag,ciphertext,expires_at)
+      VALUES(?,?,0,0,1,?,?,?,?,?)`).run("missing-job", "a".repeat(32), "b".repeat(64), Buffer.alloc(12), Buffer.alloc(16), Buffer.alloc(1), 1),
+    /FOREIGN KEY|foreign key/);
+  }
+  const indexes = await engine.query<{ indexname: string }>("SELECT indexname FROM pg_indexes WHERE schemaname='groundwork' AND indexname IN ('idx_native_jobs_scoped_queue','idx_native_worker_outputs_expiry','idx_native_worker_chunks_expiry')");
+  assert.equal(indexes.rows.length, 3);
+});
+
 test("both adapters await commits, roll back nested work and isolate unrelated requests", async () => {
   for (const [index, adapter] of [sqlite, postgres].entries()) {
     const id = `database-user-${index}`;

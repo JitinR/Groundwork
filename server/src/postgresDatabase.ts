@@ -10,6 +10,7 @@ export const POSTGRES_SCHEMA_VERSION = "groundwork_engineering_v2";
 const MIGRATIONS = [
   { version: "groundwork_private_v1", file: "20261019191555_groundwork_private_database.sql" },
   { version: POSTGRES_SCHEMA_VERSION, file: "20261021153936_engineering_runtime.sql" },
+  { version: "groundwork_native_worker_v3", file: "20261104191702_native_worker_transport.sql" },
 ] as const;
 // A transaction-scoped lock preserves the existing critical-section semantics
 // for quotas, billing, TOTP replay checks, leases and optimistic revisions.

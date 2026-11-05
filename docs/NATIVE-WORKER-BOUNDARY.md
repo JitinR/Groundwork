@@ -1,25 +1,32 @@
 # Native worker boundary
 
-Updated 4 November 2026. Native jobs remain unavailable on the supported web deployment. This document records the remaining architecture requirement, not an enabled service.
+Updated 5 November 2026. Production native processing remains disabled. This branch supplies the dedicated client, scoped authority transport and local executor; synthetic acceptance does not establish an always-on production service.
 
-## Implemented boundary and lifecycle fixes
+## Separation of authority
 
-- Canonical API startup rejects native-worker enablement before storage/key initialization. The HTTP server no longer imports or starts `nativeJobWorker`.
-- `nativeWorkerLoop` has no config, database, HTTP, filesystem or provider imports. An injected adapter supplies initialization, claiming, renewal and execution.
-- Explicit lease checks and periodic heartbeats share one outstanding renewal. Lease loss or renewal failure aborts execution. Stop cancels timers, aborts active execution, prevents another claim and awaits outstanding initialization/claim/renewal/execution work. Repeated stop calls share one promise.
-- The retained database-backed adapter still reauthorizes submitting sessions and project access. Atomic publication remains fenced by the current lease. These guarantees are computation/publication fences, not exactly-once execution.
-
-Ten targeted regressions cover the API boundary and lifecycle, including a startup subprocess that proves storage is not created, renewal/cleanup barriers, late claim completion, cancellation and recovery from callback failures.
-
-## Required service architecture before enablement
-
-| Priority | Component | Authority and acceptance requirement |
+| Process | Identity and access | Excluded authority |
 |---|---|---|
-| High | Unprivileged networked worker | Use a scoped transport adapter for the lifecycle. Do not import server config, `server/.env`, workspace-vault keys, database connections or provider credentials. No public HTTP listener or root identity. |
-| High | Scoped authority transport | Provision project/kind-scoped bootstrap access and lease-bound expiring grants. Reauthorize current submitting identity/access at claim, renew and publication; enforce grant expiry/revocation, hashes, budgets and current attempt. Never disclose a submitting session ID to the worker. Preserve atomic output publication. |
-| High | Secret-free per-job executor | A narrowly administered launcher receives only one validated input. Create separate filesystem/network/PID confinement per attempt, pin binaries/libraries, drop privileges and enforce resource/cancellation/output limits. It receives no queue/database/key/provider credentials. |
-| High | Deployment and live acceptance | Bind worker release to its exact source and native acceptance. Run actual queued conversion/solver fixtures through submission, lease, execution, publication and authorized download; test cancellation, stale grants, permission loss and attempt/tenant isolation. Establish host/lifecycle ownership and recovery monitoring. |
+| Web API | Existing application database, vault keys and user authorization | Never executes native binaries or starts a native worker; direct native enablement fails before storage initialization |
+| Dedicated network worker | UID/GID 10002, zero capabilities, no-new-privileges, sealed filesystem; fixed HTTPS authority and a project/kind-scoped bootstrap token | No database, master key, provider credentials, user session, application config, native binary or public listener |
+| Local broker | Root-owned, environment cleared; a single pathname Unix socket authenticated with SO_PEERCRED; verified sealed runtime and delegated cgroup | No TCP listener, authority token, user session, database, key or provider environment |
+| Per-attempt supervisor/native child | Fresh mount/network/PID/IPC/UTS namespaces and chroot; supervisor has only CHOWN/DAC_OVERRIDE/KILL/SETGID/SETUID; native child UID/GID 10001, no capabilities | No network interfaces, host homes/drives, application files, queue credentials or access to supervisor control files |
 
-The current `nativeJobWorker` imports database/workspace configuration and the direct native adapter needs ownership changes plus a distinct UID/GID. Merely running that module in a second Node process, or making it root, does not meet this boundary. Its retained supervisor adapter is not a production entry point. The Linux acceptance rootfs deliberately has no queue or application credentials and validates a different, bounded execution scope.
+The broker is privileged trusted code and the Linux kernel remains a shared trust boundary. Chroot and namespaces do not establish virtual-machine isolation. Keep the host patched, dedicated and administered; do not run the web authority as root.
 
-No cloud account, always-on worker, production credentials or public endpoint was provisioned by this change. Keep the disabled Docker/Compose scaffolds and web flags disabled until the service above exists and passes acceptance.
+## Transport and publication
+
+All worker operations are authenticated POSTs under `/api/native-worker/v1`. Browser cookies/origins, redirects and automatic mutation retries are refused. Valid machine requests have a separate bounded rate budget; credentials do not authorize other application APIs.
+
+Registration contains a worker ID, SHA-256 token fingerprint, explicit project IDs and job kinds. The worker receives a ten-minute HMAC grant bound to one worker/job/project/source/kind/attempt, without the submitting actor or session. Every operation checks current registration, grant expiry, durable lease, submitting session credential version, access and cancellation. Scope filtering happens before queue selection.
+
+Inputs and outputs use 256 KiB chunks, 32 MiB input and aggregate output budgets, and at most eight output files. Staged chunks are AES-GCM encrypted with attempt/metadata/offset/hash associated data. Exact retransmission is idempotent; gaps, mismatched metadata and conflicting content are refused. Completion reassembles and verifies hashes and source-bound summaries before the existing atomic artifact/state publication transaction. Lease fencing prevents stale publication; execution is not exactly once.
+
+The lifecycle serializes renewals, aborts execution on lease loss and waits for outstanding work at stop. Client cancellation closes the executor socket; the broker kills the complete attempt cgroup, waits for it to empty and removes only that attempt's private scratch. Cleanup failure stops the broker and quarantines scratch.
+
+## Bounded evidence
+
+The real Linux broker passed confinement, actual LibreDWG round trip of an authored 10 m line, OpenSees cantilever closed forms and equilibrium, uploaded-Tcl rejection, and active cancellation/cgroup/scratch cleanup. These are executable synthetic cases, not arbitrary DWG fidelity, all structural methods, national-code assessment or production workload acceptance.
+
+SQLite and PostgreSQL transport tests exercise real API claim/chunk/publication/download paths, cancellation, credential revocation, scope/expiry/stale attempts, tampered staging, budgets and machine/browser separation. Their executor fixture is synthetic; those transport tests alone do not validate native computation.
+
+See [deployment and acceptance](NATIVE-WORKER-DEPLOYMENT.md) for reproduction and remaining production requirements. No production registration, database migration, host service or native feature flag is enabled automatically.

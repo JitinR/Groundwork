@@ -49,6 +49,9 @@ jobs:
       - name: Verify PostgreSQL API flow
         run: npm run test:postgres-flow
 
+      - name: Verify scoped native worker PostgreSQL transport
+        run: npm run test:native-worker:postgres
+
       - name: Test browser security helpers
         run: npm run test -w client
 
