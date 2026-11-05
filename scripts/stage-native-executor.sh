@@ -4,15 +4,16 @@
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-[[ $(uname -s) = Linux && $(uname -m) = x86_64 && $(id -u) = 0 && $# -le 2 ]] || { echo 'Requires root on x86_64 Linux and at most install/runtime paths.' >&2; exit 78; }
+[[ $(uname -s) = Linux && $(uname -m) = x86_64 && $(id -u) = 0 && $# -le 3 ]] || { echo 'Requires root on x86_64 Linux and at most install, runtime and Tcl library paths.' >&2; exit 78; }
 repo=$(cd "$(dirname "$0")/.." && pwd -P)
 destination=${1:-/opt/groundwork-native-executor}
 runtime=${2:-/opt/groundwork-native-acceptance/runtime}
+tcl_library=${3:-/usr/share/tcltk/tcl8.6}
 nodebinary=${GROUNDWORK_NATIVE_NODE_PATH:-/usr/bin/node}
-python3 -I -S - "$repo" "$destination" "$runtime" "$nodebinary" <<'PY'
+python3 -I -S - "$repo" "$destination" "$runtime" "$nodebinary" "$tcl_library" <<'PY'
 import hashlib, json, os, pathlib, re, shutil, stat, subprocess, sys, tempfile
 
-repo, target, runtime, node = map(pathlib.Path, sys.argv[1:])
+repo, target, runtime, node, tcl_library = map(pathlib.Path, sys.argv[1:])
 def protected(path):
     if not path.is_absolute() or path.resolve(strict=True) != path:
         raise RuntimeError('Protected real installation paths are required')
@@ -24,7 +25,7 @@ def source_file(path, root_owned=False):
     resolved = path.resolve(strict=True)
     info = resolved.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o7022 or info.st_nlink != 1 or (root_owned and info.st_uid != 0):
-        raise RuntimeError('Untrusted runtime source')
+        raise RuntimeError(f'Untrusted runtime source: {resolved} (mode={stat.S_IMODE(info.st_mode):o}, uid={info.st_uid}, links={info.st_nlink})')
     if 'security.capability' in os.listxattr(resolved):
         raise RuntimeError('Runtime file capabilities are not accepted')
     if root_owned:
@@ -36,6 +37,8 @@ protected(target.parent)
 if target.exists() or target.is_symlink():
     raise RuntimeError('Installation directory already exists; choose a new reviewed version directory')
 protected(runtime)
+protected(tcl_library)
+source_file(tcl_library / 'init.tcl', True)
 node = source_file(node, True)
 for filename in ('nativeAdapters.js', 'engineeringBasis.js'):
     if not (repo / 'server/dist' / filename).is_file():
@@ -92,7 +95,9 @@ try:
     copy(repo / 'scripts/native-executor-job.mjs', 'app/native-executor-job.mjs')
     # Existing dependencies are trusted as locked build inputs, but link and
     # file-type anomalies in a package are rejected rather than followed.
-    for package, prefix in ((repo / 'node_modules/zod','app/node_modules/zod'), (pathlib.Path('/usr/share/tcltk/tcl8.6'),'usr/share/tcltk/tcl8.6')):
+    packages = ((repo / 'node_modules/zod', 'app/node_modules/zod', False),
+                (tcl_library, 'usr/share/tcltk/tcl8.6', True))
+    for package, prefix, root_owned in packages:
         if not package.is_dir() or package.is_symlink():
             raise RuntimeError('Required runtime package is missing')
         for source in package.rglob('*'):
@@ -102,7 +107,7 @@ try:
                 continue
             if not stat.S_ISREG(info.st_mode) or source.is_symlink() or info.st_nlink != 1:
                 raise RuntimeError('Linked or special package entries are not accepted')
-            copy(source, prefix + '/' + str(source.relative_to(package)), False, package == pathlib.Path('/usr/share/tcltk/tcl8.6'))
+            copy(source, prefix + '/' + str(source.relative_to(package)), False, root_owned)
     # Ubuntu may externalize these Node builtins; standalone Node embeds them.
     for filename in ('/usr/share/nodejs/acorn-walk/dist/walk.js','/usr/share/nodejs/acorn/dist/acorn.js','/usr/share/nodejs/cjs-module-lexer/dist/lexer.js','/usr/share/nodejs/cjs-module-lexer/lexer.js','/usr/share/nodejs/minimatch/dist/cjs/index.bundle.js','/usr/share/nodejs/undici/undici-fetch.js'):
         if pathlib.Path(filename).is_file(): copy(filename, filename.lstrip('/'), False, True)
