@@ -7,6 +7,7 @@ on:
     paths:
       - '.gitattributes'
       - '.github/workflows/native-acceptance.yml'
+      - 'ops/systemd/**'
       - 'scripts/*native*'
       - 'server/src/nativeAdapters.ts'
       - 'server/src/nativeWorker*.ts'
@@ -18,6 +19,7 @@ on:
     paths:
       - '.gitattributes'
       - '.github/workflows/native-acceptance.yml'
+      - 'ops/systemd/**'
       - 'scripts/*native*'
       - 'server/src/nativeAdapters.ts'
       - 'server/src/nativeWorker*.ts'
