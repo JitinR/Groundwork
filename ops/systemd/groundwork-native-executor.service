@@ -1,0 +1,16 @@
+[Unit]
+Description=Groundwork isolated native executor
+
+[Service]
+Type=exec
+Slice=system.slice
+EnvironmentFile=/etc/groundwork-native/executor.conf
+RuntimeDirectory=groundwork-native
+RuntimeDirectoryMode=0750
+Delegate=cpu memory pids
+DelegateSubgroup=supervisor
+ExecStart=/usr/bin/env -i /usr/bin/python3 -I -S /usr/local/libexec/groundwork-native-supervisor.py executor ${GROUNDWORK_NATIVE_EXECUTOR_ROOT}
+KillMode=mixed
+TimeoutStopSec=35s
+Restart=no
+UMask=0077

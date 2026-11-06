@@ -1,0 +1,22 @@
+[Unit]
+Description=Groundwork scoped native network worker
+BindsTo=groundwork-native-executor.service
+After=groundwork-native-executor.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120s
+StartLimitBurst=3
+
+[Service]
+Type=exec
+Slice=system.slice
+EnvironmentFile=/etc/groundwork-native/worker.conf
+ExecStart=/usr/bin/env -i /usr/bin/python3 -I -S /usr/local/libexec/groundwork-native-supervisor.py worker ${GROUNDWORK_NATIVE_WORKER_ROOT} ${GROUNDWORK_NATIVE_AUTHORITY_ORIGIN} ${GROUNDWORK_NATIVE_WORKER_ID} ${GROUNDWORK_NATIVE_WORKER_KINDS} ${GROUNDWORK_NATIVE_TOKEN_FILE}
+KillMode=mixed
+TimeoutStopSec=25s
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=78
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

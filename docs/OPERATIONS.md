@@ -19,12 +19,12 @@ and manual [run 39959697259](https://github.com/jitinraavi/Secure-Nexus/actions/
 succeeded on 23 October 2026. These historical runs do not replace current
 freshness checks or prove inbox delivery during an outage.
 
-Approved private recovery repository `jitinraavi/Groundwork-recovery` is prepared
-with separate backup encryption and restricted database credentials. Its first
-real-data restore comparison exposed hosted/local floating-point serialization
-differences. A 1.1.2 canonicalization correction and fresh verification are in
-progress; private recovery scheduling remains disabled until the real comparison
-and artifact checks pass. Do not record this first attempt as a successful drill.
+The approved private recovery repository `jitinraavi/Groundwork-recovery` has an
+active schedule with separate backup encryption and restricted database
+credentials. A 6 November 2026 recovery run verified a read-only production
+export, authenticated restore into disposable PostgreSQL, private encrypted
+artifact retention and the durable application recovery record. Check current
+archive and restore evidence in the private workflow.
 No live database export, restore or SMTP send is part of the ordinary test suite.
 
 Maintain timestamps and workflow URLs for the latest probe, uploaded archive and

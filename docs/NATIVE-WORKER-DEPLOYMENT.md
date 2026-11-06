@@ -1,6 +1,6 @@
 # Dedicated native worker deployment
 
-Updated 5 November 2026. The web release keeps native processing disabled. These tools stage and run foreground Linux processes; they do not provision a cloud account, install a daemon, change global cgroup delegation, create users or enable the production queue. The legacy Docker/Compose worker exits with status 78.
+Updated 6 November 2026. The web release keeps native processing disabled. Use the sealed Linux bundles with the systemd service pair or the foreground commands below. The legacy Docker/Compose worker exits with status 78.
 
 ## Required host and release
 
@@ -48,9 +48,31 @@ Generate a unique random bootstrap token (at least 32 random bytes, base64url en
 [{"id":"pilot-worker-01","tokenSha256":"<64 lower-case hex>","projectIds":["<one explicit pilot project ID>"],"kinds":["dxf-to-dwg"]}]
 ```
 
-Set `NATIVE_REMOTE_WORKER_ENABLED=true` and `NATIVE_REMOTE_WORKERS_JSON` only after migration and pilot acceptance. Limit the project/kind list to the intended pilot. Keep `NATIVE_WORKER_ENABLED=false` and `NATIVE_ISOLATION_ACKNOWLEDGED=false` on the HTTP authority. The independent runtime `native` feature flag defaults off; configuring a worker does not enable that flag and is not a health check. Enable a narrow pilot only after the complete deployed path is accepted.
+Complete the isolated Linux acceptance and verify the migration, host and bootstrap credential before setting `NATIVE_REMOTE_WORKER_ENABLED=true` and `NATIVE_REMOTE_WORKERS_JSON`. Limit the registration to the intended synthetic pilot project and job kinds. Keep `NATIVE_WORKER_ENABLED=false` and `NATIVE_ISOLATION_ACKNOWLEDGED=false` on the HTTP authority. The independent runtime `native` feature flag defaults off. Enable it for the scoped pilot after the worker passes its local readiness probe and can reach the deployed authority. Broaden the registration only after the deployed path passes pilot acceptance.
 
 Deleting a registration or changing its token fingerprint revokes subsequent operations, including active grants; the worker aborts when renewal is refused. Restart the dedicated client with its new private token. Cancel queued pilot jobs before withdrawing a worker permanently, or retain a replacement with the same explicit scope. Never grant database or vault access to solve transport failures.
+
+## Supervised Linux service
+
+Use systemd with cgroup v2 and support for `DelegateSubgroup`. Install the two units in `ops/systemd/` under `/etc/systemd/system/` and `scripts/native-worker-supervisor.py` under `/usr/local/libexec/groundwork-native-supervisor.py`. Keep those files and their ancestors root-owned and protected. Write these two root-owned configuration files under `/etc/groundwork-native/` with mode 0600.
+
+```ini
+# executor.conf
+GROUNDWORK_NATIVE_EXECUTOR_ROOT=/opt/groundwork-native-executor-RELEASE
+```
+
+```ini
+# worker.conf
+GROUNDWORK_NATIVE_WORKER_ROOT=/opt/groundwork-native-worker-RELEASE
+GROUNDWORK_NATIVE_AUTHORITY_ORIGIN=https://secure-nexus-xi.vercel.app
+GROUNDWORK_NATIVE_WORKER_ID=pilot-worker-01
+GROUNDWORK_NATIVE_WORKER_KINDS=dxf-to-dwg
+GROUNDWORK_NATIVE_TOKEN_FILE=/etc/groundwork-native/worker-token
+```
+
+Place the token in the referenced protected file with mode 0400. Verify the installed units with `systemd-analyze verify`. When the host and pilot scope are ready, run `systemctl daemon-reload` followed by `systemctl start groundwork-native-worker.service`. Starting the client also starts the broker. Check the client journal for `ready`, then check claim and job results from the pilot. Enable the client at boot after the pilot passes.
+
+The broker delegates controllers only inside its own service cgroup and publishes the protected socket. The client has a bounded socket readiness wait. Stopping the broker drains the dependent client first. The broker stays stopped after failure so an operator can inspect any retained private scratch. Client restarts are bounded and startup refusal exits with status 78.
 
 ## Foreground service wiring
 
