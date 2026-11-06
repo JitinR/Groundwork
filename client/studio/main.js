@@ -99,9 +99,8 @@ function applyMotion() {
   root.classList.toggle('motion-reduced', !motionEnabled);
   const button = document.querySelector('#motion-toggle');
   button?.setAttribute('aria-pressed', String(motionEnabled));
-  button?.setAttribute('aria-label', motionEnabled ? 'Turn off decorative motion' : 'Turn on decorative motion');
-  const label = document.querySelector('#motion-label');
-  if (label) label.textContent = motionEnabled ? 'Motion on' : 'Motion off';
+  const state = document.querySelector('#motion-state');
+  if (state) state.textContent = motionEnabled ? 'on' : 'off';
 }
 
 function selectStage(index) {
