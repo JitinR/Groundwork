@@ -2,6 +2,7 @@ import { performance } from 'node:perf_hooks';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+import { requestReleaseJson } from './release-readiness.mjs';
 
 // Resolve the mail transport from its owning workspace, including nested installs.
 const nodemailer = createRequire(new URL('../server/package.json', import.meta.url))('nodemailer');
@@ -61,6 +62,31 @@ export async function backupFreshness(env = process.env, request = fetch, now = 
     return { enabled: true, ok: Boolean(artifact), reason: artifact ? 'backup_fresh' : 'backup_artifact_missing', ageHours: Math.round(ageHours * 100) / 100 };
   } catch { return { enabled: true, ok: false, reason: 'backup_evidence_unavailable' }; }
 }
+export async function monitorCadence(env = process.env, request = fetch, now = Date.now()) {
+  const failed = reason => ({ ok: false, reason });
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(env.GITHUB_REPOSITORY || '') ||
+      !/^\d+$/.test(env.GITHUB_RUN_ID || '') || !env.OPS_DEFAULT_BRANCH || !env.GITHUB_TOKEN) return failed('monitor_evidence_config');
+  const headers = { authorization: `Bearer ${env.GITHUB_TOKEN}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
+  const get = path => requestReleaseJson(request, `https://api.github.com/repos/${env.GITHUB_REPOSITORY}/${path}`, { headers });
+  try {
+    const query = new URLSearchParams({ branch: env.OPS_DEFAULT_BRANCH, event: 'schedule', status: 'completed', per_page: '10' });
+    const { workflow_runs: runs } = await get(`actions/workflows/operations-health.yml/runs?${query}`);
+    const previous = runs.find(run => Number.isSafeInteger(run.id) && run.id > 0 && String(run.id) !== env.GITHUB_RUN_ID &&
+      run.head_branch === env.OPS_DEFAULT_BRANCH && run.event === 'schedule' && run.status === 'completed' &&
+      Date.parse(run.created_at) <= now && ['success', 'failure'].includes(run.conclusion));
+    if (!previous) return failed('monitor_run_missing');
+    const { jobs } = await get(`actions/runs/${previous.id}/attempts/1/jobs?per_page=10`);
+    const previousProbe = jobs.find(job => job.name === 'health')?.steps?.find(step =>
+      step.name === 'Check external health and send authorized SMTP alert on failure' && step.status === 'completed' &&
+      ['success', 'failure'].includes(step.conclusion));
+    const completed = Date.parse(previousProbe?.completed_at);
+    if (!Number.isFinite(completed) || completed < Date.parse(previous.created_at) || completed > now) return failed('monitor_probe_unverified');
+    const ageMs = now - completed;
+    const ageMinutes = Math.round(ageMs / 60000);
+    if (ageMs > 45 * 60000) return { ...failed('monitor_cadence_gap'), ageMinutes };
+    return { ok: true, reason: 'monitor_cadence_fresh', ageMinutes };
+  } catch { return failed('monitor_evidence_unavailable'); }
+}
 export async function checkHealth(env = process.env) {
   const origin = allowedOrigin(env.OPS_HEALTH_ORIGIN, env.OPS_HEALTH_ALLOWED_ORIGINS);
   const samples = [];
@@ -75,5 +101,6 @@ export async function checkHealth(env = process.env) {
   return report;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  checkHealth().then(result => { console.log(JSON.stringify(result)); if (!result.ok) process.exitCode = 1; }).catch(() => { console.error('External monitoring failed: check the explicit origin allowlist and private alert configuration.'); process.exitCode = 1; });
+  const check = process.argv[2] === '--cadence' ? monitorCadence : checkHealth;
+  check().then(result => { console.log(JSON.stringify(result)); if (!result.ok) process.exitCode = 1; }).catch(() => { console.error('External monitoring failed: check the explicit origin allowlist and private alert configuration.'); process.exitCode = 1; });
 }

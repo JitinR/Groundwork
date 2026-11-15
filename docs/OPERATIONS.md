@@ -8,14 +8,14 @@ and from full recovery verification.
 ## Activation record
 
 The canonical application is `https://secure-nexus-xi.vercel.app/`, with production
-source on `main` in public repository `jitinraavi/Secure-Nexus`. Main is protected
+source on `main` in public repository `JitinR/Groundwork`. Main is protected
 by the required release gate. Production deploys require successful exact-source
 CI. The owner-authorized alert recipient is configured privately; runtime operation
 credentials, the daily Vercel check and existing SMTP route are configured privately.
 
 Public external monitoring is activated. Scheduled
-[run 39949974048](https://github.com/jitinraavi/Secure-Nexus/actions/runs/39949974048)
-and manual [run 39959697259](https://github.com/jitinraavi/Secure-Nexus/actions/runs/39959697259)
+[run 39949974048](https://github.com/JitinR/Groundwork/actions/runs/39949974048)
+and manual [run 39959697259](https://github.com/JitinR/Groundwork/actions/runs/39959697259)
 succeeded on 23 October 2026. These historical runs do not replace current
 freshness checks or prove inbox delivery during an outage.
 
@@ -76,7 +76,12 @@ not whether real-data restoration/decryption has been rehearsed.
 After configuration changes, dispatch a normal health run and perform an
 owner-controlled failure drill against an isolated target. Confirm the failed
 run and inbox delivery. GitHub schedules can be delayed or disabled; inspect the last run daily.
-Set a freshness alert/process if no completed probe exists for 45 minutes.
+On each first-attempt scheduled run, a separate read-only evidence check fails
+the workflow if the preceding scheduled probe step cannot be verified or
+completed more than 45 minutes earlier. A rerun or manual probe does not
+refresh this evidence. This records a missed interval when GitHub resumes and
+keeps probe results separate from scheduling failures. Maintain an independent
+freshness alert for detection while GitHub is quiet.
 
 ## Encrypted offsite PostgreSQL export
 
