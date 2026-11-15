@@ -70,7 +70,7 @@ async function run() {
         }
         const data = await response.json();
         if (data.csrfToken) this.csrf = data.csrfToken;
-        return { status: response.status, data };
+        return { status: response.status, data, cacheControl: response.headers.get('cache-control') };
       }
     }
     const password = `Fixture-${randomBytes(16).toString('hex')}-1`;
@@ -95,10 +95,25 @@ async function run() {
     assert.equal(revision.status,201,JSON.stringify(revision.data));
     const link = await owner.request('POST',`/api/projects/${id}/share-links`,{ expiresInHours:1 });
     assert.equal(link.status,201,JSON.stringify(link.data));
-    assert.equal((await new Client().request('GET',`/api/share/${link.data.token}`)).status,200);
+    const anonymous = new Client();
+    const shareUrl = `/api/share/${link.data.token}`;
+    const publicRead = await anonymous.request('GET',shareUrl);
+    assert.equal(publicRead.status,200);
+    assert.equal(publicRead.cacheControl,'private, no-store');
     const other = new Client();
     assert.equal((await other.request('POST','/api/auth/login',{ email:'pg-other@example.invalid',password })).status,200);
     assert.equal((await other.request('GET',`/api/projects/${id}`)).status,404);
+    const collaboration = `/api/collaboration/${id}`;
+    assert.equal((await other.request('GET',`${collaboration}/items`)).status,404);
+    assert.equal((await owner.request('POST',`${collaboration}/members`,{ identifier:'pg-other@example.invalid',role:'viewer' })).status,201);
+    assert.equal((await other.request('GET',`${collaboration}/items`)).status,200);
+    assert.equal((await other.request('PATCH',`/api/projects/${id}`,{ name:'Unauthorized change' })).status,403);
+    assert.equal((await owner.request('DELETE',`${collaboration}/members/pg-other`)).status,200);
+    assert.equal((await other.request('GET',`${collaboration}/items`)).status,404);
+    assert.equal((await owner.request('DELETE',`/api/projects/${id}/share-links/${link.data.id}`)).status,200);
+    const revokedRead = await anonymous.request('GET',shareUrl);
+    assert.equal(revokedRead.status,404);
+    assert.equal(revokedRead.cacheControl,'private, no-store');
     const artifacts = new FormData(); artifacts.append('kind','geometry'); artifacts.append('file',new Blob(['{"meshes":[]}'],{type:'application/json'}),'scene.json');
     const upload = await fetch(`${base}/api/projects/${id}/workspaces/artifacts`,{method:'POST',headers:{cookie:[...owner.cookies].map(([k,v])=>`${k}=${v}`).join('; '),'x-csrf-token':owner.csrf},body:artifacts});
     assert.equal(upload.status,201,await upload.text());

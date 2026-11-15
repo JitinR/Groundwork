@@ -23,6 +23,8 @@ function decryptForUser(payloadJson: string, userId: string): string {
 
 /* Public by design: the random, expiring token is the read-only capability. */
 router.get("/:token", asyncHandler(async (req, res) => {
+  res.set("Cache-Control", "private, no-store");
+  res.set("X-Content-Type-Options", "nosniff");
   const row = (await db.prepare(
     `SELECT l.project_id, l.user_id, l.expires_at, p.name, p.project_type, p.design_data, p.width_mm, p.depth_mm, p.revision, p.created_at, p.updated_at, p.photo_file_id
      FROM project_share_links l JOIN projects p ON p.id = l.project_id
@@ -42,8 +44,6 @@ router.get("/:token", asyncHandler(async (req, res) => {
     res.status(422).json({ error: "Shared design data is unreadable" });
     return;
   }
-  res.set("Cache-Control", "private, no-store");
-  res.set("X-Content-Type-Options", "nosniff");
   res.json({ id: row.project_id, name: row.name, projectType: row.project_type, widthMm: row.width_mm, depthMm: row.depth_mm, design, readOnly: true, expiresAt: row.expires_at, revision: row.revision, createdAt: row.created_at, updatedAt: row.updated_at, hasPhoto: Boolean(row.photo_file_id) });
 }));
 
