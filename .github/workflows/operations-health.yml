@@ -25,6 +25,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - name: Check external health and send authorized SMTP alert on failure
+        id: probe
         run: node scripts/operational-health.mjs
         env:
           OPS_HEALTH_ORIGIN: ${{ vars.OPS_HEALTH_ORIGIN }}
@@ -37,5 +38,11 @@ jobs:
           MAIL_USER: ${{ secrets.OPS_MAIL_USER }}
           MAIL_PASS: ${{ secrets.OPS_MAIL_PASS }}
           OPS_BACKUP_ENABLED: ${{ vars.OPS_BACKUP_ENABLED }}
+          OPS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Verify the previous scheduled probe completed within 45 minutes
+        if: ${{ !cancelled() && github.event_name == 'schedule' && github.run_attempt == '1' && (steps.probe.outcome == 'success' || steps.probe.outcome == 'failure') }}
+        run: node scripts/operational-health.mjs --cadence
+        env:
           OPS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GITHUB_TOKEN: ${{ github.token }}

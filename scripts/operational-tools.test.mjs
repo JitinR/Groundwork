@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { allowedOrigin, probe, alert, backupFreshness } from './operational-health.mjs';
+import { allowedOrigin, probe, alert, backupFreshness, monitorCadence } from './operational-health.mjs';
 import { measure, percentile } from './operational-performance.mjs';
 
 test('operational probes require exact allowlisted origins and isolated performance targets', async () => {
@@ -45,4 +45,24 @@ test('backup freshness requires recent successful run and an unexpired nonempty 
   assert.equal((await backupFreshness(env, fixture({}, []), now)).reason, 'backup_artifact_missing');
   assert.equal((await backupFreshness(env, fixture({ head_branch: 'preview' }), now)).ok, false);
   assert.equal((await backupFreshness({}, () => assert.fail('disabled freshness performed network access'), now)).enabled, false);
+});
+
+test('monitor cadence counts the original scheduled probe, excluding manual and current runs', async () => {
+  const now = Date.parse('2026-11-06T12:00:00Z');
+  const env = { GITHUB_REPOSITORY: 'fixture/repo', GITHUB_TOKEN: 'synthetic', GITHUB_RUN_ID: '30', OPS_DEFAULT_BRANCH: 'main' };
+  const prior = { id: 20, head_branch: 'main', event: 'schedule', status: 'completed', conclusion: 'success', created_at: '2026-11-06T11:00:00Z', run_attempt: 2 };
+  const probeStep = { name: 'Check external health and send authorized SMTP alert on failure', status: 'completed', conclusion: 'success', completed_at: '2026-11-06T11:30:00Z' };
+  const fixture = (step, runs = [{ ...prior, id: 30 }, { ...prior, id: 25, event: 'workflow_dispatch' }, prior]) => async url => {
+    if (url.includes('/operations-health.yml/runs?')) {
+      assert.match(url, /branch=main&event=schedule&status=completed/);
+      return Response.json({ workflow_runs: runs });
+    }
+    assert.match(url, /\/actions\/runs\/20\/attempts\/1\/jobs\?/);
+    return Response.json({ jobs: [{ name: 'health', steps: step ? [step] : [] }] });
+  };
+  assert.deepEqual(await monitorCadence(env, fixture(probeStep), now), { ok: true, reason: 'monitor_cadence_fresh', ageMinutes: 30 });
+  assert.deepEqual(await monitorCadence(env, fixture({ ...probeStep, completed_at: '2026-11-06T11:14:59Z' }), now), { ok: false, reason: 'monitor_cadence_gap', ageMinutes: 45 });
+  assert.equal((await monitorCadence(env, fixture(undefined), now)).reason, 'monitor_probe_unverified');
+  assert.equal((await monitorCadence(env, fixture(probeStep, []), now)).reason, 'monitor_run_missing');
+  assert.equal((await monitorCadence(env, async () => new Response(null, { status: 503 }), now)).reason, 'monitor_evidence_unavailable');
 });

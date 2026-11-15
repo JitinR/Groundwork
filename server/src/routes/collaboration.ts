@@ -68,13 +68,15 @@ function decryptItemBody(payloadJson: string, ownerId: string, projectId: string
 }
 
 router.get("/:projectId/events", asyncHandler(async (req: AuthedRequest, res) => {
-  const access = (await getProjectAccess(routeParam(req, "projectId"), req.user!.id));
+  const projectId = routeParam(req, "projectId");
+  const userId = req.user!.id;
+  const access = await getProjectAccess(projectId, userId);
   if (!canReadProject(access)) {
     res.status(404).json({ error: "Project not found" });
     return;
   }
   let reservation: Awaited<ReturnType<typeof reserveProjectSubscription>>;
-  try { reservation = await reserveProjectSubscription(routeParam(req, "projectId"), req.user!.id); }
+  try { reservation = await reserveProjectSubscription(projectId, userId); }
   catch (error) {
     if (error instanceof CollaborationSubscriptionError) { res.status(error.status).json({ error: error.message }); return; }
     throw error;
@@ -101,30 +103,34 @@ router.get("/:projectId/events", asyncHandler(async (req: AuthedRequest, res) =>
   };
   res.once("close", cleanup);
   res.once("finish", cleanup);
-  let lastEventId = 0;
+  const requestedId = Number(req.get("Last-Event-ID") || req.query.after || 0);
+  let lastEventId = Number.isSafeInteger(requestedId) && requestedId >= 0 ? requestedId : 0;
   let redisCursor = "0";
   let polling = false;
+  const canReceive = async () => {
+    const session = await resolveSession(req);
+    return session?.status === "active" && session.user_id === userId && canReadProject(await getProjectAccess(projectId, userId));
+  };
   // Database polling delivers events produced by other workers. A slow database
   // must not accumulate concurrent polls or leave rejected promises unhandled.
-  const replayOnce = async () => {
+  const replayOnce = async (readDistributed: boolean) => {
     if (polling || res.writableEnded || res.destroyed) return;
     polling = true;
     try {
-      const session = (await resolveSession(req));
-      if (!session || session.status !== "active" || !canReadProject((await getProjectAccess(routeParam(req, "projectId"), req.user!.id)))) { res.end(); return; }
-      lastEventId = (await replayProjectEvents(routeParam(req, "projectId"), res, lastEventId));
-      if (redisTransportConfigured) {
+      lastEventId = await replayProjectEvents(projectId, res, lastEventId, canReceive);
+      if (readDistributed && redisTransportConfigured && !res.writableEnded && !res.destroyed) {
         let result: Awaited<ReturnType<typeof readRedisProjectEvents>>;
-        try { result = await readRedisProjectEvents(routeParam(req, "projectId"), redisCursor); }
+        try { result = await readRedisProjectEvents(projectId, redisCursor); }
         catch {
-          writeSse(res, "transport-status", { backend: "redis-rest", degraded: true });
+          if (await canReceive()) writeSse(res, "transport-status", { backend: "redis-rest", degraded: true });
+          else res.end();
           return;
         }
-        if (res.writableEnded || res.destroyed || (await resolveSession(req))?.status !== "active" || !canReadProject((await getProjectAccess(routeParam(req, "projectId"), req.user!.id)))) return;
+        if (!await canReceive()) { res.end(); return; }
         redisCursor = result.cursor;
         for (const event of result.events) {
           const parsed = z.object({ origin: z.string().max(120), eventId: z.string().max(120), projectId: z.string(), type: z.string().max(80), revision: z.number().int().min(0), createdAt: z.number().int(), actorId: z.string().max(120) }).safeParse(event);
-          if (parsed.success && parsed.data.origin !== collaborationInstanceId && parsed.data.projectId === routeParam(req, "projectId") && !writeSse(res, "distributed", parsed.data)) break;
+          if (parsed.success && parsed.data.origin !== collaborationInstanceId && parsed.data.projectId === projectId && !writeSse(res, "distributed", parsed.data)) break;
         }
       }
     } finally {
@@ -133,16 +139,18 @@ router.get("/:projectId/events", asyncHandler(async (req: AuthedRequest, res) =>
   };
   try {
     if (res.destroyed || res.writableEnded) { cleanup(); return; }
+    if (!await canReceive()) { res.status(404).json({ error: "Project not found" }); return; }
     res.status(200).set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-store", Connection: "keep-alive", "X-Accel-Buffering": "no" });
     res.flushHeaders();
-    if (!writeSse(res, "ready", { projectId: routeParam(req, "projectId"), role: access.role })) { cleanup(); return; }
-    unsubscribe = await subscribeProject(routeParam(req, "projectId"), req.user!.id, res, reservation);
+    if (!writeSse(res, "ready", { projectId, role: access.role })) { cleanup(); return; }
+    unsubscribe = await subscribeProject(projectId, userId, {
+      response: res, canReceive, wake: () => { void replayOnce(false).catch(() => res.end()); },
+    }, reservation);
     if (cleaned || res.destroyed || res.writableEnded) { await unsubscribe(); cleanup(); return; }
-    const requestedId = Number(req.get("Last-Event-ID") || req.query.after || 0);
-    lastEventId = await replayProjectEvents(routeParam(req, "projectId"), res, Number.isSafeInteger(requestedId) && requestedId >= 0 ? requestedId : 0);
-    if (cleaned || !writeSse(res, "presence", await presenceSnapshot(routeParam(req, "projectId")))) { cleanup(); return; }
+    await replayOnce(false);
+    if (cleaned || res.destroyed || res.writableEnded) { cleanup(); return; }
     heartbeat = setInterval(() => { writeSse(res, "heartbeat"); }, 20_000);
-    replay = setInterval(() => { void replayOnce().catch(() => { res.end(); }); }, 2000);
+    replay = setInterval(() => { void replayOnce(true).catch(() => { res.end(); }); }, 2000);
     heartbeat.unref?.(); replay.unref?.();
     stopDeadline = SERVERLESS ? serverlessStreamDeadline(res) : () => {};
     if (res.destroyed || res.writableEnded) cleanup();

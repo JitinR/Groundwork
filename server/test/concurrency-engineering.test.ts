@@ -227,7 +227,7 @@ test("concurrent SSE reservations admit at most ten connections and expired leas
     destroyed: false, writableEnded: false, writableLength: 0,
     write() { return true; }, end() { this.writableEnded = true; this.emit("finish"); },
   });
-  const unsubscribe = await subscribeProject(id, users[0], response as unknown as Response, leases[0]);
+  const unsubscribe = await subscribeProject(id, users[0], { response: response as unknown as Response, canReceive: async () => true, wake() {} }, leases[0]);
   assert.equal(response.writableEnded, true);
   await unsubscribe();
   const count = await db.prepare("SELECT COUNT(*) AS count FROM project_presence WHERE project_id=? AND expires_at>?").get(id, now()) as { count: number };
@@ -248,22 +248,65 @@ test("slow consumers during initial subscription or ready frame release leases w
   });
   try {
     const response = slowResponse();
-    const unsubscribe = await subscribeProject(id, users[0], response as unknown as Response);
+    const unsubscribe = await subscribeProject(id, users[0], { response: response as unknown as Response, canReceive: async () => true, wake() {} });
     await unsubscribe();
     assert.equal(response.writableEnded, true);
     assert.equal(active.size, 0);
     const { default: router } = await import("../src/routes/collaboration.js");
     const route = (router as unknown as { stack: { route?: { path: string; stack: { handle: Function }[] } }[] }).stack.find((item) => item.route?.path === "/:projectId/events")!.route!;
     const early = slowResponse();
+    const cookies = Object.fromEntries(actors[0].headers.cookie.split("; ").map((pair) => pair.split("=")));
     await new Promise<void>((resolve, reject) => {
       early.once("finish", resolve);
-      route.stack[0].handle({ params: { projectId: id }, user: { id: users[0] }, query: {}, get() { return undefined; } }, early, reject);
+      route.stack[0].handle({ params: { projectId: id }, user: { id: users[0] }, query: {}, cookies, get() { return undefined; } }, early, reject);
     });
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(active.size, 0);
     const count = await db.prepare("SELECT COUNT(*) AS count FROM project_presence WHERE project_id=?").get(id) as { count: number };
     assert.equal(count.count, 0);
   } finally { for (const timer of active) clear(timer); globalThis.setInterval = set; globalThis.clearInterval = clear; }
+});
+
+test("open collaboration streams stop before delivering events after revocation", async (t) => {
+  for (const kind of ["project membership", "organization membership", "session"]) await t.test(kind, async () => {
+    const id = await project();
+    const path = `/collaboration/${id}`;
+    let memberPath = `${path}/members/${users[1]}`;
+    if (kind === "organization membership") {
+      const org = await request(0, "/organizations", "POST", { name: "Revocation fixture" });
+      assert.equal(org.status, 201);
+      const organizationPath = `/organizations/${org.body.id}`;
+      assert.equal((await request(0, `${organizationPath}/projects`, "POST", { projectId: id })).status, 200);
+      assert.equal((await request(0, `${organizationPath}/members`, "POST", { identifier: `${users[1]}@example.test`, role: "viewer" })).status, 201);
+      assert.equal((await request(2, `${path}/events`)).status, 404);
+      memberPath = `${organizationPath}/members/${users[1]}`;
+    }
+    const abort = new AbortController();
+    const timeout = setTimeout(() => abort.abort(), 8000);
+    try {
+      const stream = await fetch(`${origin}/api${path}/events`, { headers: actors[1].headers, signal: abort.signal });
+      assert.equal(stream.status, 200);
+      const reader = stream.body!.pipeThrough(new TextDecoderStream()).getReader();
+      assert.equal((await request(0, `${path}/items`, "POST", { kind: "comment", body: "Before revocation" })).status, 201);
+      let received = "";
+      while (!received.includes('"type":"comment.created"')) {
+        const chunk = await reader.read();
+        assert.equal(chunk.done, false, "the active member must receive the first event");
+        received += chunk.value;
+      }
+      if (kind === "session") assert.equal((await request(1, "/auth/logout", "POST", {})).status, 200);
+      else assert.equal((await request(0, memberPath, "DELETE")).status, 200);
+      assert.equal((await request(0, `${path}/items`, "POST", { kind: "comment", body: "After revocation" })).status, 201);
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        received += chunk.value;
+      }
+      assert.doesNotMatch(received, /"type":"member.updated"/);
+      assert.equal([...received.matchAll(/"type":"comment.created"/g)].length, 1);
+      assert.equal((await request(1, `${path}/events`)).status, kind === "session" ? 401 : 404);
+    } finally { clearTimeout(timeout); abort.abort(); }
+  });
 });
 
 after(async () => {

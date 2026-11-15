@@ -2,7 +2,8 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { latestGate, releaseReadiness, requestReleaseJson, requestReleaseEvidence, ReleaseEvidenceError, releaseEvidenceFailureDetail, validateRelease } from './release-readiness.mjs';
 
-export const DEPLOYMENT_REPOSITORY = 'jitinraavi/Secure-Nexus';
+export const DEPLOYMENT_REPOSITORY = 'JitinR/Groundwork';
+export const DEPLOYMENT_REPOSITORY_ID = '1373227538';
 export const DEPLOYMENT_PROJECT = 'prj_1blxFgztH32acCvngFaCVr4MqdGJ';
 export const PREVIEW_CI_WAIT_MS = 30 * 60_000;
 export const PREVIEW_CI_POLL_MS = 2 * 60_000;
@@ -114,7 +115,11 @@ export function approvedDeployHook(value) {
 export function vercelBuildTarget(env) {
   if (!['production', 'preview'].includes(env.VERCEL_ENV)) throw new Error('The Vercel deployment environment must be explicit');
   const gitRepository = env.VERCEL_GIT_REPO_OWNER && env.VERCEL_GIT_REPO_SLUG ? `${env.VERCEL_GIT_REPO_OWNER}/${env.VERCEL_GIT_REPO_SLUG}` : null;
-  if (gitRepository && gitRepository.toLowerCase() !== DEPLOYMENT_REPOSITORY.toLowerCase()) throw new Error('Vercel Git metadata does not match the configured repository');
+  const gitRepositoryId = env.VERCEL_GIT_REPO_ID;
+  if (env.VERCEL_GIT_PROVIDER && env.VERCEL_GIT_PROVIDER !== 'github') throw new Error('Vercel Git metadata must come from GitHub');
+  if (gitRepositoryId ? gitRepositoryId !== DEPLOYMENT_REPOSITORY_ID : gitRepository && gitRepository.toLowerCase() !== DEPLOYMENT_REPOSITORY.toLowerCase()) {
+    throw new Error('Vercel Git metadata does not match the configured repository');
+  }
   if (env.VERCEL_GIT_COMMIT_SHA && env.GROUNDWORK_RELEASE_COMMIT && env.VERCEL_GIT_COMMIT_SHA !== env.GROUNDWORK_RELEASE_COMMIT) throw new Error('Explicit release commit disagrees with Vercel Git metadata');
   if (env.VERCEL_GIT_COMMIT_REF && env.GROUNDWORK_RELEASE_BRANCH && env.VERCEL_GIT_COMMIT_REF !== env.GROUNDWORK_RELEASE_BRANCH) throw new Error('Explicit release branch disagrees with Vercel Git metadata');
   const branch = env.VERCEL_GIT_COMMIT_REF || env.GROUNDWORK_RELEASE_BRANCH || (env.VERCEL_ENV === 'production' ? 'main' : '');
@@ -134,7 +139,8 @@ export async function guardVercelBuild(env = process.env, request = fetch, waitO
 /** A workflow_run job receives only its short-lived read-only GitHub token and
  * this one project-scoped hook. A lost POST acknowledgement is never retried. */
 export async function deployAfterCi(env = process.env, request = fetch, { checkOnly = false, evidenceOptions = {}, hookTimeoutMs = DEPLOY_HOOK_ACK_TIMEOUT_MS } = {}) {
-  if (env.GITHUB_EVENT_NAME !== 'workflow_run' || env.GITHUB_REPOSITORY !== DEPLOYMENT_REPOSITORY || env.RELEASE_BRANCH !== 'main' ||
+  if (env.GITHUB_EVENT_NAME !== 'workflow_run' || env.GITHUB_REPOSITORY_ID !== DEPLOYMENT_REPOSITORY_ID ||
+      env.GITHUB_REPOSITORY?.toLowerCase() !== DEPLOYMENT_REPOSITORY.toLowerCase() || env.RELEASE_BRANCH !== 'main' ||
       !/^[1-9]\d*$/.test(env.RELEASE_RUN_ID || '') || !/^[1-9]\d*$/.test(env.RELEASE_RUN_ATTEMPT || '') ||
       !Number.isSafeInteger(hookTimeoutMs) || hookTimeoutMs < 1 || hookTimeoutMs > DEPLOY_HOOK_ACK_TIMEOUT_MS) throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID');
   try { validateRelease({ repository: env.GITHUB_REPOSITORY, commit: env.RELEASE_COMMIT, branch: env.RELEASE_BRANCH }); }
