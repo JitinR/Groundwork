@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { approvedDeployHook, deployAfterCi, deploymentFailureDiagnostic, DeploymentDeliveryError, guardVercelBuild, vercelBuildTarget, waitForPreviewCi, PREVIEW_CI_WAIT_MS, PREVIEW_CI_MAX_POLLS, DEPLOY_HOOK_ACK_TIMEOUT_MS, DEPLOYMENT_PROJECT, DEPLOYMENT_REPOSITORY } from './deploy-after-ci.mjs';
+import { approvedDeployHook, deployAfterCi, deploymentFailureDiagnostic, DeploymentDeliveryError, guardVercelBuild, vercelBuildTarget, waitForPreviewCi, PREVIEW_CI_WAIT_MS, PREVIEW_CI_MAX_POLLS, DEPLOY_HOOK_ACK_TIMEOUT_MS, DEPLOYMENT_PROJECT, DEPLOYMENT_REPOSITORY, DEPLOYMENT_REPOSITORY_ID } from './deploy-after-ci.mjs';
 import { releaseReadiness, requestReleaseJson, requestReleaseEvidence } from './release-readiness.mjs';
 
 const commit = 'a'.repeat(40), otherCommit = 'b'.repeat(40);
 const hook = `https://api.vercel.com/v1/integrations/deploy/${DEPLOYMENT_PROJECT}/isolated-hook-fixture`;
-const environment = () => ({ GITHUB_EVENT_NAME: 'workflow_run', GITHUB_REPOSITORY: DEPLOYMENT_REPOSITORY, RELEASE_COMMIT: commit, RELEASE_BRANCH: 'main', RELEASE_RUN_ID: '101', RELEASE_RUN_ATTEMPT: '1', GITHUB_TOKEN: 'ephemeral-isolated-github-token', VERCEL_DEPLOY_HOOK: hook });
+const environment = () => ({ GITHUB_EVENT_NAME: 'workflow_run', GITHUB_REPOSITORY: DEPLOYMENT_REPOSITORY, GITHUB_REPOSITORY_ID: DEPLOYMENT_REPOSITORY_ID, RELEASE_COMMIT: commit, RELEASE_BRANCH: 'main', RELEASE_RUN_ID: '101', RELEASE_RUN_ATTEMPT: '1', GITHUB_TOKEN: 'ephemeral-isolated-github-token', VERCEL_DEPLOY_HOOK: hook });
 const run = (update = {}) => ({ id: 101, repository: { full_name: DEPLOYMENT_REPOSITORY }, head_repository: { full_name: DEPLOYMENT_REPOSITORY }, head_sha: commit, head_branch: 'main', event: 'push', path: '.github/workflows/ci.yml', run_number: 5, run_attempt: 1, status: 'completed', conclusion: 'success', ...update });
 const jobs = (update = {}) => ['verify', 'backup-drill', 'release-gate'].map(name => ({ name, run_id: 101, head_sha: commit, status: 'completed', conclusion: 'success', ...(update[name] || {}) }));
 function fakeGithub({ runs = [run()], refreshedRuns = runs, jobList = jobs(), branchCommits = [commit], hookResponse = { job: { id: 'isolated-job', state: 'PENDING' } } } = {}) {
@@ -60,7 +60,7 @@ test('stale, foreign, failed, incomplete and rerun CI evidence can never trigger
     await assert.rejects(deployAfterCi(environment(), fake.request));
     assert.equal(fake.calls.some(call => call.url === hook), false);
   }
-  for (const update of [{ GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_REPOSITORY: 'another/repo' }, { RELEASE_BRANCH: 'preview' }, { RELEASE_RUN_ID: 'bad' }, { RELEASE_RUN_ATTEMPT: '0' }]) {
+  for (const update of [{ GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_REPOSITORY: 'another/repo' }, { GITHUB_REPOSITORY_ID: '1' }, { GITHUB_REPOSITORY_ID: '' }, { RELEASE_BRANCH: 'preview' }, { RELEASE_RUN_ID: 'bad' }, { RELEASE_RUN_ATTEMPT: '0' }]) {
     const fake = fakeGithub(); await assert.rejects(deployAfterCi({ ...environment(), ...update }, fake.request)); assert.equal(fake.calls.length, 0);
   }
 });
@@ -212,6 +212,17 @@ test('Vercel build guard checks production main and preview branch CI with anony
   for (const update of [{ VERCEL_ENV: '' }, { VERCEL_GIT_COMMIT_REF: branch }, { VERCEL_GIT_COMMIT_SHA: '' }, { GROUNDWORK_RELEASE_COMMIT: otherCommit }, { GROUNDWORK_RELEASE_BRANCH: branch }, { VERCEL_GIT_REPO_OWNER: 'another', VERCEL_GIT_REPO_SLUG: 'repo' }]) assert.throws(() => vercelBuildTarget({ ...env, ...update }));
 });
 
+test('Vercel uses canonical GitHub evidence when matching repository ID accompanies stale Git metadata', async () => {
+  const env = { VERCEL_ENV: 'production', VERCEL_GIT_COMMIT_SHA: commit, VERCEL_GIT_COMMIT_REF: 'main',
+    VERCEL_GIT_PROVIDER: 'github', VERCEL_GIT_REPO_ID: DEPLOYMENT_REPOSITORY_ID,
+    VERCEL_GIT_REPO_OWNER: 'jitinraavi', VERCEL_GIT_REPO_SLUG: 'Secure-Nexus' };
+  const fake = fakeGithub();
+  assert.equal((await guardVercelBuild(env, fake.request)).repository, 'JitinR/Groundwork');
+  assert.throws(() => vercelBuildTarget({ ...env, VERCEL_GIT_REPO_ID: '' }));
+  assert.throws(() => vercelBuildTarget({ ...env, VERCEL_GIT_PROVIDER: 'gitlab' }));
+  assert.throws(() => vercelBuildTarget({ ...env, VERCEL_GIT_REPO_ID: '1', VERCEL_GIT_REPO_OWNER: 'JitinR', VERCEL_GIT_REPO_SLUG: 'Groundwork' }));
+});
+
 test('release evidence limits cover streamed response bodies after headers', async () => {
   let connectionSignal;
   await assert.rejects(requestReleaseJson(async (_url, init) => { connectionSignal = init.signal; return new Promise(() => undefined); }, 'https://api.github.com/fixture', {}, 100, 10), /timed out/);
@@ -327,6 +338,8 @@ test('deployment workflow uses only completed successful main CI and keeps the h
   const workflow = await readFile(new URL('../.github/workflows/deploy-production.yml', import.meta.url), 'utf8');
   assert.match(workflow, /workflow_run:/); assert.match(workflow, /types: \[completed\]/); assert.match(workflow, /branches: \[main\]/);
   assert.match(workflow, /conclusion == 'success'/); assert.match(workflow, /workflow_run\.event == 'push'/);
+  assert.ok(workflow.includes(`github.repository_id == '${DEPLOYMENT_REPOSITORY_ID}'`));
+  assert.ok(workflow.includes(`github.event.workflow_run.head_repository.id == ${DEPLOYMENT_REPOSITORY_ID}`));
   assert.match(workflow, /persist-credentials: false/); assert.match(workflow, /actions: read/);
   assert.doesNotMatch(workflow, /npm (?:ci|install)|VERCEL_TOKEN|pull_request_target:|workflow_dispatch:/);
   assert.equal((workflow.match(/secrets\.VERCEL_DEPLOY_HOOK/g) || []).length, 1);
