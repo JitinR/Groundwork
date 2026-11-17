@@ -10,6 +10,7 @@ if [[ "${ID}" != "ubuntu" || "${VERSION_CODENAME}" != "noble" ]]; then
 fi
 sudo install -d /usr/share/postgresql-common/pgdg
 curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+  --connect-timeout 10 --max-time 20 --retry 3 --retry-all-errors --retry-max-time 75 \
   https://www.postgresql.org/media/keys/ACCC4CF8.asc \
   --output "${RUNNER_TEMP}/postgresql-repository.asc"
 sudo install -m 0644 "${RUNNER_TEMP}/postgresql-repository.asc" /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
