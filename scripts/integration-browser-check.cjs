@@ -123,14 +123,18 @@ async function run() {
     results.push('Mobile studio and five independently tappable process hotspots');
 
     await page.goto(`${base}/dashboard`, { waitUntil: 'networkidle' });
-    await page.waitForFunction(async () => Boolean((await navigator.serviceWorker.getRegistration())?.active), { timeout: 30000 });
-    await page.reload({ waitUntil: 'networkidle' });
-    await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller));
+    await page.getByRole('button', { name: 'Sync Ready', exact: true }).click();
+    await page.getByRole('button', { name: 'Prepare offline files', exact: true }).click();
+    await page.getByText(/^(Prepared; reopen app|Verified cache ready)$/).waitFor({ timeout: 45000 });
+    await page.close();
+    const offlinePage = await context.newPage();
+    offlinePage.on('pageerror', error => errors.push(error.message));
     await context.setOffline(true);
-    await page.goto(`${base}/`, { waitUntil: 'domcontentloaded' });
-    await page.locator('#hero-heading').waitFor();
-    await page.goto(`${base}/login`, { waitUntil: 'domcontentloaded' });
-    await page.locator('#root').waitFor();
+    await offlinePage.goto(`${base}/`, { waitUntil: 'domcontentloaded' });
+    await offlinePage.locator('#hero-heading').waitFor();
+    assert.equal(await offlinePage.evaluate(() => Boolean(navigator.serviceWorker.controller)), true);
+    await offlinePage.goto(`${base}/login`, { waitUntil: 'domcontentloaded' });
+    await offlinePage.locator('#root').waitFor();
     results.push('Verified service worker serves the matching studio and application documents offline');
     await context.setOffline(false);
     // Offline API failures are expected; page exceptions and CSP errors are not.
