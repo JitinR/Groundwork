@@ -126,8 +126,14 @@ app.use("/api", csrfProtection);
 
 
 app.get("/api/health", asyncHandler(async (_req, res) => {
-  const ok = ((await db.prepare("SELECT 1 AS ok").get()) as { ok: number }).ok === 1;
-  res.json({ ok, uptime: process.uptime() });
+  let ok = false;
+  try {
+    const result = await db.prepare("SELECT 1 AS ok").get() as { ok: number } | undefined;
+    ok = result?.ok === 1;
+  } catch {
+    console.error(JSON.stringify({ type: "health.database_unavailable" }));
+  }
+  res.set("Cache-Control", "no-store").status(ok ? 200 : 503).json({ ok, uptime: process.uptime() });
 }));
 
 app.get("/api/countries", (_req, res) => {

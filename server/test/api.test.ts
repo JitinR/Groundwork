@@ -170,8 +170,31 @@ test("roadmap API integration slice", async (t) => {
             uptime: number;
         }>("/api/health");
         assert.equal(response.status, 200);
+        assert.equal(response.headers.get("cache-control"), "no-store");
         assert.equal(body.ok, true);
         assert.equal(typeof body.uptime, "number");
+    });
+    await t.test("unhealthy database checks return uncached HTTP 503 without internal details", async (healthTest) => {
+        const prepare = db.prepare.bind(db);
+        let checks = 0;
+        healthTest.mock.method(db, "prepare", (sql: string) => {
+            if (sql !== "SELECT 1 AS ok") return prepare(sql);
+            return { get() {
+                checks += 1;
+                if (checks === 1) return undefined;
+                if (checks === 2) return { ok: 0 };
+                throw new Error("private fixture database error");
+            } };
+        });
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const { response, body } = await client.json<{ ok: boolean; uptime: number }>("/api/health");
+            assert.equal(response.status, 503);
+            assert.equal(response.headers.get("cache-control"), "no-store");
+            assert.deepEqual(Object.keys(body).sort(), ["ok", "uptime"]);
+            assert.equal(body.ok, false);
+            assert.equal(typeof body.uptime, "number");
+        }
+        assert.equal(checks, 3);
     });
     let csrfToken = "";
     await t.test("bootstraps auth CSRF state", async () => {
