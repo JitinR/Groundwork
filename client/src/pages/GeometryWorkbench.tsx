@@ -10,7 +10,7 @@ import { inspectGeometryScene, MAX_SCENE_TRIANGLES, validVec3, type GeometryMesh
 import { inspectGeometryManifest, type GeometryManifest } from "../lib/geometryPipeline";
 import { DEFAULT_TRACE_SETTINGS, type PathTraceSettings } from "../lib/pathTracer";
 import { buildIfcStep } from "../lib/bim";
-import { importIfcGeometry } from "../lib/ifcGeometry";
+import { ifcGeometryCoverageWarnings, importIfcGeometry } from "../lib/ifcGeometry";
 import type { MeshClashReport } from "../lib/meshClash";
 import type { GeometryBenchmark, GeometryRequest, GeometryResponse } from "../lib/geometry.worker";
 import { produceGeometryChunks, type ProducedGeometryChunks } from "../lib/geometryChunkProducer";
@@ -109,7 +109,7 @@ function inspectWorkspace(value: unknown): GeometryWorkspace {
 }
 function projectScene(project: ProjectDetail): GeometryScene {
   if (!project.design) throw new Error("The selected project has no saved design geometry.");
-  const source = buildIfcStep(project.design), document = importIfcGeometry(source), meshes: GeometryMesh[] = [], warnings: string[] = ["Linked editor import uses approximate IFC planning envelopes, not the editor's original meshes or construction-ready geometry.", "IFC Z-up metres are rotated into right-handed Y-up metres as (X, Z, -Y); triangle winding is retained.", "Constant diffuse material proxies are used. Openings, textures, parametric curves, terrain and unsupported IFC representations may be absent or approximated.", ...document.issues];
+  const source = buildIfcStep(project.design), document = importIfcGeometry(source), meshes: GeometryMesh[] = [], warnings: string[] = ["Linked editor import uses approximate IFC planning envelopes, not the editor's original meshes or construction-ready geometry.", "IFC Z-up metres are rotated into right-handed Y-up metres as (X, Z, -Y); triangle winding is retained.", "Constant diffuse material proxies are used. Openings, textures, parametric curves, terrain and unsupported IFC representations may be absent or approximated.", ...ifcGeometryCoverageWarnings(document)];
   const min: Vec3 = [Infinity, Infinity, Infinity], max: Vec3 = [-Infinity, -Infinity, -Infinity]; let triangles = 0, missing = 0;
   for (const product of document.products) {
     if (!product.meshes.length) missing++;

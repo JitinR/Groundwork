@@ -279,7 +279,15 @@ export function importIfcGeometry(source: string): IfcDocument {
     }
     for (const [key, entry] of Object.entries(combined)) { metadataStep(); product.propertyValues![key] = entry; product.properties[key] = entry.lexicalValue; product.propertyTypes![key] = entry.dataType; }
   }
-  for (const e of entities.values()) if (e.type === "IFCRELVOIDSELEMENT") { const product = byId.get(get(e.args[4])?.id ?? -1); if (product) product.issues.push("Host void/opening geometry is retained in source but not subtracted from the imported mesh."); }
+  const hostsWithVoids = new Set<IfcProduct>();
+  for (const entity of entities.values()) {
+    if (entity.type !== "IFCRELVOIDSELEMENT") continue;
+    const host = byId.get(get(entity.args[4])?.id ?? -1);
+    if (host) hostsWithVoids.add(host);
+  }
+  for (const host of hostsWithVoids) {
+    host.issues.push("Host void/opening geometry is retained in source but not subtracted from the imported mesh.");
+  }
   if (entities.size && !products.length) issues.push("No products with supported product representation attributes found.");
   issues.push("Openings/Boolean operations, mirrored/nonuniform/partially authored mapped transforms, multi-hop type inheritance, non-scalar properties, textures and CRS map conversions are not applied. Source STEP is preserved on export; this is a shared IFC representation/metadata subset, not full schema validation.");
   return { schema, source, products, issues, entities, unitScale };
@@ -309,4 +317,43 @@ export function exportIfcRoundTrip(document: IfcDocument, names: Record<string, 
   let result = document.source; for (const patch of patches.sort((a, b) => b.start - a.start)) result = result.slice(0, patch.start) + patch.text + result.slice(patch.end); return result;
 }
 
-export function exportIfcMeshObj(document: IfcDocument): string { let offset = 1; const out = ["# IFC supported geometry in metres; IFC Z-up coordinates"]; for (const product of document.products) { out.push(`o ${product.globalId}`); for (const mesh of product.meshes) { for (let i = 0; i < mesh.vertices.length; i += 3) out.push(`v ${mesh.vertices[i]} ${mesh.vertices[i + 1]} ${mesh.vertices[i + 2]}`); for (let i = 0; i < mesh.triangles.length; i += 3) out.push(`f ${mesh.triangles[i] + offset} ${mesh.triangles[i + 1] + offset} ${mesh.triangles[i + 2] + offset}`); offset += mesh.vertices.length / 3; } } return out.join("\n"); }
+function productCoverageWarning(product: IfcProduct, issue: string): string {
+  return `${product.globalId} (#${product.stepId}): ${issue}`.slice(0, 500);
+}
+
+/** Reserve four of the scene's 100 warning slots for the caller's scope and conversion notes. */
+export function ifcGeometryCoverageWarnings(document: IfcDocument): string[] {
+  const warnings: string[] = [];
+  let total = 0;
+  for (const product of document.products) for (const issue of product.issues) {
+    if (++total <= 96) warnings.push(productCoverageWarning(product, issue));
+  }
+  for (const issue of document.issues) {
+    if (++total <= 96) warnings.push(issue.slice(0, 500));
+  }
+  if (total > warnings.length) {
+    warnings.pop();
+    warnings.push(`${total - warnings.length} additional IFC geometry findings omitted from this scene. See the full geometry coverage report and retain the source IFC.`);
+  }
+  return warnings;
+}
+
+export function exportIfcMeshObj(document: IfcDocument): string {
+  let offset = 1;
+  const out = [
+    "# IFC supported geometry in metres; IFC Z-up coordinates",
+    "# Partial IFC mesh for coordination. Retain the source IFC and geometry coverage report for review.",
+  ];
+  for (const product of document.products) {
+    out.push(`o ${product.globalId}`);
+    for (const issue of product.issues) {
+      out.push(`# ${productCoverageWarning(product, issue).replace(/[\r\n\u2028\u2029]+/g, " ")}`);
+    }
+    for (const mesh of product.meshes) {
+      for (let i = 0; i < mesh.vertices.length; i += 3) out.push(`v ${mesh.vertices[i]} ${mesh.vertices[i + 1]} ${mesh.vertices[i + 2]}`);
+      for (let i = 0; i < mesh.triangles.length; i += 3) out.push(`f ${mesh.triangles[i] + offset} ${mesh.triangles[i + 1] + offset} ${mesh.triangles[i + 2] + offset}`);
+      offset += mesh.vertices.length / 3;
+    }
+  }
+  return out.join("\n");
+}

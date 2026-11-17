@@ -4,7 +4,9 @@ import { defaultDesign, type Design, type DraftElement } from "../src/types";
 import { cadFootprintArea, cadQuantities, createCadObject, executeCadCommand, localCadAxis, resizeDraft, resolveCadSnap } from "../src/lib/cadModel";
 import { buildDxf } from "../src/lib/dxf";
 import { buildBimExchange, buildIfcStep, ifcSourceGuid, validateIfcProfile, validateIfcStep } from "../src/lib/bim";
+import { inspectBimGeometry } from "../src/lib/bimValidation";
 import { documentationInventory } from "../src/lib/documentationSchedule";
+import { exportIfcMeshObj, exportIfcRoundTrip, ifcGeometryCoverageWarnings, importIfcGeometry } from "../src/lib/ifcGeometry";
 import { buildObjMtl } from "../src/lib/obj";
 
 const close = (actual: number, expected: number, tolerance = 1e-8) => assert.ok(Math.abs(actual - expected) < tolerance, `${actual} != ${expected}`);
@@ -134,6 +136,39 @@ test("unfilled authored IFC voids retain their host and pass reference-view pref
 
   const noHost = ifc.split("\n").filter(line => !line.includes("=IFCRELVOIDSELEMENT(")).join("\n");
   assert.ok(validateIfcStep(noHost).issues.some(issue => issue.code === "opening-host-missing"), "Missing unfilled-void hosts must still fail preflight");
+});
+
+test("IFC proxy and OBJ coverage preserve relational-void warnings on the affected mesh", () => {
+  const wall = { ...createCadObject("wall"), id: "coverage-host", openings: [
+    { id: "coverage-void-west", kind: "void" as const, widthM: .5, heightM: 2, offsetM: -1, sillM: 0 },
+    { id: "coverage-void-east", kind: "void" as const, widthM: .5, heightM: 2, offsetM: 1, sillM: 0 },
+  ] };
+  const plainWall = { ...createCadObject("wall"), id: "coverage-plain" };
+  const source = buildIfcStep(project(wall, plainWall));
+  assert.equal((source.match(/=IFCRELVOIDSELEMENT\(/g) ?? []).length, 2);
+  const document = importIfcGeometry(source);
+  const host = document.products.find(product => product.globalId === ifcSourceGuid(wall.id))!;
+  const control = document.products.find(product => product.globalId === ifcSourceGuid(plainWall.id))!;
+  assert.ok(host.meshes.length && control.meshes.length);
+  const warning = "Host void/opening geometry is retained in source but not subtracted from the imported mesh.";
+  const identifiedWarning = `${host.globalId} (#${host.stepId}): ${warning}`;
+  assert.deepEqual(host.issues, [warning]);
+  assert.deepEqual(control.issues, []);
+
+  const coverage = inspectBimGeometry(document);
+  assert.ok(coverage.findings.some(finding => finding.globalId === host.globalId && finding.status === "unsupported" && finding.message === warning));
+  assert.ok(coverage.findings.some(finding => finding.globalId === control.globalId && finding.status === "pass"));
+  assert.ok(ifcGeometryCoverageWarnings(document).includes(identifiedWarning));
+  const obj = exportIfcMeshObj(document);
+  assert.ok(obj.includes(`o ${host.globalId}\n# ${identifiedWarning}\nv `));
+  assert.ok(obj.includes(`o ${control.globalId}\nv `));
+  assert.equal((obj.match(/^f /gm) ?? []).length, document.products.flatMap(product => product.meshes).reduce((count, mesh) => count + mesh.triangles.length / 3, 0));
+  assert.equal(exportIfcRoundTrip(document), source);
+
+  const crowdedCoverage = ifcGeometryCoverageWarnings({ ...document, issues: Array.from({ length: 100 }, (_, index) => `Synthetic issue ${index}`) });
+  assert.equal(crowdedCoverage.length, 96);
+  assert.ok(crowdedCoverage.includes(identifiedWarning));
+  assert.match(crowdedCoverage.at(-1)!, /additional IFC geometry findings omitted/);
 });
 
 test("IFC spaces require storey decomposition and openings stay out of ordinary spatial containment", () => {
