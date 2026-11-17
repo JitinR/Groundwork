@@ -112,7 +112,7 @@ html.studio-auth-open .gw-toast-stack > div > p + p { color: #64685b; }
   border: 1px solid var(--public-line);
   border-radius: 3px;
   background: transparent;
-  font-size: 10px;
+  font-size: 12px;
   cursor: pointer;
 }
 .gw-public.public-auth .auth-motion-toggle:hover { border-color: var(--public-accent); color: var(--public-ink); }
@@ -292,7 +292,7 @@ html.studio-auth-open .gw-toast-stack > div > p + p { color: #64685b; }
   .gw-public.public-auth .auth-header-actions { gap: 12px; }
   .gw-public.public-auth .public-auth-back { font-size: 0; gap: 0; }
   .gw-public.public-auth .public-auth-back > span { font-size: 19px; }
-  .gw-public.public-auth .auth-motion-toggle { padding: 8px; min-height: 33px; font-size: 9px; gap: 6px; }
+  .gw-public.public-auth .auth-motion-toggle { padding: 8px; min-height: 44px; gap: 6px; white-space: nowrap; }
   .gw-public.public-auth .public-auth-layout { width: calc(100% - 40px); gap: 30px; }
   .gw-public.public-auth .public-auth-art { min-height: 290px; height: 290px; }
   .gw-public.public-auth .public-auth-art h2 { font-size: clamp(42px, 11.4vw, 54px); }

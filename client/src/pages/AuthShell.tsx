@@ -53,7 +53,17 @@ export function AuthShell({ children, stage = "login" }: { children: ReactNode; 
         <span>groundwork<sup>®</sup></span>
       </Link>
       <div className="auth-header-actions">
-        <button className="auth-motion-toggle" type="button" onClick={toggleMotion} aria-pressed={motionEnabled} disabled={reducedMotion} aria-label={reducedMotion ? "Decorative motion is paused by your system preference" : motionEnabled ? "Turn off decorative motion" : "Turn on decorative motion"} title={reducedMotion ? "Motion is paused to respect your system preference." : undefined}><span className="motion-dot" aria-hidden="true"/>{motionEnabled ? "Motion on" : "Motion off"}</button>
+        <button
+          className="auth-motion-toggle"
+          type="button"
+          onClick={toggleMotion}
+          aria-pressed={motionEnabled}
+          disabled={reducedMotion}
+          title={reducedMotion ? "Motion is paused to respect your system preference." : undefined}
+        >
+          <span className="motion-dot" aria-hidden="true" />
+          <span>Motion <span aria-hidden="true">{motionEnabled ? "on" : "off"}</span></span>
+        </button>
         <Link to="/" className="public-auth-back"><span aria-hidden="true">↖</span> Back to the studio</Link>
       </div>
     </header>

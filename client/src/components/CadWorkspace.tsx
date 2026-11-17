@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import type { BuildingLevel, CadAnalysisRecord, Design, DraftElement } from "../types";
 import { cadObjects, cadLevels, cadKind, cadQuantities, createCadObject, executeCadCommand, resizeDraft, type CadCommand, type CadKind } from "../lib/cadModel";
 import { resolveDraft } from "../lib/parametric";
@@ -20,6 +20,7 @@ type Tool = "select" | "move" | "rotate" | "resize" | `place:${string}`;
 type Unit = "m" | "mm" | "ft";
 const DISCIPLINES: [CadDiscipline, string][] = [["architecture", "Architecture"], ["structure", "Structure / Civil"], ["electrical", "Electrical"], ["plumbing", "Plumbing"], ["coordination", "Coordination"]];
 const LABELS: Record<string, string> = { column: "Column", "circular-column": "Round column", wall: "Wall", beam: "Beam", slab: "Slab", roof: "Roof" };
+const CANVAS_TOOLS = new Map<string, Tool>([["v", "select"], ["m", "move"], ["r", "rotate"], ["s", "resize"]]);
 const factor = (unit: Unit) => unit === "mm" ? 1000 : unit === "ft" ? 1 / 0.3048 : 1;
 const editable = (event: KeyboardEvent) => event.target instanceof HTMLElement && (event.target.closest("[role=dialog]") || event.target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(event.target.tagName));
 
@@ -61,11 +62,13 @@ export function CadWorkspace({ design, onChange, projectName, readOnly, saving, 
   const [leftOpen, setLeftOpen] = useState(() => window.innerWidth >= 1100);
   const [rightOpen, setRightOpen] = useState(() => window.innerWidth >= 900);
   const [inspector, setInspector] = useState<"properties" | "analysis" | "systems" | "issues">("properties");
-  const [status, setStatus] = useState("Select an object. Drag a face grip to resize; M move · R rotate · Escape cancel.");
+  const [status, setStatus] = useState("Select an object. Drag a face grip to resize. Focus the canvas for M move and R rotate.");
   const [highlightedIds, setHighlightedIds] = useState<string[]>([]);
   const [preferredSystem, setPreferredSystem] = useState<CadSystem>("electrical");
   const activeSystem = systemForDiscipline(discipline, preferredSystem);
   const [numeric, setNumeric] = useState("");
+  const numericInput = useRef<HTMLInputElement | null>(null);
+  const numericFocusRequested = useRef(false);
   const [historyVersion, setHistoryVersion] = useState(0);
   const [viewportApi, setViewportApi] = useState<CadViewportApi | null>(null);
   const history = useRef<{ past: Design[]; future: Design[] }>({ past: [], future: [] });
@@ -119,7 +122,7 @@ export function CadWorkspace({ design, onChange, projectName, readOnly, saving, 
   const duplicate = useCallback(() => { if (selectedId) command({ type: "duplicate", ids: [selectedId], offset: { x: 1, y: 0, z: 1 } }, "Duplicate created 1 m along X and Z"); }, [command, selectedId]);
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (editable(event)) return;
+      if (event.defaultPrevented || event.isComposing || event.altKey || editable(event)) return;
       const ctrl = event.ctrlKey || event.metaKey;
       if (ctrl && event.key.toLowerCase() === "z") { event.preventDefault(); travel(event.shiftKey); }
       else if (ctrl && event.key.toLowerCase() === "y") { event.preventDefault(); travel(true); }
@@ -127,14 +130,28 @@ export function CadWorkspace({ design, onChange, projectName, readOnly, saving, 
       else if (ctrl && event.key.toLowerCase() === "s") { event.preventDefault(); onSave(); }
       else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); remove(); }
       else if (event.key === "Escape") { viewportApi?.cancelDrag(); setPreview(null); setTool("select"); setStatus("Operation cancelled; Select active."); }
-      else if (!ctrl && event.key.toLowerCase() === "v") setTool("select");
-      else if (!ctrl && event.key.toLowerCase() === "m") setTool("move");
-      else if (!ctrl && event.key.toLowerCase() === "r") setTool("rotate");
-      else if (!ctrl && event.key.toLowerCase() === "s") setTool("resize");
-      else if (!ctrl && event.key.toLowerCase() === "f") viewportApi?.fit(Boolean(selectedId));
     };
     window.addEventListener("keydown", key); return () => window.removeEventListener("keydown", key);
-  }, [duplicate, onSave, remove, selectedId, travel, viewportApi]);
+  }, [duplicate, onSave, remove, travel, viewportApi]);
+  const handleCanvasShortcut = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.defaultPrevented || event.nativeEvent.isComposing || event.altKey || event.ctrlKey || event.metaKey ||
+      !(event.target instanceof HTMLCanvasElement) || !event.target.matches(".cad-viewport > canvas")) return;
+    const key = event.key.toLowerCase();
+    if (key === "f") viewportApi?.fit(Boolean(selectedId));
+    const next = CANVAS_TOOLS.get(key);
+    if (next && (next === "select" || writable)) setTool(next);
+  };
+  const attachNumericInput = useCallback((input: HTMLInputElement | null) => {
+    numericInput.current = input;
+    if (input && numericFocusRequested.current) {
+      numericFocusRequested.current = false;
+      input.focus({ preventScroll: true });
+    }
+  }, []);
+  const requestNumericFocus = () => {
+    if (numericInput.current) numericInput.current.focus({ preventScroll: true });
+    else numericFocusRequested.current = true;
+  };
   const modify = (patch: Partial<DraftElement>, label = "Properties updated") => { if (selected) command({ type: "modify", id: selected.id, patch }, label); };
   const resize = (axis: "x" | "y" | "z", value: number) => { if (selected) { try { modify(resizeDraft(selected, axis, 1, value, symmetric, levels), "Exact dimension committed"); } catch (e) { setStatus(e instanceof Error ? e.message : "Invalid dimension"); } } };
   const place = (point: { x: number; y: number; z: number }) => {
@@ -190,10 +207,16 @@ export function CadWorkspace({ design, onChange, projectName, readOnly, saving, 
       {!objects.length && <div className="cad-group"><p className="cad-muted">Add elements to your existing project or begin with an editable structural bay.</p><button className="cad-button cad-primary" disabled={!writable} onClick={starter}>Create starter frame</button></div>}
       <div className="cad-group cad-takeoff"><h3>Model quantities</h3><dl><dt>Authored elements</dt><dd>{quantities.count}</dd><dt>Net solid volume</dt><dd>{quantities.volume.toFixed(3)} m³</dd><dt>Slab / roof footprint</dt><dd>{quantities.area.toFixed(2)} m²</dd></dl><p className="cad-muted">Includes hidden objects and explicit wall opening deductions. Material build-ups and fabrication quantities require detailed review.</p></div>
     </aside>
-    <main className="cad-canvas-panel" aria-label="CAD modeling workspace"><div className="cad-view-toolbar"><button className="cad-icon-button" onClick={() => { setLeftOpen(!leftOpen); if (!leftOpen && window.innerWidth < 760) setRightOpen(false); }} aria-label="Toggle model explorer">☷</button><select aria-label="Camera projection" value={projection} onChange={e => setProjection(e.target.value as typeof projection)}><option value="perspective">Perspective</option><option value="orthographic">Orthographic</option></select><select aria-label="Viewport display" value={displayMode} onChange={e => setDisplayMode(e.target.value as typeof displayMode)}><option value="edges">Shaded with edges</option><option value="shaded">Shaded</option><option value="wireframe">Wireframe</option></select><button onClick={() => viewportApi?.fit(Boolean(selectedId))}>Fit {selectedId ? "selection" : "model"}</button><button aria-pressed={section} onClick={() => setSection(!section)}>Section {section ? "on" : "off"}</button><label className="cad-plane-elevation">Offset m<input aria-label="Working plane offset metres" type="number" step="0.1" value={Number((workingElevation - (level?.elevation ?? 0)).toFixed(6))} onChange={event => { const value = Number(event.target.value); if (event.target.value.trim() && Number.isFinite(value) && Math.abs(value + (level?.elevation ?? 0)) < 1e6) { viewportApi?.cancelDrag(); setPreview(null); setPlane({ levelId: level?.id ?? "", offset: value }); } }} /></label><span className="cad-view-label">{level?.name ?? "Ground"} · Y {workingElevation.toFixed(2)} m absolute</span><button className="cad-icon-button" aria-label="Focus canvas" title="Hide both side panels" onClick={() => { setLeftOpen(false); setRightOpen(false); }}>Focus</button><button className="cad-icon-button" aria-label="Toggle properties inspector" onClick={() => { setRightOpen(!rightOpen); if (!rightOpen && window.innerWidth < 760) setLeftOpen(false); }}>☷</button></div>
-      <Suspense fallback={<div className="cad-loading">Initializing geometry viewport…</div>}><CadViewport design={active} selectedId={selectedId} onSelect={id => { setSelectedId(id); if (id && window.innerWidth < 760) { setRightOpen(true); setLeftOpen(false); } }} onPreview={next => { setPreview(next); if (!next) setNumeric(""); }} onCommit={commit} tool={tool} discipline={discipline} levelId={level?.id} workingElevation={workingElevation} displayMode={displayMode} projection={projection} snapEnabled={snap} gridM={grid} symmetric={symmetric} readOnly={!writable} onStatus={setStatus} onApiReady={setViewportApi} onPlace={place} highlightedIds={highlightedIds} activeSystem={activeSystem} sectionElevation={section ? workingElevation + 1.5 : null} /></Suspense>
+    <main className="cad-canvas-panel" aria-label="CAD modeling workspace" onKeyDown={handleCanvasShortcut}><div className="cad-view-toolbar"><button className="cad-icon-button" onClick={() => { setLeftOpen(!leftOpen); if (!leftOpen && window.innerWidth < 760) setRightOpen(false); }} aria-label="Toggle model explorer">☷</button><select aria-label="Camera projection" value={projection} onChange={e => setProjection(e.target.value as typeof projection)}><option value="perspective">Perspective</option><option value="orthographic">Orthographic</option></select><select aria-label="Viewport display" value={displayMode} onChange={e => setDisplayMode(e.target.value as typeof displayMode)}><option value="edges">Shaded with edges</option><option value="shaded">Shaded</option><option value="wireframe">Wireframe</option></select><button onClick={() => viewportApi?.fit(Boolean(selectedId))}>Fit {selectedId ? "selection" : "model"}</button><button aria-pressed={section} onClick={() => setSection(!section)}>Section {section ? "on" : "off"}</button><label className="cad-plane-elevation">Offset m<input aria-label="Working plane offset metres" type="number" step="0.1" value={Number((workingElevation - (level?.elevation ?? 0)).toFixed(6))} onChange={event => { const value = Number(event.target.value); if (event.target.value.trim() && Number.isFinite(value) && Math.abs(value + (level?.elevation ?? 0)) < 1e6) { viewportApi?.cancelDrag(); setPreview(null); setPlane({ levelId: level?.id ?? "", offset: value }); } }} /></label><span className="cad-view-label">{level?.name ?? "Ground"} · Y {workingElevation.toFixed(2)} m absolute</span><button className="cad-icon-button" aria-label="Focus canvas" title="Hide both side panels and focus the canvas" onClick={() => { setLeftOpen(false); setRightOpen(false); viewportApi?.focus(); }}>Focus</button><button className="cad-icon-button" aria-label="Toggle properties inspector" onClick={() => { setRightOpen(!rightOpen); if (!rightOpen && window.innerWidth < 760) setLeftOpen(false); }}>☷</button></div>
+      <Suspense fallback={<div className="cad-loading">Initializing geometry viewport…</div>}><CadViewport design={active} selectedId={selectedId} onSelect={id => { setSelectedId(id); if (id && window.innerWidth < 760) { setRightOpen(true); setLeftOpen(false); } }} onPreview={next => { setPreview(next); if (!next) setNumeric(""); }} onRequestNumericFocus={requestNumericFocus} onCommit={commit} tool={tool} discipline={discipline} levelId={level?.id} workingElevation={workingElevation} displayMode={displayMode} projection={projection} snapEnabled={snap} gridM={grid} symmetric={symmetric} readOnly={!writable} onStatus={setStatus} onApiReady={setViewportApi} onPlace={place} highlightedIds={highlightedIds} activeSystem={activeSystem} sectionElevation={section ? workingElevation + 1.5 : null} /></Suspense>
       <div className="cad-viewport-note">{selected ? `${LABELS[cadKind(selected)] ?? selected.kind} · ${selected.label ?? selected.id.slice(0, 8)}` : "No object selected"}{selected ? <span>Face grips resize · opposite face fixed</span> : <><span className="cad-mouse-help">Left click select · right drag orbit · middle drag pan · wheel zoom</span><span className="cad-touch-help">Tap select · two fingers pan / pinch zoom · view cube for orientation</span></>}</div>
-      {(tool !== "select" || preview) && <div className="cad-dynamic-entry"><label>{tool === "rotate" ? "Rotation °" : "Exact value"} <input autoFocus aria-label="Exact operation measurement" type="number" step="any" value={numeric} placeholder={units} onChange={e => { setNumeric(e.target.value); const value = Number(e.target.value) / (tool === "rotate" ? 1 : factor(units)); if (e.target.value && Number.isFinite(value)) viewportApi?.setDragValue(value); }} onKeyDown={e => { if (e.key === "Enter") { viewportApi?.commitDrag(); setNumeric(""); } if (e.key === "Escape") { viewportApi?.cancelDrag(); setPreview(null); } }} /></label><span>{tool === "rotate" ? "degrees" : units} · Enter accept · Esc cancel</span></div>}
+      {(tool !== "select" || preview) && <div className="cad-dynamic-entry"><label>{tool === "rotate" ? "Rotation °" : "Exact value"} <input ref={attachNumericInput} aria-label="Exact operation measurement" type="number" step="any" value={numeric} placeholder={units} onChange={e => { setNumeric(e.target.value); const value = Number(e.target.value) / (tool === "rotate" ? 1 : factor(units)); if (e.target.value && Number.isFinite(value)) viewportApi?.setDragValue(value); }} onKeyDown={event => {
+        if (event.key === "Enter") { viewportApi?.commitDrag(); setNumeric(""); }
+        else if (event.key === "Escape") { viewportApi?.cancelDrag(); setPreview(null); }
+        else return;
+        event.stopPropagation();
+        viewportApi?.focus();
+      }} /></label><span>{tool === "rotate" ? "degrees" : units} · Enter accept · Esc cancel</span></div>}
     </main>
     <aside className="cad-inspector" aria-label="Contextual inspector"><div className="cad-panel-title"><strong>PROPERTIES & SYSTEMS</strong><button aria-label="Collapse properties" onClick={() => setRightOpen(false)}>›</button></div><nav className="cad-inspector-tabs">{([['properties','Object'],['systems','Systems'],['analysis','Analysis'],['issues',`Issues ${issues.length}`]] as const).map(([id,label]) => <button key={id} className={inspector === id ? "active" : ""} onClick={() => setInspector(id)}>{label}</button>)}</nav>
       {inspector === "properties" && (selected && resolved ? <div className="cad-inspector-content"><div className="cad-object-heading"><span>{LABELS[cadKind(selected)] ?? selected.kind}</span><small>{selected.id}</small></div><label className="cad-field">Object name<input key={`${selected.id}-${selected.label}`} defaultValue={selected.label ?? ""} onBlur={e => { if (e.target.value !== (selected.label ?? "")) modify({ label: e.target.value }); }} disabled={!writable || selected.locked} /></label>

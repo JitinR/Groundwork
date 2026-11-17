@@ -43,6 +43,7 @@ async function run() {
     page.on('console', (message) => { if (message.type() === 'error' && !/401 \(Unauthorized\)/.test(message.text())) errors.push(message.text()); });
     await page.goto(base, { waitUntil: 'networkidle' });
     await page.waitForFunction(() => document.querySelector('#preloader')?.hidden);
+    await page.waitForFunction(() => document.querySelectorAll('.scene-shell.is-ready').length === 2);
     assert.equal(await page.locator('.scene-shell.is-ready').count(), 2);
     assert.equal(await page.locator('#root').count(), 0, 'Studio uses its own document');
     assert.equal(await page.locator('.project-card').count(), 8);
@@ -65,11 +66,46 @@ async function run() {
       return { status: response.status, body: await response.json() };
     });
     assert.equal(project.status, 201, project.body.error || 'Project should be created');
-    await page.goto(`${base}/editor/${project.body.id}`, { waitUntil: 'networkidle' });
+    await page.goto(`${base}/editor/${project.body.id}`, { waitUntil: 'domcontentloaded' });
     await page.locator('canvas').first().waitFor();
     await page.waitForFunction(() => document.body.textContent.includes('Integration verification')
       || [...document.querySelectorAll('input')].some((input) => input.value === 'Integration verification'));
     results.push('CSRF-protected project creation → direct editor URL → interactive model canvas');
+    const workspace = page.locator('.cad-workspace');
+    const canvas = workspace.locator('.cad-viewport > canvas');
+    const focusCanvas = workspace.getByRole('button', { name: 'Focus canvas', exact: true });
+    await canvas.waitFor();
+    await focusCanvas.focus();
+    await page.keyboard.press('r');
+    assert.equal(await workspace.getAttribute('data-tool'), 'select', 'character shortcuts ignore the toolbar');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.matches('.cad-viewport > canvas'));
+    assert.equal(await canvas.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return style.outlineStyle === 'solid' && parseFloat(style.outlineWidth) >= 2;
+    }), true, 'keyboard focus on the canvas has a visible outline');
+    await page.keyboard.press('m');
+    assert.equal(await workspace.getAttribute('data-tool'), 'move');
+    assert.equal(await canvas.evaluate((element) => element === document.activeElement), true);
+    await page.keyboard.press('v');
+    assert.equal(await workspace.getAttribute('data-tool'), 'select');
+
+    await workspace.getByRole('button', { name: 'Toggle model explorer' }).click();
+    await workspace.getByRole('button', { name: 'Create starter frame' }).click();
+    const dimension = workspace.locator('button[data-cad-dimension="x"]');
+    await dimension.waitFor();
+    await dimension.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.getAttribute('aria-label') === 'Exact operation measurement');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => document.activeElement?.matches('.cad-viewport > canvas'));
+    results.push('CAD keyboard focus is visible, character shortcuts are canvas-only, and cancelling exact entry returns to the canvas');
+
+    if (process.argv.includes('--cad-only')) {
+      assert.deepEqual(errors, []);
+      console.log(JSON.stringify({ checkedAt: new Date().toISOString(), browser: await browser.version(), results, errors }, null, 2));
+      return;
+    }
+
     await page.goto(`${base}/`, { waitUntil: 'networkidle' });
     await page.waitForFunction(() => document.querySelector('#preloader')?.hidden);
     await page.setViewportSize({ width: 390, height: 844 });

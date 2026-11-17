@@ -74,6 +74,7 @@
 .cad-loading { position: absolute; inset: 35px 0 0; display: grid; place-items: center; color: var(--cad-muted); }
 .cad-canvas-panel > .cad-viewport { position: absolute; inset: 35px 0 0; }
 .cad-canvas-panel canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; }
+.cad-canvas-panel canvas:focus-visible { outline: 2px solid var(--cad-accent); outline-offset: -3px; }
 .cad-viewport-note { position: absolute; left: 12px; bottom: 12px; pointer-events: none; font-size: 11px; color: #c8d3d5; text-shadow: 0 1px 3px #000; }
 .cad-viewport-note > span { display: block; margin-top: 3px; font-size: 11px; opacity: .6; }
 .cad-viewport-note > .cad-touch-help { display: none; }
