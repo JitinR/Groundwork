@@ -41,7 +41,7 @@
   "devDependencies": {
     "@electric-sql/pglite": "0.5.16",
     "concurrently": "^10.0.7",
-    "supabase": "3.1.0"
+    "supabase": "3.2.0"
   },
   "overrides": {
     "@vercel/cli-config": {
