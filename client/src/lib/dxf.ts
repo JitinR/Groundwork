@@ -1,6 +1,8 @@
 import type { BuildingLevel, Design, DraftElement, FurnitureItem, MepElement } from "../types";
 import { catalogEntry } from "./catalog";
+import { amenityFootprint, landMeters, towerMeters } from "./community";
 import { engineeringProvenanceAscii } from "./exchangeProvenance";
+import { defaultHighway, highwayPlanDimensions } from "./infra";
 import { dxfLineweightHundredthsMm, formatDimensionMetres, technicalGraphicsSettings } from "./technicalGraphics";
 import { resolveDraft } from "./parametric";
 
@@ -47,12 +49,9 @@ function dxfText(value: string): string {
 
 /** R2000 ASCII DXF in millimetres. This is a 2D projection, with approximated fabrication details and spline control polygons. */
 export function buildDxf(design: Design): string {
-  const roomWidth = design.room.widthMm;
-  const roomDepth = design.room.depthMm;
-  if (!Number.isFinite(roomWidth) || !Number.isFinite(roomDepth) || roomWidth <= 0 || roomDepth <= 0) throw new Error("DXF export requires positive, finite room dimensions.");
   const entities: string[] = [];
   const graphics = technicalGraphicsSettings(design.technicalGraphics);
-  const layerNames = ["0", "WALLS", "COLUMNS", "BEAMS", "SLABS", "ROOFS", "OPENINGS", "DIMENSIONS", "TEXT", "FURNITURE", "CURTAINS", "MEP_DUCT", "MEP_PIPE", "MEP_CABLE", "MEP_EQUIPMENT", "DRAFTING", "FACILITIES", "SITE", "STRUCTURAL_GRID"];
+  const layerNames = ["0", "WALLS", "COLUMNS", "BEAMS", "SLABS", "ROOFS", "OPENINGS", "DIMENSIONS", "TEXT", "FURNITURE", "CURTAINS", "MEP_DUCT", "MEP_PIPE", "MEP_CABLE", "MEP_EQUIPMENT", "DRAFTING", "FACILITIES", "SITE", "STRUCTURAL_GRID", "HIGHWAY_CARRIAGEWAY", "HIGHWAY_MEDIAN", "HIGHWAY_SHOULDER"];
   // Fixed table/block handles and ordered entity handles make repeated exports deterministic.
   let nextHandle = 0x20 + layerNames.length;
   const handle = () => (nextHandle++).toString(16).toUpperCase();
@@ -128,21 +127,25 @@ export function buildDxf(design: Design): string {
     if (name === "TEXT") return graphics.lineweights.annotations;
     return graphics.lineweights.site;
   };
-  box("WALLS", [[-roomWidth / 2, -roomDepth / 2], [roomWidth / 2, -roomDepth / 2], [roomWidth / 2, roomDepth / 2], [-roomWidth / 2, roomDepth / 2]]);
-  dimension(-roomWidth / 2, -roomDepth / 2 - 300, roomWidth / 2, -roomDepth / 2 - 300, formatDimensionMetres(roomWidth / 1000, graphics.dimensionStyle));
-  dimension(roomWidth / 2 + 300, -roomDepth / 2, roomWidth / 2 + 300, roomDepth / 2, formatDimensionMetres(roomDepth / 1000, graphics.dimensionStyle));
-  design.furniture.forEach((item) => { box("FURNITURE", furnitureBox(item)); text("TEXT", item.x, item.z, item.name, 90); });
-  if (design.curtains?.enabled) {
-    const cur = design.curtains;
-    const span = (cur.wall === "north" || cur.wall === "south" ? roomWidth : roomDepth) * cur.widthPercentPerPanel;
-    for (let i = 0; i < 2; i++) {
-      const offset = (i - 0.5) * span;
-      if (cur.wall === "north") line("CURTAINS", offset - 30, roomDepth / 2, offset + 30, roomDepth / 2);
-      if (cur.wall === "south") line("CURTAINS", offset - 30, -roomDepth / 2, offset + 30, -roomDepth / 2);
-      if (cur.wall === "east") line("CURTAINS", roomWidth / 2, offset - 30, roomWidth / 2, offset + 30);
-      if (cur.wall === "west") line("CURTAINS", -roomWidth / 2, offset - 30, -roomWidth / 2, offset + 30);
+  if (!design.community && !design.infra) {
+    const { widthMm: roomWidth, depthMm: roomDepth } = design.room;
+    if (!Number.isFinite(roomWidth) || !Number.isFinite(roomDepth) || roomWidth <= 0 || roomDepth <= 0) throw new Error("DXF export requires positive, finite room dimensions.");
+    box("WALLS", rotatedBox(0, 0, roomWidth, roomDepth));
+    dimension(-roomWidth / 2, -roomDepth / 2 - 300, roomWidth / 2, -roomDepth / 2 - 300, formatDimensionMetres(roomWidth / 1000, graphics.dimensionStyle));
+    dimension(roomWidth / 2 + 300, -roomDepth / 2, roomWidth / 2 + 300, roomDepth / 2, formatDimensionMetres(roomDepth / 1000, graphics.dimensionStyle));
+    design.furniture.forEach((item) => { box("FURNITURE", furnitureBox(item)); text("TEXT", item.x, item.z, item.name, 90); });
+    if (design.curtains?.enabled) {
+      const cur = design.curtains;
+      const span = (cur.wall === "north" || cur.wall === "south" ? roomWidth : roomDepth) * cur.widthPercentPerPanel;
+      for (let i = 0; i < 2; i++) {
+        const offset = (i - 0.5) * span;
+        if (cur.wall === "north") line("CURTAINS", offset - 30, roomDepth / 2, offset + 30, roomDepth / 2);
+        if (cur.wall === "south") line("CURTAINS", offset - 30, -roomDepth / 2, offset + 30, -roomDepth / 2);
+        if (cur.wall === "east") line("CURTAINS", roomWidth / 2, offset - 30, roomWidth / 2, offset + 30);
+        if (cur.wall === "west") line("CURTAINS", -roomWidth / 2, offset - 30, -roomWidth / 2, offset + 30);
+      }
+      text("TEXT", 0, 0, `CURTAINS (${cur.style})`, 90);
     }
-    text("TEXT", 0, 0, `CURTAINS (${cur.style})`, 90);
   }
 
   const addDraft = (draft: DraftElement, levels: BuildingLevel[]) => {
@@ -200,11 +203,37 @@ export function buildDxf(design: Design): string {
   for (const element of [...(design.mep?.elements ?? []), ...(design.community?.mep?.elements ?? []), ...(design.infra?.mep?.elements ?? [])]) addMep(element);
 
   if (design.community) {
+    const land = landMeters(design.community.land);
+    box("SITE", rotatedBox(0, 0, land.w * 1000, land.d * 1000));
     for (const tower of design.community.towers) {
-      box("WALLS", rotatedBox(tower.x * 1000, tower.z * 1000, tower.unitWidth * tower.unitsPerFloor * 1000, tower.unitDepth * 1000, tower.rotY));
+      const { w, d } = towerMeters(tower);
+      box("WALLS", rotatedBox(tower.x * 1000, tower.z * 1000, w * 1000, d * 1000, -(tower.rotY ?? 0)));
       text("TEXT", tower.x * 1000, tower.z * 1000, `${tower.label} (${tower.floors}F)`, 100);
     }
-    for (const amenity of design.community.amenities) box("SITE", rotatedBox(amenity.x * 1000, amenity.z * 1000, amenity.w * 1000, amenity.d * 1000, amenity.rotY));
+    for (const amenity of design.community.amenities) {
+      const { w, d, diameter } = amenityFootprint(amenity);
+      if (diameter !== undefined) circle("SITE", amenity.x * 1000, amenity.z * 1000, diameter * 500);
+      else box("SITE", rotatedBox(amenity.x * 1000, amenity.z * 1000, w * 1000, d * 1000, -amenity.rotY));
+    }
+  }
+  if (design.infra?.kind === "highway") {
+    const highway = { ...defaultHighway(), ...design.infra.highway };
+    const { length, carriageway, median } = highwayPlanDimensions(highway, design.infra.location);
+    const strip = (layer: string, x: number, width: number) => {
+      box(layer, rotatedBox(x * 1000, 0, width * 1000, length * 1000));
+    };
+    if (median > 0) {
+      const separation = median / 2 + carriageway / 4;
+      strip("HIGHWAY_CARRIAGEWAY", -separation, carriageway / 2);
+      strip("HIGHWAY_CARRIAGEWAY", separation, carriageway / 2);
+      strip("HIGHWAY_MEDIAN", 0, median);
+    } else strip("HIGHWAY_CARRIAGEWAY", 0, carriageway);
+    if (highway.shoulderM > 0) {
+      const shoulderCenter = (carriageway + median + highway.shoulderM) / 2;
+      strip("HIGHWAY_SHOULDER", -shoulderCenter, highway.shoulderM);
+      strip("HIGHWAY_SHOULDER", shoulderCenter, highway.shoulderM);
+    }
+    text("TEXT", 0, -length * 500, "CONCEPT HIGHWAY - LOCAL PLAN", 250);
   }
   if (design.infra) for (const facility of design.infra.facilities ?? []) {
     box("FACILITIES", rotatedBox(0, 0, facility.widthM * 1000, facility.lengthM * 1000));
@@ -212,6 +241,9 @@ export function buildDxf(design: Design): string {
   }
   const lines: string[] = [];
   const out = (...parts: string[]) => lines.push(...parts);
+  if (design.infra?.kind === "highway") {
+    out("999", "Straight local highway concept plan. Survey alignment, terrain, interchanges and culverts are outside this projection.");
+  }
   // Group 999 comments are optional exchange metadata and may be discarded by CAD tools.
   const provenance = engineeringProvenanceAscii(design.engineeringBasis), chunkCount = Math.ceil(provenance.length / 180);
   for (let chunk = 0; chunk < chunkCount; chunk++) out("999", `SECURE_NEXUS_BASIS ${chunk + 1}/${chunkCount} ${provenance.slice(chunk * 180, (chunk + 1) * 180)}`);

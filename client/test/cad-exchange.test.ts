@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { defaultDesign, type Design, type DraftElement } from "../src/types";
 import { cadFootprintArea, cadQuantities, createCadObject, executeCadCommand, localCadAxis, resizeDraft, resolveCadSnap } from "../src/lib/cadModel";
 import { buildDxf } from "../src/lib/dxf";
+import { defaultCommunity, defaultTower, makeAmenity } from "../src/lib/community";
+import { defaultInfra } from "../src/lib/infra";
 import { buildBimExchange, buildIfcStep, ifcSourceGuid, validateIfcProfile, validateIfcStep } from "../src/lib/bim";
 import { inspectBimGeometry } from "../src/lib/bimValidation";
 import { documentationInventory } from "../src/lib/documentationSchedule";
@@ -106,6 +108,39 @@ test("DXF plan coordinates follow the same positive-Y rotation as the viewport",
   const z = entity.values.filter(([code]) => code === 20).map(([,value]) => Number(value));
   assert.deepEqual(x, [2900,2900,3100,3100]); assert.deepEqual(z, [7000,3000,3000,7000]);
   assert.match(buildIfcStep(project(wall)), /IFCDIRECTION\(\(0\.000000000,-1\.000000000,0\.\)\)/);
+});
+
+test("community DXF uses the rotated tower footprint from the design without exporting the default room", () => {
+  const community = { ...defaultCommunity("commercial"), commercialStyle: "hotel" as const };
+  community.towers = [{
+    ...defaultTower("commercial", "Hotel", 45, 12),
+    unitsPerFloor: 4, unitWidth: 6, unitDepth: 8, commonAreaPerFloor: 25, rotY: 90,
+  }];
+  community.amenities = [{ ...makeAmenity("circle-platform", 20, 30), w: 16, d: 8 }];
+  const entities = dxfEntities(buildDxf({ ...defaultDesign(), community }));
+  const walls = entities.filter(entity => entity.values.some(([code, value]) => code === 8 && value === "WALLS"));
+  assert.equal(walls.length, 1, "only the hotel contributes a wall footprint");
+  const [tower] = walls;
+  assert.deepEqual(tower.values.filter(([code]) => code === 10).map(([, value]) => Number(value)), [36000, 36000, 54000, 54000]);
+  assert.deepEqual(tower.values.filter(([code]) => code === 20).map(([, value]) => Number(value)), [19000, 5000, 5000, 19000]);
+  const circle = entities.find(entity => entity.kind === "CIRCLE");
+  assert.ok(circle);
+  assert.ok(circle.values.some(([code, value]) => code === 40 && Number(value) === 4000));
+  assert.ok(!entities.some(entity => entity.values.some(([code, value]) => code === 8 && value === "DIMENSIONS")));
+});
+
+test("highway DXF contains the concept carriageway, median and shoulders instead of a room", () => {
+  const infra = defaultInfra("highway");
+  const source = buildDxf({ ...defaultDesign(), infra });
+  const entities = dxfEntities(source);
+  const onLayer = (name: string) => entities.filter(entity => entity.kind === "LWPOLYLINE" && entity.values.some(([code, value]) => code === 8 && value === name));
+  const xCoordinates = (entity: (typeof entities)[number]) => entity.values.filter(([code]) => code === 10).map(([, value]) => Number(value));
+  const zCoordinates = (entity: (typeof entities)[number]) => entity.values.filter(([code]) => code === 20).map(([, value]) => Number(value));
+  assert.deepEqual(onLayer("HIGHWAY_CARRIAGEWAY").map(xCoordinates), [[-8500, -1500, -1500, -8500], [1500, 8500, 8500, 1500]]);
+  assert.deepEqual(onLayer("HIGHWAY_MEDIAN").map(zCoordinates), [[-400000, -400000, 400000, 400000]]);
+  assert.deepEqual(onLayer("HIGHWAY_SHOULDER").map(xCoordinates), [[-10000, -8500, -8500, -10000], [8500, 10000, 10000, 8500]]);
+  assert.equal(onLayer("WALLS").length, 0);
+  assert.match(source, /Straight local highway concept plan/);
 });
 
 test("polygon exchange preserves its authored footprint and net quantities", () => {

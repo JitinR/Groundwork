@@ -3,7 +3,7 @@ import { ApiError, assertHostedRequestSize, getCsrfToken } from "../api";
 import { offlineProjectStore } from "./offlineProjectStore";
 import { offlineQueueStore, type OfflineQueueItem } from "./offlineQueue";
 import { captureLocalWrite, localWriteAllowed, subscribeLocalDataFence } from "./localDataFence";
-import type { Design, Project, ProjectType } from "../types";
+import type { Design, Project, ProjectDetail, ProjectType } from "../types";
 import { fetchJsonResponse, isTransientStatus, RequestTimeoutError, retryAfterDelay, syncRetryDelay } from "./requestResilience";
 
 export interface SyncManagerStatus {
@@ -16,15 +16,19 @@ export interface SyncManagerStatus {
 }
 
 type SyncListener = (status: SyncManagerStatus) => void;
+type ProjectSaveListener = (userId: string, project: Project, design: Design) => void;
 const transientSyncError = (error: unknown) => error instanceof ApiError ? isTransientStatus(error.status) : error instanceof TypeError || error instanceof RequestTimeoutError;
 const responseError = (response: Response, message: string) => new ApiError(response.status, message, retryAfterDelay(response.headers.get("retry-after")));
+const REPLAY_LOCK = "offline-sync-lock";
 
 class OfflineSyncManager {
   private isOnline = typeof navigator !== "undefined" && typeof navigator.onLine === "boolean" ? navigator.onLine : true;
   private isSyncing = false;
+  private isDiscarding = false;
   private lastSyncTime: number | null = null;
   private lastError: string | null = null;
   private listeners = new Set<SyncListener>();
+  private projectSaveListeners = new Set<ProjectSaveListener>();
   private activeUserId: string | null = null;
   private syncController: AbortController | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -71,6 +75,11 @@ class OfflineSyncManager {
     return () => this.listeners.delete(listener);
   }
 
+  subscribeProjectSaves(listener: ProjectSaveListener): () => void {
+    this.projectSaveListeners.add(listener);
+    return () => this.projectSaveListeners.delete(listener);
+  }
+
   private notify(): void {
     const status = this.getStatus();
     for (const listener of this.listeners) {
@@ -95,17 +104,35 @@ class OfflineSyncManager {
     return { pending, conflicted };
   }
 
+  async discardProjectSaves(userId: string, projectId: string): Promise<void> {
+    if (this.isSyncing || this.isDiscarding) throw new Error("Wait for synchronization to finish, then try again.");
+    this.isDiscarding = true;
+    try {
+      if (typeof navigator !== "undefined" && navigator.locks) {
+        await navigator.locks.request(REPLAY_LOCK, { ifAvailable: true }, async lock => {
+          if (!lock) throw new Error("Another tab is synchronizing. Try again after it finishes.");
+          await offlineQueueStore.discardProjectSaves(userId, projectId);
+        });
+      } else {
+        await offlineQueueStore.discardProjectSaves(userId, projectId);
+      }
+    } finally {
+      this.isDiscarding = false;
+      this.notify();
+    }
+  }
+
   /**
    * Run synchronization process for the given account.
    */
   async synchronize(userId: string, manual = false): Promise<void> {
-    if (!userId || userId !== this.activeUserId || this.isSyncing || !this.isOnline || captureLocalWrite(userId) === null) return;
+    if (!userId || userId !== this.activeUserId || this.isSyncing || this.isDiscarding || !this.isOnline || captureLocalWrite(userId) === null) return;
     if (manual) { this.failures = 0; if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; } }
     else if (this.retryTimer || this.failures >= 6) return;
 
     const performSync = async () => {
       const write = captureLocalWrite(userId);
-      if (!localWriteAllowed(userId, write) || userId !== this.activeUserId || this.isSyncing) return;
+      if (!localWriteAllowed(userId, write) || userId !== this.activeUserId || this.isSyncing || this.isDiscarding) return;
       const controller = new AbortController();
       this.syncController = controller;
       const assertCurrent = () => {
@@ -160,7 +187,7 @@ class OfflineSyncManager {
     };
 
     if (typeof navigator !== "undefined" && navigator.locks) {
-      await navigator.locks.request("offline-sync-lock", { ifAvailable: true }, async (lock) => {
+      await navigator.locks.request(REPLAY_LOCK, { ifAvailable: true }, async (lock) => {
         // If lock is null, another tab is already syncing. We simply return and let it finish.
         if (lock) await performSync();
       });
@@ -198,7 +225,7 @@ class OfflineSyncManager {
   private async syncProjectSave(userId: string, item: OfflineQueueItem, signal: AbortSignal, assertCurrent: () => void): Promise<void> {
     assertCurrent();
     // Permission & Project verification check: inspect server state first
-    const { response: getRes, data: projectData } = await fetchJsonResponse<{ project: Project }>(`/api/projects/${encodeURIComponent(item.projectId)}`, {
+    const { response: getRes, data: projectData } = await fetchJsonResponse<ProjectDetail>(`/api/projects/${encodeURIComponent(item.projectId)}`, {
       credentials: "same-origin",
       signal,
     });
@@ -219,8 +246,10 @@ class OfflineSyncManager {
       throw responseError(getRes, `Failed to check project status (${getRes.status})`);
     }
 
-    const { project } = projectData;
-    assertCurrent();
+    if (projectData?.id !== item.projectId || !Number.isSafeInteger(projectData.revision) || projectData.revision < 0) {
+      throw new Error("Server returned an invalid project revision. The offline edit remains available for recovery.");
+    }
+    const { design: serverDesign, ...project } = projectData;
 
     // Revision conflict detection: verify server has not moved ahead
     if (project.revision !== item.expectedRevision) {
@@ -240,7 +269,11 @@ class OfflineSyncManager {
 
     // Server revision is clean — submit save patch
     const csrfToken = getCsrfToken();
-    const body = JSON.stringify({ ...item.payload, baseRevision: item.expectedRevision, expectedAccountId: userId });
+    const { design: legacyDesign, ...payload } = item.payload;
+    const designData = typeof payload.designData === "string"
+      ? payload.designData
+      : legacyDesign && typeof legacyDesign === "object" ? JSON.stringify(legacyDesign) : undefined;
+    const body = JSON.stringify({ ...payload, designData, baseRevision: item.expectedRevision, expectedAccountId: userId });
     assertHostedRequestSize(body, "PATCH", import.meta.env?.VITE_HOSTING_MODE);
     const { response: patchRes, data: patchData } = await fetchJsonResponse<{ ok?: boolean; revision?: number; currentRevision?: number; code?: string; error?: string }>(`/api/projects/${encodeURIComponent(item.projectId)}`, {
       method: "PATCH",
@@ -286,24 +319,21 @@ class OfflineSyncManager {
       ...project,
       name: (item.payload.name as string) || project.name,
       projectType: (item.payload.projectType as ProjectType) || project.projectType,
+      widthMm: typeof payload.widthMm === "number" ? payload.widthMm : project.widthMm,
+      depthMm: typeof payload.depthMm === "number" ? payload.depthMm : project.depthMm,
       revision: savedData.revision!,
       updatedAt: Date.now(),
     };
 
-    let design = item.payload.design as Design | undefined;
-    if (!design && typeof item.payload.designData === "string") {
-      try {
-        design = JSON.parse(item.payload.designData) as Design;
-      } catch {
-        /* ignore */
-      }
-    }
+    const design = designData === undefined ? serverDesign : JSON.parse(designData) as Design;
 
     if (design) {
       await offlineProjectStore.cacheProject(userId, updatedProject, design);
     }
 
     await offlineQueueStore.updateStatus(item.id, "completed");
+    assertCurrent();
+    if (design) for (const listener of this.projectSaveListeners) listener(userId, updatedProject, design);
   }
 
 }

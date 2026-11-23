@@ -1,5 +1,5 @@
 import type { Design, DocumentationSchedule, FurnitureItem, MepDesign, ParametricFamilyMetadata } from "../types";
-import { towerMeters } from "./community";
+import { amenityFootprint, towerMeters } from "./community";
 import { resolveDraft, resolveRoomOpening, resolveTowerOpening } from "./parametric";
 import { cadFootprintArea } from "./cadModel";
 
@@ -73,7 +73,13 @@ export function documentationInventory(design: Design): ScheduleRecord[] {
         add(opening.id, "objects", `interior:${room.id}`, opening.kind, `${opening.kind} ${opening.wall}`, { "width m": finite(resolved.width), "height m": finite(resolved.height), "area m2": product(resolved.width, resolved.height), floor: room.floor, host: room.id, phase: room.phaseId ?? "" }, opening.family);
       }
     }
-    for (const item of community.amenities) add(item.id, "objects", "community", "amenity", item.label ?? item.kind, { type: item.kind, "width m": finite(item.w), "depth m": finite(item.d), "height m": finite(item.h), "area m2": product(item.w, item.d), phase: item.phaseId ?? "" });
+    for (const item of community.amenities) {
+      const footprint = amenityFootprint(item);
+      add(item.id, "objects", "community", "amenity", item.label ?? item.kind, {
+        type: item.kind, "width m": finite(footprint.w), "depth m": finite(footprint.d),
+        "diameter m": finite(footprint.diameter), "height m": finite(item.h), "area m2": finite(footprint.area), phase: item.phaseId ?? "",
+      });
+    }
     for (const item of community.exteriors) add(item.id, "objects", `tower:${item.towerId}`, "facade panel", item.material, { "width m": finite(item.w), "height m": finite(item.h), "area m2": product(item.w, item.h), material: item.material, host: item.towerId });
   }
   if (!design.community && !design.infra) for (const level of design.cad?.levels ?? []) add(level.id, "levels", "cad", "level", level.name, { "elevation m": finite(level.elevation), "height m": finite(level.floorHeight), level: level.id });

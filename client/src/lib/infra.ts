@@ -35,6 +35,7 @@ export const INFRA_LABELS: Record<InfraKind, string> = {
 };
 
 const round = (n: number, d = 2) => Math.round((Number.isFinite(n) ? n : 0) * 10 ** d) / 10 ** d;
+const AIRPORT_SHOULDER_WIDTH_M = 1.5;
 
 /* --------------------------------- Defaults -------------------------------- */
 
@@ -192,6 +193,15 @@ export interface InfraExtent {
   h: number;
 }
 
+/** Dimensions of the straight, local concept model used for the highway preview and plan. */
+export function highwayPlanDimensions(highway: HighwayDesign, location?: InfraDesign["location"]) {
+  const length = location?.routeLengthM && location.routeLengthM > 40 ? location.routeLengthM : 800;
+  const carriageway = highway.lanes * highway.laneWidthM;
+  const median = highway.medianM > 0.4 ? highway.medianM : 0;
+  const platform = carriageway + median + 2 * highway.shoulderM;
+  return { length, carriageway, median, platform, formation: platform + 6 };
+}
+
 function airportLocalExtent(a: AirportDesign): InfraExtent {
   const spacing = a.runwayWidthM + 400;
   return {
@@ -211,10 +221,8 @@ function airportRotation(heading: number): number {
 export function infraExtent(infra: InfraDesign): InfraExtent {
   switch (infra.kind) {
     case "highway": {
-      const h = infra.highway!;
-      const len = infra.location?.routeLengthM && infra.location.routeLengthM > 40 ? infra.location.routeLengthM : 800;
-      const carriage = h.lanes * h.laneWidthM + h.medianM + 2 * h.shoulderM;
-      return { w: Math.max(carriage + 60, 80), d: len + 120, h: 70 };
+      const plan = highwayPlanDimensions(infra.highway!, infra.location);
+      return { w: Math.max(plan.platform + 60, 80), d: plan.length + 120, h: 70 };
     }
     case "airport": {
       const a = infra.airport!;
@@ -283,10 +291,10 @@ function dashedLine(count: number, x0: number, z0: number, dx: number, dz: numbe
 
 /* --------------------------------- Highways --------------------------------- */
 
-function buildHighway(h: HighwayDesign, ext: InfraExtent, loc: InfraDesign["location"]): THREE.Group {
+function buildHighway(h: HighwayDesign, loc: InfraDesign["location"]): THREE.Group {
   const g = new THREE.Group();
 
-  const carriage = h.lanes * h.laneWidthM;
+  const { length: spanZ, carriageway: carriage, median, platform, formation } = highwayPlanDimensions(h, loc);
   const asphalt = material(h.surface === "bituminous" ? "#2b2f36" : "#b9bcc0", { rough: 0.85 });
   const shoulderMat = material("#8a8f96", { rough: 0.9 });
   const bankMat = material("#877a5f", { rough: 0.95 });
@@ -295,28 +303,26 @@ function buildHighway(h: HighwayDesign, ext: InfraExtent, loc: InfraDesign["loca
   const rampMat = material("#3a3f47", { rough: 0.85 });
   const culvertMat = material("#6b6f75", { rough: 0.8 });
 
-  const spanZ = ext.d - 120;
-
   // Embankment pad under the road
-  g.add(prismAt(0, h.embankmentHeightM / 2 - 0.2, 0, carriage + 2 * h.shoulderM + 6, h.embankmentHeightM, spanZ, bankMat));
+  g.add(prismAt(0, h.embankmentHeightM / 2 - 0.2, 0, formation, h.embankmentHeightM, spanZ, bankMat));
   // Shoulders
-  g.add(prismAt(0, h.embankmentHeightM + 0.01, 0, carriage + 2 * h.shoulderM, 0.12, spanZ, shoulderMat));
+  g.add(prismAt(0, h.embankmentHeightM + 0.01, 0, platform, 0.12, spanZ, shoulderMat));
   // Carriageways (split by median when present)
   const halfLane = h.lanes / 2;
-  if (h.medianM > 0.4) {
+  if (median > 0) {
     const cw = halfLane * h.laneWidthM;
-    g.add(prismAt(-(h.medianM / 2 + cw / 2), h.embankmentHeightM + 0.05, 0, cw, 0.14, spanZ, asphalt));
-    g.add(prismAt(h.medianM / 2 + cw / 2, h.embankmentHeightM + 0.05, 0, cw, 0.14, spanZ, asphalt));
-    g.add(prismAt(0, h.embankmentHeightM + 0.06, 0, h.medianM, 0.16, spanZ, medianMat));
+    g.add(prismAt(-(median / 2 + cw / 2), h.embankmentHeightM + 0.05, 0, cw, 0.14, spanZ, asphalt));
+    g.add(prismAt(median / 2 + cw / 2, h.embankmentHeightM + 0.05, 0, cw, 0.14, spanZ, asphalt));
+    g.add(prismAt(0, h.embankmentHeightM + 0.06, 0, median, 0.16, spanZ, medianMat));
   } else {
     g.add(prismAt(0, h.embankmentHeightM + 0.05, 0, carriage, 0.14, spanZ, asphalt));
   }
   // Lane markings
   const dashCount = Math.max(8, Math.floor(spanZ / 18));
-  const laneEdge = carriage / 2;
+  const laneEdge = (carriage + median) / 2;
   g.add(dashedLine(dashCount, -laneEdge, -spanZ / 2, 0, spanZ / dashCount, 3, 0.18, markMat));
   g.add(dashedLine(dashCount, laneEdge, -spanZ / 2, 0, spanZ / dashCount, 3, 0.18, markMat));
-  if (h.medianM <= 0.4 && halfLane > 1) {
+  if (!median && halfLane > 1) {
     g.add(dashedLine(dashCount, 0, -spanZ / 2, 0, spanZ / dashCount, 3, 0.2, markMat));
   }
 
@@ -374,8 +380,12 @@ function buildAirport(a: AirportDesign, ext: InfraExtent): THREE.Group {
 
   for (let i = 0; i < a.runways; i++) {
     const z = (i - (a.runways - 1) / 2) * spacing;
-    // Runway + shoulders
-    g.add(prismAt(0, 0.06, z, rl + 120, 0.12, rw + 2 * 7.5, concrete));
+    for (const side of [-1, 1]) {
+      const offset = side * (rw + AIRPORT_SHOULDER_WIDTH_M) / 2;
+      const shoulder = prismAt(0, 0.06, z + offset, rl, 0.12, AIRPORT_SHOULDER_WIDTH_M, concrete);
+      shoulder.name = `airport-runway-${i + 1}-shoulder-${side < 0 ? "left" : "right"}`;
+      g.add(shoulder);
+    }
     const runway = prismAt(0, 0.1, z, rl, 0.14, rw, runwayMat);
     runway.name = `airport-runway-${i + 1}`;
     g.add(runway);
@@ -623,7 +633,7 @@ export function buildInfraScene(infra: InfraDesign, visualization?: Visualizatio
     return empty;
   }
   const scene = infra.kind === "highway"
-    ? buildHighway(infra.highway!, ext, infra.location)
+    ? buildHighway(infra.highway!, infra.location)
     : infra.kind === "airport"
       ? new THREE.Group().add(buildAirport(infra.airport!, airportLocalExtent(infra.airport!)))
       : infra.kind === "ports"
@@ -692,10 +702,8 @@ export function computeInfraTakeoff(infra: InfraDesign): InfraTakeoff {
 
   if (infra.kind === "highway") {
     const h = infra.highway!;
-    const len = infra.location?.routeLengthM && infra.location.routeLengthM > 40 ? infra.location.routeLengthM : 800;
-    const carriage = h.lanes * h.laneWidthM;
+    const { length: len, carriageway: carriage, median, formation: embank } = highwayPlanDimensions(h, infra.location);
     const roadArea = (carriage + 2 * h.shoulderM) * len;
-    const embank = carriage + 2 * h.shoulderM + 6;
     const earthwork = embank * len * h.embankmentHeightM;
     const asphaltVol = roadArea * (h.pavementThicknessMm / 1000);
     add("clearance", "Earthwork", "Site clearance & stripping", roadArea * 0.15, "m²", "Roadway width × length × 0.15 strip");
@@ -706,7 +714,7 @@ export function computeInfraTakeoff(infra: InfraDesign): InfraTakeoff {
     add("bitumen", "Pavement", h.surface === "bituminous" ? "Bituminous courses (DBM + BC)" : "Concrete pavement (PQC)", asphaltVol, "m³", "Area × pavement thickness");
     add("shoulder", "Pavement", "Shoulders & kerbs", 2 * h.shoulderM * len, "m²", "Shoulder width × length × 2");
     add("marking", "Finishes", "Road markings & signage", len, "m", "Route length");
-    add("median", "Finishes", "Median / divider", h.medianM * len, "m²", "Median width × length");
+    add("median", "Finishes", "Median / divider", median * len, "m²", "Median width × length");
     add("culverts", "Structures", `Culverts (${h.culverts} nos)`, h.culverts, "nos", "Cross-drainage count");
     add("interchange", "Structures", `Interchanges (${h.interchanges})`, h.interchanges * carriage * 260, "m²", "Interchange paving allowance");
     summary.push(
@@ -718,13 +726,13 @@ export function computeInfraTakeoff(infra: InfraDesign): InfraTakeoff {
   } else if (infra.kind === "airport") {
     const a = infra.airport!;
     const rArea = a.runways * a.runwayLengthM * a.runwayWidthM;
-    const shoulders = a.runways * a.runwayLengthM * 15 * 2;
+    const shoulders = a.runways * a.runwayLengthM * AIRPORT_SHOULDER_WIDTH_M * 2;
     const taxi = a.taxiways * a.runwayLengthM * 0.4 * 22;
     const apron = Math.min(a.runwayLengthM, 2400) * a.apronDepthM;
     add("clearing", "Earthwork", "Runway strip clearing & levelling", (rArea + shoulders) * 1.4, "m²", "Strip area × 1.4");
     add("subgrade", "Pavement", "Runway subgrade (CBR 8+)", rArea, "m²", "Runway area");
     add("pqc", "Pavement", "Runway PQC slab (flexible/rigid)", rArea, "m²", "Runway area");
-    add("shoulder", "Pavement", "Runway shoulders", shoulders, "m²", "1.5 m each side × 2");
+    add("shoulder", "Pavement", "Runway shoulders", shoulders, "m²", `Runway count × length × ${AIRPORT_SHOULDER_WIDTH_M} m × 2 sides`);
     add("taxiway", "Pavement", `Taxiways (${a.taxiways})`, taxi, "m²", "Taxiway length × 22 m");
     add("apron", "Pavement", "Apron (PQC)", apron, "m²", "Apron width × depth");
     add("markings", "Finishes", "Runway markings & lighting", a.runwayLengthM * (a.runways * 4), "m", "Centreline + edge + approach");

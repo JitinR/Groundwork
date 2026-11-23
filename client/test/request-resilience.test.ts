@@ -92,7 +92,7 @@ test("a lost offline save acknowledgement rechecks server revision before sendin
     if (String(input) === "/api/auth/me") return Response.json({ user: { id: userId } });
     if (init?.method === "PATCH") { patches += 1; throw new TypeError("connection lost after commit"); }
     reads += 1;
-    return Response.json({ project: { id: projectId, name: "server", revision: reads === 1 ? 3 : 4 } });
+    return Response.json({ id: projectId, name: "server", revision: reads === 1 ? 3 : 4 });
   }) as typeof fetch;
   let unsubscribe = () => undefined;
   try {

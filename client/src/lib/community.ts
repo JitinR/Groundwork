@@ -97,20 +97,32 @@ export const AMENITIES: AmenityKind[] = [
 
 /** Amenity presets available for a project branch (residential or commercial). */
 export function amenitiesFor(branch: BuildingBranch, style?: CommercialStyle): AmenityKind[] {
-  if (branch === "commercial" && (style === "hotel" || style === "resort")) {
-    return AMENITIES.filter((a) => !a.branch || a.branch === "residential" || a.branch === "commercial");
-  }
+  if (branch === "commercial" && (style === "hotel" || style === "resort")) return [...AMENITIES];
   return AMENITIES.filter((a) => !a.branch || a.branch === branch);
 }
 
-/** True when an existing amenity kind is allowed in the given branch. */
-export function amenityAllowed(kind: string, branch: BuildingBranch): boolean {
-  const k = amenityKind(kind);
-  return !k || !k.branch || k.branch === branch;
+export function amenityAllowed(kind: string, branch: BuildingBranch, style?: CommercialStyle): boolean {
+  return amenitiesFor(branch, style).some((amenity) => amenity.kind === kind);
 }
 
 export function amenityKind(kind: string): AmenityKind | undefined {
   return AMENITIES.find((a) => a.kind === kind);
+}
+
+export function amenityFootprint(amenity: AmenityData): { w: number; d: number; area: number; diameter?: number } {
+  if (!amenity.shape && amenityKind(amenity.kind)?.shape === "circle") {
+    // Preserve the visible diameter of older models whose two stored dimensions differed.
+    const diameter = Math.min(amenity.w, amenity.d);
+    return { w: diameter, d: diameter, diameter, area: Math.PI * (diameter / 2) ** 2 };
+  }
+  return { w: amenity.w, d: amenity.d, area: amenity.w * amenity.d };
+}
+
+export function updateAmenity(amenity: AmenityData, patch: Partial<AmenityData>): AmenityData {
+  const next = { ...amenity, ...patch };
+  if (amenityFootprint(next).diameter === undefined || (patch.w === undefined && patch.d === undefined)) return next;
+  const diameter = patch.w ?? patch.d!;
+  return { ...next, w: diameter, d: diameter };
 }
 
 export function makeAmenity(kind: string, x: number, z: number): AmenityData {
@@ -261,8 +273,54 @@ export function towerMeters(t: TowerData): { w: number; d: number; h: number } {
   return { w, d, h: Math.max(t.floors, 1) * t.floorHeight };
 }
 
-export function undergroundDepth(p: UndergroundParking): number {
-  return p.levels * p.floorHeight + p.foundationDepth;
+/** Excavated footprint from user dimensions, or the tower envelopes of older models. */
+export function pitFootprint(design: CommunityDesign): { x: number; z: number; w: number; d: number } {
+  const { w: siteWidth, d: siteDepth } = landMeters(design.land);
+  const underground = design.parking.underground;
+  if (underground?.parkingWidthM && underground?.parkingLengthM && underground.parkingWidthM > 0 && underground.parkingLengthM > 0) {
+    return { x: 0, z: 0, w: Math.min(underground.parkingWidthM, siteWidth), d: Math.min(underground.parkingLengthM, siteDepth) };
+  }
+  if (design.towers.length === 0) {
+    return { x: 0, z: 0, w: Math.min(siteWidth * 0.62, 70), d: Math.min(siteDepth * 0.62, 46) };
+  }
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const tower of design.towers) {
+    const { w, d } = towerMeters(tower);
+    minX = Math.min(minX, tower.x - w / 2 - 6);
+    maxX = Math.max(maxX, tower.x + w / 2 + 6);
+    minZ = Math.min(minZ, tower.z - d / 2 - 8);
+    maxZ = Math.max(maxZ, tower.z + d / 2 + 8);
+  }
+  return { x: (minX + maxX) / 2, z: (minZ + maxZ) / 2, w: maxX - minX, d: maxZ - minZ };
+}
+
+export function undergroundParkingBayLayout(design: CommunityDesign) {
+  const pit = pitFootprint(design);
+  const underground = design.parking.mode === "underground" ? design.parking.underground : undefined;
+  if (!underground) return { cols: 0, rows: 0, levels: 0, pitchX: 0, pitchZ: 0, capacity: 0 };
+  const pitchX = underground.bayWidth + 0.6;
+  const pitchZ = underground.bayLength + 1;
+  const count = (requested: number, extent: number, pitch: number) =>
+    Number.isFinite(pitch) && pitch > 0 ? Math.max(0, Math.floor(Math.min(requested, extent / pitch))) : 0;
+  const cols = count(underground.bayCols, pit.w, pitchX);
+  const rows = count(underground.bayRows, pit.d, pitchZ);
+  const levels = Math.max(0, Math.floor(underground.levels));
+  return { cols, rows, levels, pitchX, pitchZ, capacity: cols * rows * levels };
+}
+
+export const BASEMENT_RAMP_DECK_M = 0.35;
+export const BASEMENT_RAMP_EDGE_WIDTH_M = 0.25;
+export const BASEMENT_RAMP_EDGE_HEIGHT_M = 0.35;
+
+export function undergroundRamp(underground: UndergroundParking) {
+  const width = underground.rampWidth > 0 ? underground.rampWidth : 3;
+  const length = underground.rampLength > 0 ? underground.rampLength : 30;
+  const slope = underground.rampSlope > 0 ? underground.rampSlope : underground.floorHeight / length * 100;
+  return { width, length, slope, rise: length * slope / 100 };
+}
+
+export function undergroundDepth(underground: UndergroundParking): number {
+  return undergroundRamp(underground).rise + Math.max(0, underground.levels - 1) * underground.floorHeight + underground.foundationDepth;
 }
 
 export function makeRoom(towerId: string, floor: number, name: string, type: string): InteriorRoom {

@@ -28,10 +28,11 @@ import { PerformancePanel } from "../components/PerformancePanel";
 import { VisualizationControls } from "../components/VisualizationControls";
 import { visualizationSettings } from "../lib/visualization";
 import { useAuth } from "../auth";
-import { clearPendingDraft, clearRecoveredDraft, hasMergeBase, persistPendingDraft, readPendingDraftResult, recoveryFromAnotherTab, type PendingDraft } from "../lib/offlineDraft";
+import { clearPendingDraft, clearRecoveredDraft, draftMatchesSavedProject, hasMergeBase, persistPendingDraft, readPendingDraftResult, recoveryFromAnotherTab, type PendingDraft } from "../lib/offlineDraft";
 import { captureLocalWrite, localWriteAllowed, subscribeLocalDataFence } from "../lib/localDataFence";
 import { offlineProjectStore } from "../lib/offlineProjectStore";
 import { offlineQueueStore } from "../lib/offlineQueue";
+import { offlineSyncManager } from "../lib/offlineSyncManager";
 import type { MergeDocument } from "../lib/designMerge";
 import { DraftConflictPanel } from "../components/DraftConflictPanel";
 import { RenderStudioModal } from "../components/RenderStudioModal";
@@ -81,6 +82,7 @@ export function Editor() {
   const [mergeOpen, setMergeOpen] = useState(false);
   const [recoveryWarning, setRecoveryWarning] = useState("");
   const [projectRole, setProjectRole] = useState<"owner" | "editor" | "viewer">("viewer");
+  const readOnly = projectRole === "viewer";
   const [cadWorkspaceActive, setCadWorkspaceActive] = useState(true);
   const [moduleTarget, setModuleTarget] = useState<"drafting" | undefined>();
 
@@ -92,6 +94,7 @@ export function Editor() {
   const [api, setApi] = useState<EditorApi | null>(null);
   const [tourPlaying, setTourPlaying] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [discardingDraft, setDiscardingDraft] = useState(false);
   const [lastSaved, setLastSaved] = useState<number | null>(null);
   const [remoteRevision, setRemoteRevision] = useState<number | null>(null);
 
@@ -134,6 +137,7 @@ export function Editor() {
   const saveTimer = useRef<number | null>(null);
   const revisionRef = useRef(0);
   const saveInFlight = useRef(false);
+  const discardInFlight = useRef(false);
   const editGeneration = useRef(0);
   const pendingBaseRevision = useRef<number | null>(null);
   const acknowledged = useRef<MergeDocument | null>(null);
@@ -163,12 +167,18 @@ export function Editor() {
         void offlineProjectStore.cacheProject(user.id, project, document.design);
       }
       const recovery = user ? readPendingDraftResult(user.id, id!) : { draft: null, error: undefined };
-      const recovered = recovery.draft;
+      let recovered = recovery.draft;
+      if (user && recovered && draftMatchesSavedProject(recovered, project)) {
+        if (recoveryFromAnotherTab(recovered)) clearRecoveredDraft(user.id, id!, recovered);
+        else clearPendingDraft(user.id, id!);
+        recovered = null;
+      }
       recoveryOrigin.current = recovered; latestDraft.current = recovered;
       setPendingDraft(recovered); setRecoveryWarning(recovery.error ?? "");
       pendingBaseRevision.current = recovered?.baseRevision ?? null;
       blockedSaveStatus.current = recovered?.lastSaveStatus;
-      setName(recovered?.name ?? document.name); setProjectType(recovered?.projectType ?? document.projectType); setDesign(recovered?.design ?? document.design);
+      const visibleDraft = project.role === "viewer" ? null : recovered;
+      setName(visibleDraft?.name ?? document.name); setProjectType(visibleDraft?.projectType ?? document.projectType); setDesign(visibleDraft?.design ?? document.design);
       setPhotoUrl(project.hasPhoto ? `/api/projects/${id}/photo?v=${project.updatedAt}` : null);
       setLoaded(true);
     } catch (err) {
@@ -201,6 +211,29 @@ export function Editor() {
     };
   }, [load]);
 
+  useEffect(() => offlineSyncManager.subscribeProjectSaves((accountId, project, savedDesign) => {
+    if (accountId !== user?.id || project.id !== id || scopeRef.current !== scope) return;
+    const draft = latestDraft.current;
+    if (!draft || !draftMatchesSavedProject(draft, { ...project, design: savedDesign }) || project.revision < revisionRef.current) return;
+    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+    saveTimer.current = null;
+    editGeneration.current++;
+    revisionRef.current = project.revision;
+    acknowledged.current = { design: savedDesign, name: project.name, projectType: project.projectType };
+    pendingBaseRevision.current = null;
+    blockedSaveStatus.current = undefined;
+    latestDraft.current = null;
+    if (recoveryOrigin.current && draftMatchesSavedProject(recoveryOrigin.current, { ...project, design: savedDesign })) {
+      clearRecoveredDraft(accountId, project.id, recoveryOrigin.current);
+    }
+    recoveryOrigin.current = null;
+    const cleanup = clearPendingDraft(accountId, project.id);
+    setPendingDraft(null);
+    setRecoveryWarning(cleanup.error ?? "");
+    setRemoteRevision(current => current !== null && current > project.revision ? current : null);
+    setLastSaved(Date.now());
+  }), [id, scope, user?.id]);
+
   useEffect(() => subscribeLocalDataFence((userId, fence) => {
     if (userId !== user?.id || !fence.blocked) return;
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
@@ -213,7 +246,7 @@ export function Editor() {
 
   const scheduleSave = useCallback(
     (d: Design, recovery?: PendingDraft): void => {
-      if (projectRole === "viewer" || !id || !user) return;
+      if (projectRole === "viewer" || discardInFlight.current || !id || !user) return;
       const write = captureLocalWrite(user.id);
       if (write === null) return;
       const currentScope = scopeRef.current;
@@ -276,15 +309,17 @@ export function Editor() {
 
           const isNetworkOffline = err instanceof TypeError;
           if (isNetworkOffline && user?.id) {
-            void offlineQueueStore.enqueue(
+            await offlineQueueStore.enqueue(
               user.id,
               id,
               "project_save",
-              { name: draft.name, projectType: draft.projectType, widthMm: d.room.widthMm, depthMm: d.room.depthMm, designData: JSON.stringify(d), baseRevision: draft.baseRevision, design: d },
+              { name: draft.name, projectType: draft.projectType, widthMm: d.room.widthMm, depthMm: d.room.depthMm, designData: JSON.stringify(d) },
               draft.baseRevision,
             );
+            if (currentScope !== scopeRef.current || loadAtSave !== loadGeneration.current || !localWriteAllowed(user.id, write)) return;
             void offlineProjectStore.cacheProject(user.id, { id, name: draft.name, projectType: draft.projectType, revision: draft.baseRevision } as any, d);
             toast.push({ title: "Offline: changes queued safely", description: "Offline queue updated. Will synchronize when reconnected.", tone: "info" });
+            void offlineSyncManager.synchronize(user.id);
           } else {
             const failed = { ...(latestDraft.current ?? draft), lastSaveStatus: status, lastSaveError: err instanceof Error ? err.message : "Could not save design" };
             store(failed);
@@ -304,27 +339,50 @@ export function Editor() {
     if (["design.updated", "operation.applied"].includes(event.type) && event.actorId !== user?.id && event.revision > revisionRef.current) setRemoteRevision(event.revision);
   }, [user?.id]);
 
+  const discardLocalAndReload = async () => {
+    if (saveInFlight.current || discardInFlight.current || !id || !user) return;
+    if (!latestDraft.current) { await load(); return; }
+    discardInFlight.current = true;
+    setDiscardingDraft(true);
+    if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    saveTimer.current = null;
+    editGeneration.current++;
+    try {
+      await offlineSyncManager.discardProjectSaves(user.id, id);
+      if (scopeRef.current !== scope) return;
+      clearPendingDraft(user.id, id);
+      if (recoveryOrigin.current) clearRecoveredDraft(user.id, id, recoveryOrigin.current);
+      latestDraft.current = null;
+      setPendingDraft(null);
+      await load();
+    } catch (error) {
+      if (scopeRef.current === scope) {
+        toast.push({ title: "Could not discard local changes", description: error instanceof Error ? error.message : undefined, tone: "error" });
+      }
+    } finally {
+      discardInFlight.current = false;
+      setDiscardingDraft(false);
+    }
+  };
+
   const recoveryControls = (pendingDraft || remoteRevision !== null || recoveryWarning) ? <div className="flex flex-wrap items-center gap-2 text-xs text-amber-200">
     <span>{pendingDraft ? recoveryFromAnotherTab(pendingDraft) ? "Recovery from a previous page or another tab is available." : "Local changes are pending." : remoteRevision !== null ? "Remote design update available." : "Recovery storage needs attention."}</span>
     {recoveryWarning && <span role="status">{recoveryWarning}</span>}
     {pendingDraft?.lastSaveError && <span role="status">{pendingDraft.lastSaveError}</span>}
     <Button size="sm" variant="outline" onClick={() => download("local-design.json", JSON.stringify(pendingDraft?.design ?? design, null, 2), "application/json")}>Download local</Button>
     {pendingDraft && <>
-      <Button size="sm" variant="secondary" disabled={saving || projectRole === "viewer"} onClick={() => {
+      <Button size="sm" variant="secondary" disabled={saving || discardingDraft || readOnly} onClick={() => {
         setDesign(pendingDraft.design); setName(pendingDraft.name); setProjectType(pendingDraft.projectType);
         scheduleSave(pendingDraft.design, pendingDraft);
       }}>Retry original revision</Button>
-      <Button size="sm" variant="outline" disabled={saving || projectRole === "viewer" || !hasMergeBase(pendingDraft)} onClick={() => {
+      <Button size="sm" variant="outline" disabled={saving || discardingDraft || readOnly || !hasMergeBase(pendingDraft)} onClick={() => {
         if (saveTimer.current) window.clearTimeout(saveTimer.current);
         editGeneration.current++; setMergeOpen(true);
       }}>Compare & merge</Button>
     </>}
-    <Button size="sm" variant="ghost" disabled={saving} onClick={() => {
-      if (saveTimer.current) window.clearTimeout(saveTimer.current);
-      editGeneration.current++;
-      if (user) { clearPendingDraft(user.id, id!); if (recoveryOrigin.current) clearRecoveredDraft(user.id, id!, recoveryOrigin.current); }
-      latestDraft.current = null; setPendingDraft(null); void load();
-    }}>Discard local & reload</Button>
+    <Button size="sm" variant="ghost" disabled={saving || discardingDraft} onClick={() => void discardLocalAndReload()}>
+      {pendingDraft ? "Discard local & queued edits" : "Reload project"}
+    </Button>
     {mergeOpen && pendingDraft && <DraftConflictPanel projectId={id!} draft={pendingDraft} remoteDocument={projectDocument} onClose={() => setMergeOpen(false)} onApply={(document, remote) => {
       const base = projectDocument(remote);
       const recovery: PendingDraft = { ...document, baseDesign: base.design, baseName: base.name, baseProjectType: base.projectType, baseRevision: remote.revision, savedAt: Date.now() };
@@ -335,10 +393,11 @@ export function Editor() {
 
   const changeDesign = useCallback(
     (d: Design) => {
+      if (readOnly || discardInFlight.current) return;
       setDesign(d);
       scheduleSave(d);
     },
-    [scheduleSave],
+    [readOnly, scheduleSave],
   );
 
   const mutateFurniture = useCallback(
@@ -383,6 +442,7 @@ export function Editor() {
   };
 
   const uploadFile = async (file: File) => {
+    if (readOnly) return;
     setUploading(true);
     try {
       await uploadProjectPhoto(id!, file);
@@ -397,6 +457,7 @@ export function Editor() {
   };
 
   useEffect(() => {
+    if (readOnly) return;
     const onPaste = (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (!items) return;
@@ -412,10 +473,11 @@ export function Editor() {
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, [uploadFile]);
+  }, [readOnly, uploadFile]);
 
   const onCanvasDrop = (e: DragEvent) => {
     e.preventDefault();
+    if (readOnly) return;
     const file = [...e.dataTransfer.files].find((f) => f.type.startsWith("image/"));
     if (file) void uploadFile(file);
   };
@@ -538,117 +600,119 @@ export function Editor() {
         ))}
       </div>
 
-      {panelTab === "items" && (
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          {selected ? (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="font-semibold text-slate-100">{selected.name}</p>
-                  <p className="text-xs text-slate-500">{selectedEntry?.w} × {selectedEntry?.d} × {selectedEntry?.h} mm</p>
+      <fieldset disabled={readOnly} className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {panelTab === "items" && (
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {selected ? (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="font-semibold text-slate-100">{selected.name}</p>
+                    <p className="text-xs text-slate-500">{selectedEntry?.w} × {selectedEntry?.d} × {selectedEntry?.h} mm</p>
+                  </div>
+                  <Badge tone="cyan">{Math.round(selected.rotationDeg)}°</Badge>
                 </div>
-                <Badge tone="cyan">{Math.round(selected.rotationDeg)}°</Badge>
+                <div className="space-y-1.5">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Finish colour</p>
+                  <div className="flex items-center gap-2">
+                    <input type="color" aria-label="Furniture finish colour" value={selected.color} onChange={(e) => updateSelected({ color: e.target.value })} className="h-9 w-12 cursor-pointer rounded-lg border border-slate-700 bg-transparent" />
+                    <div className="flex flex-wrap gap-1.5">
+                      {SWATCHES.map((s) => (
+                        <button key={s} aria-label={`Use finish colour ${s}`} aria-pressed={selected.color === s} onClick={() => updateSelected({ color: s })} className={cn("h-6 w-6 rounded-md border transition", selected.color === s ? "border-emerald-400 ring-2 ring-emerald-400/40" : "border-slate-700")} style={{ backgroundColor: s }} />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <div className="flex justify-between"><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Scale</p><p className="text-xs text-slate-400">{Math.round(selected.scale * 100)}%</p></div>
+                  <input type="range" aria-label="Furniture scale" min={0.5} max={1.5} step={0.05} value={selected.scale} onChange={(e) => updateSelected({ scale: Number(e.target.value) })} className="w-full accent-emerald-500" />
+                </div>
+                <Select label="Construction phase" value={selected.phaseId ?? ""} onChange={(e) => updateSelected({ phaseId: e.target.value || undefined })}>
+                  <option value="">Unassigned / always visible</option>
+                  {selected.phaseId && !phaseOptions.some((phase) => phase.id === selected.phaseId) && <option value={selected.phaseId}>Missing or outside selection limit ({selected.phaseId})</option>}
+                  {phaseOptions.map((phase) => <option key={phase.id} value={phase.id}>{phase.name}</option>)}
+                </Select>
+                <Select label="PBR finish" value={selected.finish ?? "satin"} onChange={(e) => updateSelected({ finish: e.target.value as FurnitureItem["finish"] })}>
+                  <option value="matte">Matte</option><option value="satin">Satin</option><option value="glossy">Glossy</option><option value="metallic">Metallic</option><option value="glass">Glass</option>
+                </Select>
+                <Select label="Mounting" value={selected.mount ?? furnitureMount(selected.type)} onChange={(e) => updateSelected({ mount: e.target.value as FurnitureItem["mount"] })}>
+                  <option value="unassigned">Choose placement</option>
+                  <option value="floor">Floor</option>
+                  <option value="wall">Wall</option>
+                  <option value="ceiling">Ceiling</option>
+                </Select>
+                {(selected.mount ?? furnitureMount(selected.type)) === "wall" && (
+                  <Select label="Wall" value={selected.mountWall ?? "north"} onChange={(e) => updateSelected({ mountWall: e.target.value as FurnitureItem["mountWall"] })}>
+                    <option value="north">North wall</option>
+                    <option value="east">East wall</option>
+                    <option value="south">South wall</option>
+                    <option value="west">West wall</option>
+                  </Select>
+                )}
+                <div className="space-y-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Rotate</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    <Button variant="secondary" size="sm" onClick={() => updateSelected({ rotationDeg: (selected.rotationDeg - 45 + 360) % 360 })}>⟲ 45°</Button>
+                    <Button variant="secondary" size="sm" onClick={() => updateSelected({ rotationDeg: (selected.rotationDeg + 45) % 360 })}>45° ⟳</Button>
+                    <Button variant="secondary" size="sm" onClick={() => updateSelected({ rotationDeg: 0 })}>Reset</Button>
+                  </div>
+                </div>
+                <Button variant="danger" size="sm" className="w-full" onClick={removeSelected}>Remove from design</Button>
               </div>
-              <div className="space-y-1.5">
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Finish colour</p>
-                <div className="flex items-center gap-2">
-                  <input type="color" aria-label="Furniture finish colour" value={selected.color} onChange={(e) => updateSelected({ color: e.target.value })} className="h-9 w-12 cursor-pointer rounded-lg border border-slate-700 bg-transparent" />
-                  <div className="flex flex-wrap gap-1.5">
-                    {SWATCHES.map((s) => (
-                      <button key={s} aria-label={`Use finish colour ${s}`} aria-pressed={selected.color === s} onClick={() => updateSelected({ color: s })} className={cn("h-6 w-6 rounded-md border transition", selected.color === s ? "border-emerald-400 ring-2 ring-emerald-400/40" : "border-slate-700")} style={{ backgroundColor: s }} />
+            ) : design.furniture.length === 0 ? (
+              <div className="py-8 text-center text-sm text-slate-500">
+                <p>Click a piece in the library to add it.</p>
+                <p className="mt-1 text-xs text-slate-600">Drag items around the room to position them.</p>
+              </div>
+            ) : (
+              <div className="space-y-1">
+                {design.furniture.map((f) => (
+                  <button key={f.id} onClick={() => setSelectedId(f.id)} className={cn("flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm transition", selectedId === f.id ? "bg-emerald-500/10 text-emerald-300" : "text-slate-300 hover:bg-slate-800")}>
+                    <span className="h-4 w-4 rounded border border-slate-700" style={{ backgroundColor: f.color }} />
+                    <span className="truncate">{f.name}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {panelTab === "room" && (
+          <div className="flex-1 space-y-4 overflow-y-auto">
+            <RoomNum label="Width" value={design.room.widthMm} unit=" mm" step={100} min={100} onChange={(v) => changeDesign({ ...design, room: { ...design.room, widthMm: Math.max(Number.isFinite(v) ? v : 0, 100) } })} />
+            <RoomNum label="Depth" value={design.room.depthMm} unit=" mm" step={100} min={100} onChange={(v) => changeDesign({ ...design, room: { ...design.room, depthMm: Math.max(Number.isFinite(v) ? v : 0, 100) } })} />
+            <RoomNum label="Ceiling height" value={design.room.wallHeightMm} unit=" mm" step={100} min={100} onChange={(v) => changeDesign({ ...design, room: { ...design.room, wallHeightMm: Math.max(Number.isFinite(v) ? v : 0, 100) } })} />
+            <ColorField label="Wall colour" value={design.room.wallColor} onChange={(c) => changeDesign({ ...design, room: { ...design.room, wallColor: c } })} />
+            <ColorField label="Floor colour" value={design.room.floorColor} onChange={(c) => changeDesign({ ...design, room: { ...design.room, floorColor: c } })} />
+          </div>
+        )}
+
+        {panelTab === "curtains" && (
+          <div className="flex-1 space-y-4 overflow-y-auto">
+            <Toggle checked={Boolean(design.curtains?.enabled)} onChange={(v) => changeDesign({ ...design, curtains: v ? { enabled: true, style: "panel", color: "#e8e4da", wall: "north", heightPercent: 1, widthPercentPerPanel: 0.2 } : null })} label="Enable curtains" />
+            {design.curtains?.enabled && (
+              <>
+                <div className="space-y-1.5">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Style</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(["sheer", "blackout", "roman", "panel"] as const).map((s) => (
+                      <button key={s} onClick={() => changeDesign({ ...design, curtains: { ...design.curtains!, style: s } })} className={cn("rounded-lg border px-2 py-1.5 text-xs font-semibold capitalize", design.curtains!.style === s ? "border-emerald-500 bg-emerald-500/10 text-emerald-300" : "border-slate-700 text-slate-400")}>{s}</button>
                     ))}
                   </div>
                 </div>
-              </div>
-              <div className="space-y-1.5">
-                <div className="flex justify-between"><p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Scale</p><p className="text-xs text-slate-400">{Math.round(selected.scale * 100)}%</p></div>
-                <input type="range" aria-label="Furniture scale" min={0.5} max={1.5} step={0.05} value={selected.scale} onChange={(e) => updateSelected({ scale: Number(e.target.value) })} className="w-full accent-emerald-500" />
-              </div>
-              <Select label="Construction phase" value={selected.phaseId ?? ""} onChange={(e) => updateSelected({ phaseId: e.target.value || undefined })}>
-                <option value="">Unassigned / always visible</option>
-                {selected.phaseId && !phaseOptions.some((phase) => phase.id === selected.phaseId) && <option value={selected.phaseId}>Missing or outside selection limit ({selected.phaseId})</option>}
-                {phaseOptions.map((phase) => <option key={phase.id} value={phase.id}>{phase.name}</option>)}
-              </Select>
-              <Select label="PBR finish" value={selected.finish ?? "satin"} onChange={(e) => updateSelected({ finish: e.target.value as FurnitureItem["finish"] })}>
-                <option value="matte">Matte</option><option value="satin">Satin</option><option value="glossy">Glossy</option><option value="metallic">Metallic</option><option value="glass">Glass</option>
-              </Select>
-              <Select label="Mounting" value={selected.mount ?? furnitureMount(selected.type)} onChange={(e) => updateSelected({ mount: e.target.value as FurnitureItem["mount"] })}>
-                <option value="unassigned">Choose placement</option>
-                <option value="floor">Floor</option>
-                <option value="wall">Wall</option>
-                <option value="ceiling">Ceiling</option>
-              </Select>
-              {(selected.mount ?? furnitureMount(selected.type)) === "wall" && (
-                <Select label="Wall" value={selected.mountWall ?? "north"} onChange={(e) => updateSelected({ mountWall: e.target.value as FurnitureItem["mountWall"] })}>
-                  <option value="north">North wall</option>
-                  <option value="east">East wall</option>
-                  <option value="south">South wall</option>
-                  <option value="west">West wall</option>
+                <Select label="Wall" value={design.curtains.wall} onChange={(e) => changeDesign({ ...design, curtains: { ...design.curtains!, wall: e.target.value as "north" | "south" | "east" | "west" } })}>
+                  {(["north", "south", "east", "west"] as const).map((w) => <option key={w} value={w}>{wallKey(w)}</option>)}
                 </Select>
-              )}
-              <div className="space-y-2">
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Rotate</p>
-                <div className="grid grid-cols-3 gap-2">
-                  <Button variant="secondary" size="sm" onClick={() => updateSelected({ rotationDeg: (selected.rotationDeg - 45 + 360) % 360 })}>⟲ 45°</Button>
-                  <Button variant="secondary" size="sm" onClick={() => updateSelected({ rotationDeg: (selected.rotationDeg + 45) % 360 })}>45° ⟳</Button>
-                  <Button variant="secondary" size="sm" onClick={() => updateSelected({ rotationDeg: 0 })}>Reset</Button>
-                </div>
-              </div>
-              <Button variant="danger" size="sm" className="w-full" onClick={removeSelected}>Remove from design</Button>
-            </div>
-          ) : design.furniture.length === 0 ? (
-            <div className="py-8 text-center text-sm text-slate-500">
-              <p>Click a piece in the library to add it.</p>
-              <p className="mt-1 text-xs text-slate-600">Drag items around the room to position them.</p>
-            </div>
-          ) : (
-            <div className="space-y-1">
-              {design.furniture.map((f) => (
-                <button key={f.id} onClick={() => setSelectedId(f.id)} className={cn("flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm transition", selectedId === f.id ? "bg-emerald-500/10 text-emerald-300" : "text-slate-300 hover:bg-slate-800")}>
-                  <span className="h-4 w-4 rounded border border-slate-700" style={{ backgroundColor: f.color }} />
-                  <span className="truncate">{f.name}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+                <ColorField label="Curtain colour" value={design.curtains.color} onChange={(c) => changeDesign({ ...design, curtains: { ...design.curtains!, color: c } })} />
+                <SliderField label="Length" value={Math.round(design.curtains.heightPercent * 100)} display={`${Math.round(design.curtains.heightPercent * 100)}%`} min={60} max={100} step={5} onChange={(v) => changeDesign({ ...design, curtains: { ...design.curtains!, heightPercent: v / 100 } })} />
+                <SliderField label="Panel width" value={Math.round(design.curtains.widthPercentPerPanel * 100)} display={`${Math.round(design.curtains.widthPercentPerPanel * 100)}%`} min={10} max={40} step={5} onChange={(v) => changeDesign({ ...design, curtains: { ...design.curtains!, widthPercentPerPanel: v / 100 } })} />
+              </>
+            )}
+          </div>
+        )}
 
-      {panelTab === "room" && (
-        <div className="flex-1 space-y-4 overflow-y-auto">
-          <RoomNum label="Width" value={design.room.widthMm} unit=" mm" step={100} min={100} onChange={(v) => changeDesign({ ...design, room: { ...design.room, widthMm: Math.max(Number.isFinite(v) ? v : 0, 100) } })} />
-          <RoomNum label="Depth" value={design.room.depthMm} unit=" mm" step={100} min={100} onChange={(v) => changeDesign({ ...design, room: { ...design.room, depthMm: Math.max(Number.isFinite(v) ? v : 0, 100) } })} />
-          <RoomNum label="Ceiling height" value={design.room.wallHeightMm} unit=" mm" step={100} min={100} onChange={(v) => changeDesign({ ...design, room: { ...design.room, wallHeightMm: Math.max(Number.isFinite(v) ? v : 0, 100) } })} />
-          <ColorField label="Wall colour" value={design.room.wallColor} onChange={(c) => changeDesign({ ...design, room: { ...design.room, wallColor: c } })} />
-          <ColorField label="Floor colour" value={design.room.floorColor} onChange={(c) => changeDesign({ ...design, room: { ...design.room, floorColor: c } })} />
-        </div>
-      )}
-
-      {panelTab === "curtains" && (
-        <div className="flex-1 space-y-4 overflow-y-auto">
-          <Toggle checked={Boolean(design.curtains?.enabled)} onChange={(v) => changeDesign({ ...design, curtains: v ? { enabled: true, style: "panel", color: "#e8e4da", wall: "north", heightPercent: 1, widthPercentPerPanel: 0.2 } : null })} label="Enable curtains" />
-          {design.curtains?.enabled && (
-            <>
-              <div className="space-y-1.5">
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Style</p>
-                <div className="grid grid-cols-2 gap-2">
-                  {(["sheer", "blackout", "roman", "panel"] as const).map((s) => (
-                    <button key={s} onClick={() => changeDesign({ ...design, curtains: { ...design.curtains!, style: s } })} className={cn("rounded-lg border px-2 py-1.5 text-xs font-semibold capitalize", design.curtains!.style === s ? "border-emerald-500 bg-emerald-500/10 text-emerald-300" : "border-slate-700 text-slate-400")}>{s}</button>
-                  ))}
-                </div>
-              </div>
-              <Select label="Wall" value={design.curtains.wall} onChange={(e) => changeDesign({ ...design, curtains: { ...design.curtains!, wall: e.target.value as "north" | "south" | "east" | "west" } })}>
-                {(["north", "south", "east", "west"] as const).map((w) => <option key={w} value={w}>{wallKey(w)}</option>)}
-              </Select>
-              <ColorField label="Curtain colour" value={design.curtains.color} onChange={(c) => changeDesign({ ...design, curtains: { ...design.curtains!, color: c } })} />
-              <SliderField label="Length" value={Math.round(design.curtains.heightPercent * 100)} display={`${Math.round(design.curtains.heightPercent * 100)}%`} min={60} max={100} step={5} onChange={(v) => changeDesign({ ...design, curtains: { ...design.curtains!, heightPercent: v / 100 } })} />
-              <SliderField label="Panel width" value={Math.round(design.curtains.widthPercentPerPanel * 100)} display={`${Math.round(design.curtains.widthPercentPerPanel * 100)}%`} min={10} max={40} step={5} onChange={(v) => changeDesign({ ...design, curtains: { ...design.curtains!, widthPercentPerPanel: v / 100 } })} />
-            </>
-          )}
-        </div>
-      )}
-
-      {panelTab === "mep" && <div className="flex-1 space-y-4 overflow-y-auto"><Suspense fallback={<Spinner className="h-5 w-5" />}><MepPanel value={design.mep} phases={visualization.phases} onChange={(mep) => changeDesign({ ...design, mep })} /></Suspense></div>}
+        {panelTab === "mep" && <div className="flex-1 space-y-4 overflow-y-auto"><Suspense fallback={<Spinner className="h-5 w-5" />}><MepPanel value={design.mep} phases={visualization.phases} onChange={(mep) => changeDesign({ ...design, mep })} /></Suspense></div>}
+      </fieldset>
     </>
   );
 
@@ -665,7 +729,7 @@ export function Editor() {
     return <Suspense fallback={<div className="flex min-h-[65vh] items-center justify-center"><Spinner className="h-7 w-7" /></div>}>
       <CadWorkspace key={id} design={design} onChange={changeDesign} projectName={name} readOnly={projectRole === "viewer"} saving={saving} saved={!pendingDraft} remoteRevision={remoteRevision}
         onSave={() => scheduleSave(design)} draftingAvailable={Boolean(communityActive || infraActive)} onLegacy={target => { setModuleTarget(target); setCadWorkspaceActive(false); }}
-        projectControls={<><CollaborationStatus projectId={id!} onRemoteEvent={onCollaborationEvent} /><ProjectHistory projectId={id!} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />{recoveryControls}<Suspense fallback={null}><ProjectEngineeringBasisControl value={design.engineeringBasis} disabled={projectRole === "viewer"} onChange={engineeringBasis => changeDesign({ ...design, engineeringBasis })} /></Suspense></>} />
+        projectControls={<><CollaborationStatus projectId={id!} onRemoteEvent={onCollaborationEvent} /><ProjectHistory projectId={id!} role={projectRole} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />{recoveryControls}<Suspense fallback={null}><ProjectEngineeringBasisControl value={design.engineeringBasis} disabled={projectRole === "viewer"} onChange={engineeringBasis => changeDesign({ ...design, engineeringBasis })} /></Suspense></>} />
     </Suspense>;
   }
 
@@ -674,7 +738,7 @@ export function Editor() {
       <div className="gw-editor-workspace relative flex flex-col">
         <SheetHeader
           eyebrow="Project sheet"
-          title={<input value={name} onChange={(e) => setName(e.target.value)} onBlur={() => scheduleSave(design)} className="w-full max-w-xs rounded-lg border border-transparent bg-transparent px-1 py-0.5 text-base font-semibold text-slate-100 outline-none hover:border-slate-700 focus:border-emerald-500" aria-label="Project title" />}
+          title={<input value={name} readOnly={readOnly} onChange={(e) => setName(e.target.value)} onBlur={() => scheduleSave(design)} className="w-full max-w-xs rounded-lg border border-transparent bg-transparent px-1 py-0.5 text-base font-semibold text-slate-100 outline-none hover:border-slate-700 focus:border-emerald-500" aria-label="Project title" />}
           meta={<>{PROJECT_TYPE_LABELS[projectType] ?? projectType} · {saving ? "Saving" : lastSaved ? "Saved" : "Draft"} · <CollaborationStatus projectId={id!} onRemoteEvent={onCollaborationEvent} />{remoteRevision ? " · Remote update available" : ""}</>}
         />
         <div className="gw-sheet-toolbar mb-3 mt-2 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-800 bg-slate-900/70 px-4 py-3">
@@ -684,7 +748,7 @@ export function Editor() {
             {saving ? " · saving…" : lastSaved ? " · saved" : ""}
           </p>
            <div className="flex-1" />
-           <ProjectHistory projectId={id!} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />
+           <ProjectHistory projectId={id!} role={projectRole} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />
            <ProjectWorkspaceLinks projectId={id!} />
            <Suspense fallback={null}><ProjectEngineeringBasisControl value={design.engineeringBasis} disabled={projectRole === "viewer"} onChange={engineeringBasis => changeDesign({ ...design, engineeringBasis })} /></Suspense>
            <TeamCollaborationPanel projectId={id!} />
@@ -696,17 +760,14 @@ export function Editor() {
         </div>
         <Suspense fallback={<div className="flex flex-1 items-center justify-center"><Spinner className="h-6 w-6 text-amber-300" /></div>}>
         <CommunityEditor
+          readOnly={readOnly}
           initialStep={moduleTarget === "drafting" ? "drafting" : undefined}
            branch={residentialProject ? "residential" : "commercial"}
           community={community}
            projectName={name}
            design={design}
            onVisualizationChange={changeDesign}
-          onChange={(c) => {
-            const next = { ...design, community: c };
-            setDesign(next);
-            scheduleSave(next);
-          }}
+          onChange={(community) => changeDesign({ ...design, community })}
         />
         </Suspense>
       </div>
@@ -716,11 +777,12 @@ export function Editor() {
   if (infraActive && infraKind && design.infra) {
     return (
       <div className="gw-editor-workspace relative flex flex-col">
-         <SheetHeader eyebrow="Project sheet" title={<input value={name} onChange={(e) => setName(e.target.value)} onBlur={() => scheduleSave(design)} className="w-full max-w-xs rounded-lg border border-transparent bg-transparent px-1 py-0.5 text-base font-semibold text-slate-100 outline-none hover:border-slate-700 focus:border-emerald-500" aria-label="Project title" />} meta={<>{INFRA_LABELS[infraKind]} · {saving ? "Saving" : lastSaved ? "Saved" : "Draft"} · <CollaborationStatus projectId={id!} onRemoteEvent={onCollaborationEvent} />{remoteRevision ? " · Remote update available" : ""}</>} tone="amber" />
+         <SheetHeader eyebrow="Project sheet" title={<input value={name} readOnly={readOnly} onChange={(e) => setName(e.target.value)} onBlur={() => scheduleSave(design)} className="w-full max-w-xs rounded-lg border border-transparent bg-transparent px-1 py-0.5 text-base font-semibold text-slate-100 outline-none hover:border-slate-700 focus:border-emerald-500" aria-label="Project title" />} meta={<>{INFRA_LABELS[infraKind]} · {saving ? "Saving" : lastSaved ? "Saved" : "Draft"} · <CollaborationStatus projectId={id!} onRemoteEvent={onCollaborationEvent} />{remoteRevision ? " · Remote update available" : ""}</>} tone="amber" />
         <div className="gw-sheet-toolbar mb-3 mt-2 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-800 bg-slate-900/70 px-4 py-3">
           <Button size="sm" onClick={() => setCadWorkspaceActive(true)}>CAD workspace</Button>
           <input
             value={name}
+            readOnly={readOnly}
             onChange={(e) => setName(e.target.value)}
             onBlur={() => scheduleSave(design)}
             className="w-full max-w-xs rounded-lg border border-transparent bg-transparent px-2 py-1 text-sm font-semibold text-slate-100 outline-none hover:border-slate-700 focus:border-emerald-500"
@@ -733,7 +795,7 @@ export function Editor() {
             {saving ? " · saving…" : lastSaved ? " · saved" : ""}
           </p>
            <div className="flex-1" />
-           <ProjectHistory projectId={id!} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />
+           <ProjectHistory projectId={id!} role={projectRole} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />
            <ProjectWorkspaceLinks projectId={id!} />
            <Suspense fallback={null}><ProjectEngineeringBasisControl value={design.engineeringBasis} disabled={projectRole === "viewer"} onChange={engineeringBasis => changeDesign({ ...design, engineeringBasis })} /></Suspense>
            <TeamCollaborationPanel projectId={id!} />
@@ -743,17 +805,14 @@ export function Editor() {
         </div>
         <Suspense fallback={<div className="flex flex-1 items-center justify-center"><Spinner className="h-6 w-6 text-amber-300" /></div>}>
         <InfraEditor
+          readOnly={readOnly}
           initialStep={moduleTarget === "drafting" ? "design" : undefined}
           kind={infraKind}
           infra={design.infra}
           projectName={name}
            design={design}
            onVisualizationChange={changeDesign}
-          onChange={(next) => {
-            const updated = { ...design, infra: next };
-            setDesign(updated);
-            scheduleSave(updated);
-          }}
+          onChange={(infra) => changeDesign({ ...design, infra })}
         />
         </Suspense>
       </div>
@@ -762,7 +821,7 @@ export function Editor() {
 
   return (
     <div className="gw-editor-workspace relative flex flex-col">
-        <SheetHeader eyebrow="Interior sheet" title={<input value={name} onChange={(e) => setName(e.target.value)} onBlur={() => scheduleSave(design)} className="w-full max-w-xs rounded-lg border border-transparent bg-transparent px-1 py-0.5 text-base font-semibold text-slate-100 outline-none hover:border-slate-700 focus:border-emerald-500" aria-label="Project title" />} meta={<>{PROJECT_TYPE_LABELS[projectType] ?? projectType} · {saving ? "Saving" : lastSaved ? "Saved" : "Draft"} · <CollaborationStatus projectId={id!} onRemoteEvent={onCollaborationEvent} />{remoteRevision ? " · Remote update available" : ""}</>} />
+        <SheetHeader eyebrow="Interior sheet" title={<input value={name} readOnly={readOnly} onChange={(e) => setName(e.target.value)} onBlur={() => scheduleSave(design)} className="w-full max-w-xs rounded-lg border border-transparent bg-transparent px-1 py-0.5 text-base font-semibold text-slate-100 outline-none hover:border-slate-700 focus:border-emerald-500" aria-label="Project title" />} meta={<>{PROJECT_TYPE_LABELS[projectType] ?? projectType} · {saving ? "Saving" : lastSaved ? "Saved" : "Draft"} · <CollaborationStatus projectId={id!} onRemoteEvent={onCollaborationEvent} />{remoteRevision ? " · Remote update available" : ""}</>} />
        <div className="gw-sheet-toolbar mb-3 mt-2 flex flex-wrap items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/70 px-4 py-3">
          <Button size="sm" onClick={() => setCadWorkspaceActive(true)}>CAD workspace</Button>
          <div className="min-w-0 flex-1">
@@ -772,7 +831,7 @@ export function Editor() {
           </p>
         </div>
 
-          <ProjectHistory projectId={id!} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />
+          <ProjectHistory projectId={id!} role={projectRole} currentDesign={design} currentRevision={revisionRef.current} onRestored={onHistoryRestore} />
           <ProjectWorkspaceLinks projectId={id!} />
           <Suspense fallback={null}><ProjectEngineeringBasisControl value={design.engineeringBasis} disabled={projectRole === "viewer"} onChange={engineeringBasis => changeDesign({ ...design, engineeringBasis })} /></Suspense>
            <TeamCollaborationPanel projectId={id!} />
@@ -780,11 +839,12 @@ export function Editor() {
           <Badge tone="slate">{design.room.widthMm / 1000} × {design.room.depthMm / 1000} m · {design.furniture.length} items</Badge>
           {recoveryControls}
 
-        <Button variant="secondary" size="sm" onClick={() => setCameraOpen(true)} disabled={!canUseCamera}>
+        {readOnly && <Badge tone="slate">Read-only access</Badge>}
+        <Button variant="secondary" size="sm" onClick={() => setCameraOpen(true)} disabled={readOnly || !canUseCamera}>
           <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor"><path d="M9 3L7.3 5H4a2 2 0 00-2 2v11a2 2 0 002 2h16a2 2 0 002-2V7a2 2 0 00-2-2h-3.3L15 3H9zm3 14a5 5 0 110-10 5 5 0 010 10zm0-8a3 3 0 100 6 3 3 0 000-6z" /></svg>
           Camera
         </Button>
-        <Button variant="secondary" size="sm" onClick={() => fileInputRef.current?.click()}>
+        <Button variant="secondary" size="sm" onClick={() => fileInputRef.current?.click()} disabled={readOnly}>
           <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17v3h18v-3M7 8l5-5 5 5M12 3v11" /></svg>
           Upload photo
         </Button>
@@ -809,7 +869,7 @@ export function Editor() {
             <Button variant="ghost" size="sm" onClick={() => api?.resetView()} title="Reset view">Home</Button>
           </div>
           <div className="flex items-center gap-1 rounded-xl border border-slate-800 bg-slate-950 p-1">
-            <Button variant="ghost" size="sm" onClick={() => {
+            <Button variant="ghost" size="sm" disabled={readOnly} onClick={() => {
               if (!api) return;
               const current = visualizationSettings(design.visualization);
               const currentPath = current.cameraPath ?? [];
@@ -820,7 +880,7 @@ export function Editor() {
             <Button variant="ghost" size="sm" onClick={() => api?.stopCameraPath()} title="Stop camera path">Stop</Button>
           </div>
 
-        <Button size="sm" variant="outline" onClick={() => void openRenderStudio()} title="AI photorealistic rendering studio">
+        <Button size="sm" variant="outline" disabled={readOnly} onClick={() => void openRenderStudio()} title="AI photorealistic rendering studio">
           <span className="mr-1">✨</span>
           AI Render
         </Button>
@@ -828,13 +888,13 @@ export function Editor() {
           <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17v3h18v-3M7 8l5-5 5 5M12 3v11" /></svg>
           Export / ship to CAD
         </Button>
-         <Suspense fallback={null}><DesignExportMenu design={design} projectName={name} onChange={changeDesign} /></Suspense>
+         <Suspense fallback={null}><DesignExportMenu design={design} projectName={name} onChange={readOnly ? undefined : changeDesign} /></Suspense>
       </div>
 
       <div className="flex min-h-0 flex-1 gap-3">
         {/* Catalog sidebar */}
         <aside className="hidden w-60 shrink-0 flex-col overflow-y-auto rounded-2xl border border-slate-800 bg-slate-900/60 p-3 lg:flex">
-          {catalogContent}
+          <fieldset disabled={readOnly} className="min-w-0">{catalogContent}</fieldset>
         </aside>
 
         {/* 3D canvas */}
@@ -851,20 +911,20 @@ export function Editor() {
               showPhoto={showPhoto && Boolean(photoUrl)}
               photoOpacity={photoOpacity}
               selectedId={selectedId}
-              onChange={changeDesign}
+              onChange={readOnly ? undefined : changeDesign}
               onSelect={setSelectedId}
               onApiReady={setApi}
             />
             </Suspense>
           )}
-           {!photoUrl && !uploading && (
+           {!readOnly && !photoUrl && !uploading && (
             <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1 text-[11px] text-slate-400 backdrop-blur">
               Drop a photo here or paste (Ctrl/Cmd+V) to trace the site
             </div>
            )}
-           <div className="pointer-events-auto absolute bottom-3 right-3 z-10 max-w-full">
+           {!readOnly && <div className="pointer-events-auto absolute bottom-3 right-3 z-10 max-w-full">
              <VisualizationControls design={design} presentationApi={api} onChange={changeDesign} />
-           </div>
+           </div>}
           {uploading && (
             <div className="pointer-events-none absolute left-1/2 top-4 flex -translate-x-1/2 items-center gap-2 rounded-full border border-emerald-500/40 bg-slate-950/90 px-3 py-1.5 text-[11px] text-emerald-300 backdrop-blur">
               <Spinner className="h-3 w-3" /> Uploading photo…
@@ -927,7 +987,7 @@ export function Editor() {
           : mobilePanel === "curtains" ? "Curtains" : "MEP coordination"}
       >
         <div className="flex min-h-0 flex-col">
-          {mobilePanel === "catalog" ? catalogContent : panelContent}
+          {mobilePanel === "catalog" ? <fieldset disabled={readOnly}>{catalogContent}</fieldset> : panelContent}
         </div>
       </Modal>
 

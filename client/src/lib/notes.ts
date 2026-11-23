@@ -1,5 +1,5 @@
 import type { CommunityDesign } from "../types";
-import { FACADES, UNIT_LABELS, amenityKind, landAreaSqYards, landMeters } from "./community";
+import { FACADES, UNIT_LABELS, amenityFootprint, amenityKind, landAreaSqYards, landMeters, undergroundDepth, undergroundRamp } from "./community";
 import { computeTakeoff, type TakeoffResult } from "./takeoff";
 import { communityReviewFindings } from "./review";
 import { analyzeCommunity } from "./structural";
@@ -45,13 +45,15 @@ export function buildNotesText({ projectName, design, takeoff }: NotesContext): 
 
   lines.push("## Parking & basement");
   lines.push(pad("Parking type", design.parking.mode === "none" ? "None" : design.parking.mode === "surface" ? "Surface" : "Underground"));
-  if (design.parking.underground) {
+  if (design.parking.mode === "underground" && design.parking.underground) {
     const u = design.parking.underground;
+    const ramp = undergroundRamp(u);
     lines.push(pad("Basement levels", `${u.levels}`));
-    lines.push(pad("Clear height / level", `${u.floorHeight} m`));
+    lines.push(pad("Basement storey height", `${u.floorHeight} m`));
+    lines.push(pad("First parking deck depth", `${ramp.rise.toFixed(2)} m`));
     lines.push(pad("Foundation depth", `${u.foundationDepth} m`));
-    lines.push(pad("Excavation depth", `${(u.levels * u.floorHeight + u.foundationDepth).toFixed(1)} m`));
-    lines.push(pad("Ramp", `${u.rampWidth} m wide × ${u.rampLength} m @ ${u.rampSlope}%`));
+    lines.push(pad("Excavation depth", `${undergroundDepth(u).toFixed(1)} m`));
+    lines.push(pad("Ramp", `${ramp.width} m wide × ${ramp.length} m horizontal run @ ${ramp.slope}%`));
     lines.push(pad("Lift / stair lobby", `${u.liftLobby ? "Yes" : "No"} / ${u.stairLobby ? "Yes" : "No"}`));
   }
   lines.push(pad("Parking bays", `${t.summary.parkingBays}`));
@@ -71,7 +73,9 @@ export function buildNotesText({ projectName, design, takeoff }: NotesContext): 
     lines.push("## Ground-floor amenities");
     design.amenities.forEach((a) => {
       const k = amenityKind(a.kind);
-      lines.push(`- ${a.label ?? k?.label ?? a.kind} — ${a.w} × ${a.d} m`);
+      const footprint = amenityFootprint(a);
+      const size = footprint.diameter === undefined ? `${footprint.w} × ${footprint.d} m` : `Ø ${footprint.diameter} m`;
+      lines.push(`- ${a.label ?? k?.label ?? a.kind} — ${size}`);
     });
     lines.push("");
   }

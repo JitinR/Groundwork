@@ -38,6 +38,20 @@ test("every exported page remains visibly schematic and not for construction eve
   }
 });
 
+test("renumbered stock sheets retain their cover, takeoff, and schedule content", () => {
+  const design = defaultDesign();
+  design.furniture.push({ id: "desk-1", type: "desk", name: "Authored review desk", x: 0, z: 0, rotationDeg: 0, scale: 1, color: "#687b74" });
+  const docs = defaultDocumentation();
+  const numbers = new Map([["sheet-cover", "COVER-A"], ["sheet-boq", "Q-501A"], ["sheet-schedule", "SCHED-A"]]);
+  docs.sheets = docs.sheets.filter(sheet => numbers.has(sheet.id)).map(sheet => ({ ...sheet, number: numbers.get(sheet.id)! }));
+  design.documentation = docs;
+  const pages = pdfPages(buildSheetPdf("Renumbered", design));
+  assert.ok(pages.some(page => page.includes("COVER-A") && page.includes("SHEET INDEX")));
+  assert.ok(pages.some(page => page.includes("Q-501A") && page.includes("Room 6 x 4 m") && page.includes("Authored review desk")));
+  assert.ok(pages.some(page => page.includes("SCHED-A") && page.includes("STANDARDS SCREENING")));
+  assert.ok(pages.some(page => page.includes("SCHED-A") && page.includes("COORDINATION SCHEDULE - LIVE MODEL SCHEDULE")));
+});
+
 test("authored CAD is drawn on supported views while undefined sections remain explicit", () => {
   const design = defaultDesign();
   design.drafts = [createCadObject("wall")];

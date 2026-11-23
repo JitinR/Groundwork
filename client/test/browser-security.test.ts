@@ -3,7 +3,7 @@ import { test } from "node:test";
 import JSZip from "jszip";
 import { BcfImportLimitError, inflateBcfArchive, MAX_BCF_XML_BYTES } from "../src/lib/bcfArchive.ts";
 import { captureAuthenticationFences, captureLocalWrite, confirmLocalSignOut, fenceLocalAccount, localAccountFence, localWriteAllowed, registerLocalDraftFlush, resumeAuthenticatedLocalAccount, resumeLocalAccount, subscribeLocalDataFence, synchronizeLocalAccountFence } from "../src/lib/localDataFence.ts";
-import { exportAccountDrafts, persistPendingDraft, readPendingDraftResult, removeAccountDrafts, type PendingDraft } from "../src/lib/offlineDraft.ts";
+import { draftMatchesSavedProject, exportAccountDrafts, persistPendingDraft, readPendingDraftResult, removeAccountDrafts, type PendingDraft } from "../src/lib/offlineDraft.ts";
 import { recoverLocalAccountAfterSignIn, signOutAccount } from "../src/lib/signOutAccount.ts";
 import { offlineQueueStore } from "../src/lib/offlineQueue.ts";
 import { offlineProjectStore } from "../src/lib/offlineProjectStore.ts";
@@ -198,6 +198,59 @@ test("interrupted queued sends retain their bodies for revision-checked recovery
   assert.equal(pending[0].expectedRevision, 3);
 });
 
+test("discarding project edits removes interrupted saves without touching other projects or accounts", async () => {
+  const userId = "discard-queued-edit";
+  const discarded = await offlineQueueStore.enqueue(userId, "project", "project_save", { name: "discarded" }, 3);
+  await offlineQueueStore.updateStatus(discarded.id, "syncing");
+  const otherProject = await offlineQueueStore.enqueue(userId, "other-project", "project_save", { name: "kept" }, 3);
+  const otherAccount = await offlineQueueStore.enqueue("keep-queued-edit", "project", "project_save", { name: "kept" }, 3);
+  await offlineSyncManager.discardProjectSaves(userId, "project");
+  assert.deepEqual((await offlineQueueStore.getPendingQueue(userId)).map(item => item.id), [otherProject.id]);
+  assert.deepEqual((await offlineQueueStore.getPendingQueue("keep-queued-edit")).map(item => item.id), [otherAccount.id]);
+});
+
+test("offline sync saves the exact draft through the flat project API and acknowledges the new revision", async () => {
+  const userId = "offline-sync-success", projectId = "project", originalFetch = globalThis.fetch;
+  const pending = { ...draft("synced edit"), baseRevision: 3 };
+  const designData = JSON.stringify(pending.design);
+  const queued = await offlineQueueStore.enqueue(userId, projectId, "project_save", {
+    name: pending.name, projectType: pending.projectType, widthMm: 4200, depthMm: 3700, designData, design: pending.design,
+  }, pending.baseRevision);
+  const oldProject = { id: projectId, name: "server", projectType: pending.projectType, revision: 3, role: "editor", updatedAt: 1, design: null };
+  let body: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (input, init) => {
+    if (String(input) === "/api/auth/me") return Response.json({ user: { id: userId } });
+    assert.equal(String(input), "/api/projects/project");
+    if (init?.method !== "PATCH") return Response.json(oldProject);
+    body = JSON.parse(String(init.body));
+    return Response.json({ ok: true, revision: 4 });
+  }) as typeof fetch;
+  let unsubscribeStatus: () => void = () => undefined;
+  let acknowledge: { revision: number; exact: boolean; newer: boolean } | undefined;
+  const unsubscribeSave = offlineSyncManager.subscribeProjectSaves((accountId, project, design) => {
+    assert.equal(accountId, userId);
+    acknowledge = {
+      revision: project.revision,
+      exact: draftMatchesSavedProject(pending, { ...project, design }),
+      newer: draftMatchesSavedProject({ ...pending, name: "newer unsaved edit" }, { ...project, design }),
+    };
+  });
+  try {
+    offlineSyncManager.setActiveUser(userId);
+    await new Promise<void>(resolve => {
+      unsubscribeStatus = offlineSyncManager.subscribe(status => { if (!status.isSyncing) resolve(); });
+    });
+    assert.deepEqual(body, { name: pending.name, projectType: pending.projectType, widthMm: 4200, depthMm: 3700, designData, baseRevision: 3, expectedAccountId: userId });
+    assert.deepEqual(acknowledge, { revision: 4, exact: true, newer: false });
+    assert.equal((await offlineQueueStore.listQueue(userId)).find(item => item.id === queued.id)?.status, "completed");
+    const cached = await offlineProjectStore.getCachedProject(userId, projectId);
+    assert.equal(cached?.revision, 4);
+    assert.equal(cached?.role, "editor");
+  } finally {
+    unsubscribeSave(); unsubscribeStatus(); offlineSyncManager.setActiveUser(null); globalThis.fetch = originalFetch;
+  }
+});
+
 test("a delayed synchronization response cannot recreate data after removal and resume", async () => {
   const userId = "late-sync", projectId = "project", originalFetch = globalThis.fetch;
   const body = draft("late response");
@@ -211,7 +264,7 @@ test("a delayed synchronization response cannot recreate data after removal and 
       // Deliberately ignore AbortSignal: a completed network response can still be delayed.
       return new Promise<Response>(resolve => { finishPatch = resolve; });
     }
-    return Response.json({ project: { id: projectId, name: "server", revision: 3, projectType: "house" } });
+    return Response.json({ id: projectId, name: "server", revision: 3, projectType: "house" });
   }) as typeof fetch;
   let unsubscribe: () => void = () => undefined;
   try {

@@ -1,4 +1,4 @@
-import type { Design, ProjectType } from "../types";
+import type { Design, ProjectDetail, ProjectType } from "../types";
 import { PROJECT_TYPE_LABELS } from "../types";
 import { captureLocalWrite, localAccountFence, subscribeLocalDataFence } from "./localDataFence";
 
@@ -21,6 +21,12 @@ export interface PendingDraft {
 export interface DraftStorageResult { stored: boolean; durable: boolean; error?: string; }
 export interface DraftReadResult { draft: PendingDraft | null; source: "durable" | "session" | "memory" | null; error?: string; }
 export const MAX_DRAFT_CHARACTERS = 4_000_000;
+
+/** A later server revision acknowledges this exact draft; preserve any different local edit. */
+export function draftMatchesSavedProject(draft: PendingDraft, project: Pick<ProjectDetail, "revision" | "name" | "projectType" | "design">): boolean {
+  return project.revision > draft.baseRevision && project.name === draft.name
+    && project.projectType === draft.projectType && JSON.stringify(project.design) === JSON.stringify(draft.design);
+}
 const PREFIX = "groundwork:draft:v2:";
 const TAB_KEY = "groundwork:recovery-tab";
 const memory = new Map<string, PendingDraft>();

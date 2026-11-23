@@ -1,6 +1,6 @@
 import type { MepDesign, MepElement, ReviewMarker } from "../types";
 import type { CommunityReviewInput, InfraReviewInput } from "./reviewWorkerProtocol";
-import { amenityKind, towerMeters } from "./community";
+import { amenityFootprint, amenityKind, towerMeters } from "./community";
 import { SpatialHash2D } from "./performance";
 
 export interface ReviewFinding {
@@ -115,17 +115,14 @@ export function communityReviewFindings(design: CommunityReviewInput): ReviewFin
       const size = towerMeters(tower);
       return { id: tower.id, label: tower.label, x: tower.x, z: tower.z, w: size.w, d: size.d, rotationDeg: tower.rotY ?? 0, minY: 0, maxY: size.h };
     }),
-    ...design.amenities.map((amenity) => ({
-      id: amenity.id,
-      label: amenity.label ?? amenityKind(amenity.kind)?.label ?? amenity.kind,
-      x: amenity.x,
-      z: amenity.z,
-      w: amenity.w,
-      d: amenity.d,
-      rotationDeg: amenity.rotY,
-      minY: 0,
-      maxY: amenity.h,
-    })),
+    ...design.amenities.map((amenity) => {
+      const { w, d } = amenityFootprint(amenity);
+      return {
+        id: amenity.id,
+        label: amenity.label ?? amenityKind(amenity.kind)?.label ?? amenity.kind,
+        x: amenity.x, z: amenity.z, w, d, rotationDeg: amenity.rotY, minY: 0, maxY: amenity.h,
+      };
+    }),
   ];
   const findings: ReviewFinding[] = [];
   for (const [a, b] of footprintPairs(objects)) {

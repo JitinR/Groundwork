@@ -10,8 +10,11 @@ import { ViewportGizmo3D } from "../components/ViewportGizmo3D";
 import type { CadTool } from "../components/CadToolPalette";
 import type { AmenityData, BuildingLevel, CommunityDesign, DraftElement, DraftElementKind, ExteriorPanel, InteriorRoom, StructuralGridLine, TowerData, TowerOpening, VisualizationSettings } from "../types";
 import { addTechnicalEdges, disposeObject3D, material, prism, prismAt } from "../lib/modelcore";
-import { amenityKind, facadeOption, landMeters, levelsForDesign, towerMeters, undergroundDepth } from "../lib/community";
-import { pitFootprint } from "../lib/takeoff";
+import {
+  BASEMENT_RAMP_DECK_M, BASEMENT_RAMP_EDGE_HEIGHT_M, BASEMENT_RAMP_EDGE_WIDTH_M,
+  amenityFootprint, amenityKind, facadeOption, landMeters, levelsForDesign, pitFootprint,
+  towerMeters, undergroundDepth, undergroundParkingBayLayout, undergroundRamp,
+} from "../lib/community";
 import { buildMapGround } from "../lib/mapGround";
 import { sectionClippingPlanes } from "../lib/section";
 import { constrainDraftEnd, constrainedDraftSize, draftingSettings, snapDraftPoint, solveDraftConstraintGraph } from "../lib/drafting";
@@ -107,8 +110,7 @@ function buildAmenityMesh(a: AmenityData): THREE.Group {
   }
 
   const kk = k ?? amenityKind("lawn")!;
-  const w = a.w;
-  const d = a.d;
+  const { w, d } = amenityFootprint(a);
   const mat = material(kk.color);
   switch (kk.shape) {
     case "court": {
@@ -211,7 +213,7 @@ function buildAmenityMesh(a: AmenityData): THREE.Group {
     }
     case "circle": {
       const disc = new THREE.Mesh(
-        new THREE.CylinderGeometry(Math.min(w, d) / 2, Math.min(w, d) / 2, Math.max(a.h, 0.12), 48),
+        new THREE.CylinderGeometry(w / 2, w / 2, Math.max(a.h, 0.12), 48),
         mat,
       );
       disc.position.y = Math.max(a.h, 0.12) / 2;
@@ -225,8 +227,8 @@ function buildAmenityMesh(a: AmenityData): THREE.Group {
   g.rotation.y = (a.rotY * Math.PI) / 180;
   g.userData.selectId = a.id;
   g.userData.selectKind = "amenity";
-  g.userData.selW = a.w;
-  g.userData.selD = a.d;
+  g.userData.selW = w;
+  g.userData.selD = d;
   return g;
 }
 
@@ -498,24 +500,36 @@ function buildSite(design: CommunityDesign, selectedId?: string | null, visualiz
   const activeLevelIndex = Math.max(0, levels.findIndex((level) => level.id === design.activeLevelId));
   const activeLevel = levels[activeLevelIndex] ?? levels[0];
 
-  /* Natural ground slab & open-world surrounding terrain */
-  const ground = prism(W, 0.6, D, material("#6b7280", { rough: 0.95 }));
-  ground.position.y = -0.3;
-  g.add(ground);
-
-  // Expansive open-world lawn perimeter
-  const lawn = prism(W + 18, 0.12, D + 18, material("#2e6b35", { rough: 0.85 }));
-  lawn.position.y = -0.06;
-  lawn.receiveShadow = true;
-  lawn.userData.noSelect = true;
-  g.add(lawn);
-
-  // Surrounding access roadway perimeter with realistic dark asphalt
-  const road = prism(W + 38, 0.08, D + 38, material("#1e293b", { rough: 0.7 }));
-  road.position.y = -0.1;
-  road.receiveShadow = true;
-  road.userData.noSelect = true;
-  g.add(road);
+  /* Leave an opening through the visual ground layers along the authored ramp. */
+  const parking = design.parking.mode === "underground" ? design.parking.underground : undefined;
+  const pit = parking ? pitFootprint(design) : undefined;
+  const ramp = parking ? undergroundRamp(parking) : undefined;
+  const trench = pit && ramp ? {
+    minX: pit.x + pit.w / 2,
+    maxX: pit.x + pit.w / 2 + ramp.length,
+    minZ: pit.z - ramp.width / 2 - BASEMENT_RAMP_EDGE_WIDTH_M,
+    maxZ: pit.z + ramp.width / 2 + BASEMENT_RAMP_EDGE_WIDTH_M,
+  } : undefined;
+  const groundLayer = (w: number, d: number, y: number, h: number, mat: THREE.Material) => {
+    const add = (minX: number, maxX: number, minZ: number, maxZ: number) => {
+      if (maxX > minX && maxZ > minZ) g.add(prismAt((minX + maxX) / 2, y, (minZ + maxZ) / 2, maxX - minX, h, maxZ - minZ, mat));
+    };
+    const minX = Math.max(-w / 2, trench?.minX ?? w / 2);
+    const maxX = Math.min(w / 2, trench?.maxX ?? -w / 2);
+    const minZ = Math.max(-d / 2, trench?.minZ ?? d / 2);
+    const maxZ = Math.min(d / 2, trench?.maxZ ?? -d / 2);
+    if (minX >= maxX || minZ >= maxZ) {
+      add(-w / 2, w / 2, -d / 2, d / 2);
+      return;
+    }
+    add(-w / 2, minX, -d / 2, d / 2);
+    add(maxX, w / 2, -d / 2, d / 2);
+    add(minX, maxX, -d / 2, minZ);
+    add(minX, maxX, maxZ, d / 2);
+  };
+  groundLayer(W, D, -0.3, 0.6, material("#6b7280", { rough: 0.95 }));
+  groundLayer(W + 18, D + 18, -0.06, 0.12, material("#2e6b35", { rough: 0.85 }));
+  groundLayer(W + 38, D + 38, -0.1, 0.08, material("#1e293b", { rough: 0.7 }));
 
   g.add(buildTerrainVisualization(W, D, design.terrain));
 
@@ -644,19 +658,35 @@ function buildUnderground(design: CommunityDesign): THREE.Group {
 
   const pit = pitFootprint(design);
   const depth = undergroundDepth(ug);
+  const layout = undergroundParkingBayLayout(design);
+  const ramp = undergroundRamp(ug);
+  const rampStartX = pit.x + pit.w / 2;
+  const openingHalfWidth = Math.min(pit.d / 2, ramp.width / 2 + BASEMENT_RAMP_EDGE_WIDTH_M);
   const soilMat = material("#8d6e63", { rough: 1 });
 
   /* Pit side walls (the excavated earth) */
   g.add(prismAt(pit.x, -depth / 2, pit.z - pit.d / 2, pit.w + 1.2, depth, 1.2, soilMat));
   g.add(prismAt(pit.x, -depth / 2, pit.z + pit.d / 2, pit.w + 1.2, depth, 1.2, soilMat));
   g.add(prismAt(pit.x - pit.w / 2, -depth / 2, pit.z, 1.2, depth, pit.d, soilMat));
-  g.add(prismAt(pit.x + pit.w / 2, -depth / 2, pit.z, 1.2, depth, pit.d, soilMat));
+  const flankingWallDepth = pit.d / 2 - openingHalfWidth;
+  if (flankingWallDepth > 0) {
+    for (const side of [-1, 1]) {
+      const wallZ = pit.z + side * (openingHalfWidth + flankingWallDepth / 2);
+      g.add(prismAt(rampStartX, -depth / 2, wallZ, 1.2, depth, flankingWallDepth, soilMat));
+    }
+  }
+  if (depth > ramp.rise) {
+    const sillDepth = depth - ramp.rise;
+    g.add(prismAt(rampStartX, -ramp.rise - sillDepth / 2, pit.z, 1.2, sillDepth, openingHalfWidth * 2, soilMat));
+  }
 
   /* Basement floor slabs, one per level */
-  for (let i = 0; i < ug.levels; i++) {
-    const topY = -(0.25 + i * ug.floorHeight);
+  for (let i = 0; i < layout.levels; i++) {
+    const topY = -(ramp.rise + i * ug.floorHeight);
+    const wallHeight = i === 0 ? ramp.rise : ug.floorHeight - 0.3;
     const slab = prism(pit.w, 0.3, pit.d, material("#9e9e9e", { rough: 0.8 }));
-    slab.position.set(pit.x, topY, pit.z);
+    slab.name = "basement-floor-" + (i + 1);
+    slab.position.set(pit.x, topY - 0.15, pit.z);
     g.add(slab);
 
     /* Pillars */
@@ -665,8 +695,8 @@ function buildUnderground(design: CommunityDesign): THREE.Group {
     const pw = 0.5;
     for (let px = pxStart; px <= pit.x + pit.w / 2 - ug.pillarSpacingX * 0.5; px += ug.pillarSpacingX) {
       for (let pz = pzStart; pz <= pit.z + pit.d / 2 - ug.pillarSpacingZ * 0.5; pz += ug.pillarSpacingZ) {
-        const col = prism(pw, ug.floorHeight - 0.3, pw, material("#cfd8dc", { rough: 0.7 }));
-        col.position.set(px, topY - 0.15 + (ug.floorHeight - 0.3) / 2, pz);
+        const col = prism(pw, wallHeight, pw, material("#cfd8dc", { rough: 0.7 }));
+        col.position.set(px, topY + wallHeight / 2, pz);
         g.add(col);
       }
     }
@@ -675,57 +705,55 @@ function buildUnderground(design: CommunityDesign): THREE.Group {
     const bayDrawW = ug.bayWidth;
     const bayDrawD = ug.bayLength;
     const carMat = material("#4fc3f7", { trans: 0.55, rough: 0.4 });
-    const usedCols = Math.min(ug.bayCols, Math.max(1, Math.floor(pit.w / (bayDrawW + 0.6))));
-    const usedRows = Math.min(ug.bayRows, Math.max(1, Math.floor(pit.d / (bayDrawD + 1))));
-    const bxStart = pit.x - ((usedCols - 1) * (bayDrawW + 0.6)) / 2;
-    const bzStart = pit.z - ((usedRows - 1) * (bayDrawD + 1)) / 2;
-    for (let r = 0; r < usedRows; r++) {
-      for (let c = 0; c < usedCols; c++) {
+    const bxStart = pit.x - ((layout.cols - 1) * layout.pitchX) / 2;
+    const bzStart = pit.z - ((layout.rows - 1) * layout.pitchZ) / 2;
+    for (let r = 0; r < layout.rows; r++) {
+      for (let c = 0; c < layout.cols; c++) {
         const bay = prism(bayDrawW * 0.9, 0.1, bayDrawD * 0.95, carMat);
-        bay.position.set(bxStart + c * (bayDrawW + 0.6), topY + 0.16, bzStart + r * (bayDrawD + 1));
+        bay.name = "basement-parking-bay";
+        bay.position.set(bxStart + c * layout.pitchX, topY + 0.05, bzStart + r * layout.pitchZ);
         g.add(bay);
       }
     }
 
     /* Lift lobby (centred on one side) */
     if (ug.liftLobby) {
-      const lobby = prism(4, ug.floorHeight - 0.3, 3, material("#eceff1", { rough: 0.6 }));
-      lobby.position.set(pit.x, topY - 0.15 + (ug.floorHeight - 0.3) / 2, pit.z + pit.d / 2 - 2);
+      const lobby = prism(4, wallHeight, 3, material("#eceff1", { rough: 0.6 }));
+      lobby.position.set(pit.x, topY + wallHeight / 2, pit.z + pit.d / 2 - 2);
       g.add(lobby);
-      const lift = prism(2.4, ug.floorHeight - 0.5, 2, material("#455a64", { metal: 0.5, rough: 0.4 }));
-      lift.position.set(pit.x, topY - 0.1 + (ug.floorHeight - 0.4) / 2, pit.z + pit.d / 2 - 2.2);
+      const liftHeight = Math.max(0.1, wallHeight - 0.2);
+      const lift = prism(2.4, liftHeight, 2, material("#455a64", { metal: 0.5, rough: 0.4 }));
+      lift.position.set(pit.x, topY + liftHeight / 2, pit.z + pit.d / 2 - 2.2);
       g.add(lift);
     }
 
     /* Stair lobby (opposite side) */
     if (ug.stairLobby) {
-      const lobby = prism(3.4, ug.floorHeight - 0.3, 3.4, material("#f5f5f5", { rough: 0.6 }));
-      lobby.position.set(pit.x, topY - 0.15 + (ug.floorHeight - 0.3) / 2, pit.z - pit.d / 2 + 2.4);
+      const lobby = prism(3.4, wallHeight, 3.4, material("#f5f5f5", { rough: 0.6 }));
+      lobby.position.set(pit.x, topY + wallHeight / 2, pit.z - pit.d / 2 + 2.4);
       g.add(lobby);
     }
   }
 
-  /* Entry/exit ramp from grade down to the top basement slab */
-  const topSlabY = -(0.25 + 0 * ug.floorHeight) - 0.15;
-  const rampAngle = Math.atan2(Math.abs(topSlabY) + 0.6, ug.rampLength > 0 ? ug.rampLength : 24);
-  const rampStarts = { x: pit.x + pit.w / 2, z: pit.z };
-  const ramp = new THREE.Mesh(
-    new THREE.BoxGeometry(ug.rampWidth, 0.4, ug.rampLength),
-    material("#bdbdbd", { rough: 0.7 }),
-  );
-  ramp.position.set(rampStarts.x + ug.rampLength / 2, -Math.abs(topSlabY) / 2 - 0.2, rampStarts.z);
-  ramp.rotation.z = rampAngle;
-  ramp.userData.noSelect = true;
-  g.add(ramp);
-
-  /* Ramp retaining edges */
-  const edgeA = prism(0.3, 0.7, ug.rampLength, material("#8d6e63"));
-  edgeA.position.set(rampStarts.x + ug.rampLength / 2, -Math.abs(topSlabY) / 2 - 0.4, rampStarts.z - ug.rampWidth / 2 - 0.15);
-  edgeA.rotation.z = rampAngle;
-  const edgeB = prism(0.3, 0.7, ug.rampLength, material("#8d6e63"));
-  edgeB.position.set(rampStarts.x + ug.rampLength / 2, -Math.abs(topSlabY) / 2 - 0.4, rampStarts.z + ug.rampWidth / 2 + 0.15);
-  edgeB.rotation.z = rampAngle;
-  g.add(edgeA, edgeB);
+  // Shear each box along the travel axis so both end faces stay vertical and meet their landings.
+  const rampPart = (width: number, height: number, offsetZ: number, topOffset: number, mat: THREE.Material) => {
+    const mesh = prism(ramp.length, height, width, mat);
+    const positions = mesh.geometry.getAttribute("position");
+    for (let vertex = 0; vertex < positions.count; vertex++) {
+      positions.setY(vertex, positions.getY(vertex) + positions.getX(vertex) * ramp.rise / ramp.length);
+    }
+    positions.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+    mesh.position.set(rampStartX + ramp.length / 2, -ramp.rise / 2 + topOffset - height / 2, pit.z + offsetZ);
+    return mesh;
+  };
+  const deck = rampPart(ramp.width, BASEMENT_RAMP_DECK_M, 0, 0, material("#bdbdbd", { rough: 0.7 }));
+  deck.name = "basement-entry-ramp";
+  g.add(deck);
+  for (const side of [-1, 1]) {
+    const edgeOffset = side * (ramp.width / 2 + BASEMENT_RAMP_EDGE_WIDTH_M / 2);
+    g.add(rampPart(BASEMENT_RAMP_EDGE_WIDTH_M, BASEMENT_RAMP_EDGE_HEIGHT_M, edgeOffset, BASEMENT_RAMP_EDGE_HEIGHT_M, soilMat));
+  }
 
   return g;
 }
