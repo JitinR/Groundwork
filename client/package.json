@@ -20,14 +20,14 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",
-    "@types/google.maps": "^3.66.10",
+    "@types/google.maps": "^3.67.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@types/three": "^0.187.0",
     "@vitejs/plugin-react": "^6.3.0",
     "tailwindcss": "^4.1.0",
     "typescript": "~7.0.2",
-    "vite": "^8.3.7"
+    "vite": "^8.3.8"
   },
   "engines": {
     "node": ">=22.12.0 <23"
