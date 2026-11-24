@@ -32,7 +32,7 @@ interface Canvas3DProps {
   showPhoto: boolean;
   photoOpacity: number;
   selectedId: string | null;
-  onChange: (design: Design) => void;
+  onChange?: (design: Design) => void;
   onSelect: (id: string | null) => void;
   onApiReady: (api: EditorApi | null) => void;
 }
@@ -339,6 +339,8 @@ export function Canvas3D({
         onSelectRef.current(null);
         return;
       }
+      onSelectRef.current(itemId);
+      if (!onChangeRef.current) return;
       const item = designRef.current.furniture.find((f) => f.id === itemId);
       const mount = item?.mount ?? furnitureMount(item?.type ?? "");
       const wall = item?.mountWall ?? "north";
@@ -365,7 +367,6 @@ export function Canvas3D({
           dragState.current.offset.subVectors(group.group.position, planeHit);
         }
       }
-      onSelectRef.current(itemId);
     };
 
     const onPointerMove = (e: PointerEvent) => {
@@ -755,7 +756,7 @@ export function Canvas3D({
     const patches = new Map(pendingItemPatches.current);
     pendingItemPatches.current.clear();
     const d = designRef.current;
-    onChangeRef.current({
+    onChangeRef.current?.({
       ...d,
       furniture: d.furniture.map((f) => {
         const patch = patches.get(f.id);

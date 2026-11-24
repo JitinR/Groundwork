@@ -259,6 +259,34 @@ class OfflineQueueStore {
     }
   }
 
+  /** Remove unsaved project edits while the caller holds the replay lock. */
+  async discardProjectSaves(userId: string, projectId: string): Promise<void> {
+    const write = captureLocalWrite(userId);
+    const isUnsavedProjectEdit = (item: OfflineQueueItem) => item.userId === userId
+      && item.projectId === projectId && item.type === "project_save" && item.status !== "completed";
+    if (write === null) throw new Error("Local changes cannot be discarded during sign-out.");
+    if (typeof window !== "undefined" && "indexedDB" in window) {
+      const db = await this.getDB();
+      await new Promise<void>((resolve, reject) => {
+        const transaction = db.transaction(STORE_QUEUE, "readwrite");
+        const store = transaction.objectStore(STORE_QUEUE);
+        const request = store.index("by_user_project").getAll([userId, projectId]);
+        request.onsuccess = () => {
+          if (!localWriteAllowed(userId, write)) { transaction.abort(); return; }
+          for (const item of request.result as OfflineQueueItem[]) {
+            if (isUnsavedProjectEdit(item)) store.delete(item.id);
+          }
+        };
+        transaction.oncomplete = () => resolve();
+        transaction.onabort = () => reject(transaction.error ?? new Error("Discarding the queued changes was interrupted."));
+        transaction.onerror = () => reject(transaction.error);
+      });
+    }
+    for (const [id, item] of this.memoryQueue) {
+      if (isUnsavedProjectEdit(item)) this.memoryQueue.delete(id);
+    }
+  }
+
   /**
    * Clean up all completed and superseded items for the user.
    */

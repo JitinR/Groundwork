@@ -4,6 +4,7 @@ import {
   createHash,
   hkdfSync,
   randomBytes,
+  scrypt,
   scryptSync,
   timingSafeEqual,
 } from "node:crypto";
@@ -12,6 +13,7 @@ export const SCRYPT_N = 16384;
 export const SCRYPT_R = 8;
 export const SCRYPT_P = 1;
 export const SCRYPT_KEYLEN = 64;
+const scryptOptions = { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P };
 
 export function randomToken(bytes = 32): string {
   return randomBytes(bytes).toString("hex");
@@ -27,23 +29,26 @@ export function sha256Hex(input: string | Buffer): string {
 
 export function hashPassword(password: string): { salt: string; hash: string } {
   const salt = randomBytes(16).toString("hex");
-  const hash = scryptSync(password, salt, SCRYPT_KEYLEN, {
-    N: SCRYPT_N,
-    r: SCRYPT_R,
-    p: SCRYPT_P,
-  }).toString("hex");
+  const hash = scryptSync(password, salt, SCRYPT_KEYLEN, scryptOptions).toString("hex");
   return { salt, hash };
 }
 
 export function verifyPassword(password: string, salt: string, hashHex: string): boolean {
   const expected = Buffer.from(hashHex, "hex");
   if (expected.length === 0) return false;
-  const actual = scryptSync(password, salt, expected.length, {
-    N: SCRYPT_N,
-    r: SCRYPT_R,
-    p: SCRYPT_P,
+  const actual = scryptSync(password, salt, expected.length, scryptOptions);
+  return timingSafeEqual(actual, expected);
+}
+
+export async function verifyPasswordAsync(password: string, salt: string, hashHex: string): Promise<boolean> {
+  const expected = Buffer.from(hashHex, "hex");
+  if (!expected.length) return false;
+  const actual = await new Promise<Buffer>((resolve, reject) => {
+    scrypt(password, salt, expected.length, scryptOptions, (error, key) => {
+      if (error) reject(error);
+      else resolve(key);
+    });
   });
-  if (actual.length !== expected.length) return false;
   return timingSafeEqual(actual, expected);
 }
 

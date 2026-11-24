@@ -1,7 +1,7 @@
 import type { Design, InfraDesign, CommunityDesign, DocumentationMetadata, DocumentationSheet, DocumentationView } from "../types";
 import { computeTakeoff, type TakeoffItem } from "./takeoff";
 import { computeInfraTakeoff, INFRA_LABELS, type InfraTakeoffItem } from "./infra";
-import { landMeters, towerMeters } from "./community";
+import { amenityFootprint, landMeters, towerMeters } from "./community";
 import { documentationFor, documentationIssues } from "./documentation";
 import { buildDocumentationSchedule, documentationInventory, scheduleCellText, type ScheduleResult } from "./documentationSchedule";
 import { validateDesign } from "./compliance";
@@ -39,6 +39,17 @@ function line(page: PdfPage, x1: number, y1: number, x2: number, y2: number, gra
 }
 function box(page: PdfPage, x: number, y: number, w: number, h: number, gray = 0.35) {
   command(page, `${gray} G ${num(x)} ${num(y)} ${num(w)} ${num(h)} re S`);
+}
+function circle(page: PdfPage, x: number, y: number, r: number, gray = 0.35) {
+  const control = r * 0.5522847498;
+  const point = (dx: number, dy: number) => `${num(x + dx)} ${num(y + dy)}`;
+  command(page, [
+    `${gray} G ${point(r, 0)} m`,
+    `${point(r, control)} ${point(control, r)} ${point(0, r)} c`,
+    `${point(-control, r)} ${point(-r, control)} ${point(-r, 0)} c`,
+    `${point(-r, -control)} ${point(-control, -r)} ${point(0, -r)} c`,
+    `${point(control, -r)} ${point(r, -control)} ${point(r, 0)} c S`,
+  ].join(" "));
 }
 function fill(page: PdfPage, x: number, y: number, w: number, h: number, gray = 0.96) {
   command(page, `${gray} g ${num(x)} ${num(y)} ${num(w)} ${num(h)} re f 0 g 0 G`);
@@ -156,7 +167,14 @@ function communityPages(page: PdfPage, design: CommunityDesign, sheet: string) {
     design.amenities.forEach((amenity) => {
       const x = ox + (amenity.x + land.w / 2) * scale;
       const y = oy + (amenity.z + land.d / 2) * scale;
-      box(page, x, y, Math.max(amenity.w * scale, 5), Math.max(amenity.d * scale, 5), 0.45);
+      const { w, d, diameter } = amenityFootprint(amenity);
+      if (diameter !== undefined) {
+        circle(page, x, y, diameter * scale / 2, 0.45);
+      } else {
+        const width = Math.max(w * scale, 5);
+        const depth = Math.max(d * scale, 5);
+        box(page, x - width / 2, y - depth / 2, width, depth, 0.45);
+      }
       text(page, amenity.label || amenity.kind, x + 3, y + 3, 6);
     });
     text(page, "N", 575, 450, 12, true); line(page, 580, 430, 580, 455, 0.2);
@@ -299,8 +317,14 @@ function buildPages(projectName: string, design: Design): PdfPage[] {
     : infraTakeoff ? { items: infraTakeoff.items, summary: infraTakeoff.summary.map(s => `${s.label}: ${s.value}`) }
     : { items: design.furniture.map(f => ({ key: f.id, group: "Furniture", label: f.name, qty: 1, unit: "nos", basis: "Stored catalog item" })), summary: [`Room ${design.room.widthMm / 1000} x ${design.room.depthMm / 1000} m`] };
   const sheets: DocumentationSheet[] = docs.sheets.length ? docs.sheets : [{ id: "empty-sheet-index", number: "G-001", name: "Documentation index", viewIds: [] }];
+  // Older or imported documents can use custom IDs with the original special sheet numbers.
+  const legacySheetIds = new Map([["G-001", "sheet-cover"], ["Q-501", "sheet-boq"], ["S-401", "sheet-schedule"]]);
+  const specialSheetIds = new Set(legacySheetIds.values());
+  const sheetIds = new Set(sheets.map(sheet => sheet.id));
   for (const sheet of sheets) {
-    if (sheet.number === "G-001") {
+    const legacyId = legacySheetIds.get(sheet.number);
+    const sheetKind = legacyId && !specialSheetIds.has(sheet.id) && !sheetIds.has(legacyId) ? legacyId : sheet.id;
+    if (sheetKind === "sheet-cover") {
       const p = page(sheet);
       text(p, safe(projectName).toUpperCase().slice(0, 40), 90, 385, 25, true); text(p, "SCHEMATIC REVIEW SET - NOT FOR CONSTRUCTION", 90, 355, 13);
       text(p, `${docs.status.toUpperCase()} | ${docs.views.filter(view => view.visible).length} visible views | ${docs.schedules.length} schedules`, 90, 320, 9);
@@ -311,7 +335,7 @@ function buildPages(projectName: string, design: Design): PdfPage[] {
       listPages(sheet, "Sheet index", docs.sheets.map(item => `${item.number} ${item.name} | ${item.viewIds.length} bound view(s)`));
       if (docs.revisions.length) listPages(sheet, "Project revision history", docs.revisions.map(revision => `${revision.number} | ${revision.date} | ${revision.author} | ${revision.description}`));
       notes(sheet);
-    } else if (sheet.number === "Q-501") {
+    } else if (sheetKind === "sheet-boq") {
       for (let start = 0; start < Math.max(takeoff.items.length, 1); start += 18) {
         const p = page(sheet); text(p, takeoff.summary.join(" | ").slice(0, 125), 70, 465, 8, true);
         rows(p, takeoff.items.slice(start, start + 18).map(item => ({ label: item.label, value: `${item.qty} ${item.unit}`, basis: item.basis })), 70, 435, 650);
@@ -319,7 +343,7 @@ function buildPages(projectName: string, design: Design): PdfPage[] {
       notes(sheet);
     } else {
       const views = sheet.viewIds.map(id => docs.views.find(view => view.id === id)).filter((view): view is DocumentationView => Boolean(view));
-      if (!views.length && sheet.number !== "S-401") { const p = page(sheet); text(p, "No model view is bound to this sheet.", 90, 430, 9); notes(sheet); }
+      if (!views.length && sheetKind !== "sheet-schedule") { const p = page(sheet); text(p, "No model view is bound to this sheet.", 90, 430, 9); notes(sheet); }
       for (const view of views) {
         if (view.kind === "schedule") {
           const p = page(sheet, view.name, view);
@@ -353,14 +377,14 @@ function buildPages(projectName: string, design: Design): PdfPage[] {
         }
         if (view.visible) notes(sheet, view);
       }
-      if (sheet.number === "S-401") {
+      if (sheetKind === "sheet-schedule") {
         if (!views.length) notes(sheet);
         if (review.length) listPages(sheet, "Saved coordination review", review.map(marker => `${marker.severity.toUpperCase()}: ${marker.text} (${marker.status})`));
         listPages(sheet, "Standards screening", compliance.issues.map(issue => `${issue.severity.toUpperCase()} / ${issue.category}: ${issue.message} | ${issue.basis}`));
         if (design.visualization?.phases.length) listPages(sheet, "Construction phases", design.visualization.phases.map(phase => `${phase.name} | ${phase.durationDays ?? "-"} days | ${phase.crewSize ?? "-"} crew | ${phase.costEstimate ?? "-"} cost | ${phase.dependsOn?.length ?? 0} dependencies`));
       }
     }
-    if (sheet.scheduleIds !== undefined || sheet.number === "S-401" || sheet.viewIds.some(id => docs.views.find(view => view.id === id)?.kind === "schedule" && docs.views.find(view => view.id === id)?.visible)) liveSchedules(sheet);
+    if (sheet.scheduleIds !== undefined || sheetKind === "sheet-schedule" || sheet.viewIds.some(id => docs.views.find(view => view.id === id)?.kind === "schedule" && docs.views.find(view => view.id === id)?.visible)) liveSchedules(sheet);
   }
   const issues = documentationIssues(design); if (issues.length) listPages(sheets[0], "Documentation binding warnings", issues);
   const provenance = engineeringExchangeProvenance(design.engineeringBasis), basis = provenance.designBasis;

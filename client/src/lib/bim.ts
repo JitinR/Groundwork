@@ -1,8 +1,9 @@
 import type { BuildingLevel, Design, DraftElement, MepElement, ReviewMarker } from "../types";
 import { resolveDraft, resolveRoomOpening, resolveTowerOpening, parametricIssues } from "./parametric";
-import { towerMeters } from "./community";
+import { amenityFootprint, towerMeters, undergroundParkingBayLayout } from "./community";
 import { engineeringExchangeProvenance, engineeringProvenanceAscii } from "./exchangeProvenance";
 import { cadFootprintArea } from "./cadModel";
+import { quoteCsvCell } from "./csv";
 
 export interface ExchangeEntity {
   id: string;
@@ -105,9 +106,10 @@ export function buildBimExchange(design: Design): string {
     for (const draft of c.drafts ?? []) addDraft(draft, "levels" in c && c.levels?.length ? c.levels : design.cad?.levels ?? []);
     if ("amenities" in c) {
       for (const amenity of c.amenities) {
+        const footprint = amenityFootprint(amenity);
         entities.push(entity(amenity.id, "SITE_AMENITY", {
           name: amenity.label ?? amenity.kind,
-          geometry: { kind: amenity.shape ?? "box", xM: amenity.x, zM: amenity.z, widthM: amenity.w, depthM: amenity.d, heightM: amenity.h, rotationDeg: amenity.rotY },
+          geometry: { kind: amenity.shape ?? (footprint.diameter === undefined ? "box" : "circle"), xM: amenity.x, zM: amenity.z, widthM: footprint.w, depthM: footprint.d, diameterM: footprint.diameter, heightM: amenity.h, rotationDeg: amenity.rotY },
           properties: { kind: amenity.kind, approximation: "Parametric site object; verify location and construction details." },
         }));
       }
@@ -149,7 +151,7 @@ export function buildBimExchange(design: Design): string {
       }
       if (c.parking.mode !== "none") {
         entities.push(entity("parking", "PARKING_STRUCTURE", {
-          properties: { mode: c.parking.mode, surfaceBays: c.parking.surfaceBays, underground: c.parking.underground },
+          properties: { mode: c.parking.mode, surfaceBays: c.parking.surfaceBays, underground: c.parking.underground, ...(c.parking.mode === "underground" ? { modeledBays: undergroundParkingBayLayout(c).capacity } : {}) },
         }));
       }
     }
@@ -782,16 +784,11 @@ export function buildIfcStep(design: Design): string {
   ].join("\n");
 }
 
-function csvCell(value: unknown): string {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  return `"${text.replace(/"/g, '""')}"`;
-}
-
 export function buildBimScheduleCsv(design: Design): string {
   const exchange = JSON.parse(buildBimExchange(design)) as { entities: ExchangeEntity[] };
   const rows = ["id,type,name,levelId,geometry,properties"];
   for (const item of exchange.entities) {
-    rows.push([item.id, item.type, item.name ?? "", item.levelId ?? "", item.geometry ?? {}, item.properties ?? {}].map(csvCell).join(","));
+    rows.push([item.id, item.type, item.name, item.levelId, JSON.stringify(item.geometry ?? {}), JSON.stringify(item.properties ?? {})].map(quoteCsvCell).join(","));
   }
   return rows.join("\n") + "\n";
 }

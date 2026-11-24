@@ -54,7 +54,7 @@ function Protected({ children }: { children: React.ReactNode }) {
   }
   // Retain mounted editor state during a failed refresh without exposing private interaction.
   return <>
-    <div style={status === "authenticated" ? undefined : { display: "none" }} aria-hidden={status !== "authenticated" || undefined}>{children}</div>
+    <div key={user.id} style={status === "authenticated" ? undefined : { display: "none" }} aria-hidden={status !== "authenticated" || undefined}>{children}</div>
     {status === "unavailable" && <AuthenticationUnavailable />}
     {status === "checking" && <FullScreenLoading />}
   </>;

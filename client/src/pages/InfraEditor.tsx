@@ -101,6 +101,7 @@ interface InfraEditorProps {
   kind: InfraKind;
   infra: InfraDesign;
   onChange: (infra: InfraDesign) => void;
+  readOnly?: boolean;
   initialStep?: StepId;
   projectName?: string;
   design?: import("../types").Design;
@@ -151,7 +152,7 @@ function Num({
   );
 }
 
-export function InfraEditor({ kind, infra, onChange, projectName, design, onVisualizationChange, initialStep }: InfraEditorProps) {
+export function InfraEditor({ kind, infra, onChange, readOnly = false, projectName, design, onVisualizationChange, initialStep }: InfraEditorProps) {
   const toast = useToast();
   const [step, setStep] = useState<StepId>(initialStep ?? "location");
   const [facilityKind, setFacilityKind] = useState(FACILITY_OPTIONS[kind][0].kind);
@@ -173,6 +174,7 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
   }, [kind]);
 
   const commitInfra = (next: InfraDesign) => {
+    if (readOnly) return;
     historyRef.current.past = [...historyRef.current.past.slice(-49), infra];
     historyRef.current.future = [];
     onChange(next);
@@ -667,7 +669,9 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="gw-sheet-toolbar relative mb-2 mt-2 flex min-h-10 items-center gap-2 overflow-x-auto rounded-xl border border-slate-800 bg-slate-900/80 px-2 py-1.5 backdrop-blur">
          <span className="hidden px-2 text-[10px] font-bold uppercase tracking-[.16em] text-slate-500 sm:inline">CAD tools</span>
-         {design && <DesignExportMenu design={design} projectName={projectName} onChange={(next) => onChange(next.infra ?? infra)} />}
+         {design && <DesignExportMenu design={design} projectName={projectName} onChange={readOnly ? undefined : onVisualizationChange} />}
+         {readOnly && <span role="status" className="shrink-0 text-xs text-slate-300">Read-only access</span>}
+         {!readOnly && <>
          <CadToolPalette active={activeTool} onChange={(tool) => { setActiveTool(tool); if (selectedDraft && ["trim", "extend", "offset", "rotate", "mirror"].includes(tool)) operateDraft(tool as "trim" | "extend" | "offset" | "rotate" | "mirror"); if (selectedDraft && tool === "array") arrayDraft(); }} compact tools={["select", "move", "measure", "rotate", "offset", "trim", "extend", "mirror", "array", "line", "rectangle", "circle", "dimension"]} />
         <Button variant="ghost" size="sm" onClick={() => setLayersOpen((open) => !open)}>Layers</Button>
         <Button variant="ghost" size="sm" onClick={undo} disabled={historyRef.current.past.length === 0}>Undo</Button>
@@ -684,6 +688,7 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
             ))}
           </div>
         )}
+        </>}
       </div>
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
          <div className="flex w-full shrink-0 flex-col border-r border-slate-800 bg-slate-900/40 lg:w-96">
@@ -706,22 +711,22 @@ export function InfraEditor({ kind, infra, onChange, projectName, design, onVisu
               </button>
             ))}
           </div>
-           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"><SectionControls value={infra.section} onChange={(section) => update({ section })} />{panels[step]}</div>
+           <fieldset disabled={readOnly} className="min-h-0 min-w-0 flex-1 space-y-4 overflow-y-auto p-4"><SectionControls value={infra.section} onChange={(section) => update({ section })} />{panels[step]}</fieldset>
         </div>
 
         <div className="relative min-h-[420px] flex-1">
-           <InfraScene infra={infra} activeTool={activeTool} onSelect={setSelectedId} onChange={commitInfra} visualization={visualization} onPresentationReady={setPresentationApi} />
-           {design && <div className="pointer-events-auto absolute bottom-3 left-3 z-10"><VisualizationControls design={design} presentationApi={presentationApi} onChange={(next) => onVisualizationChange?.(next)} /></div>}
+           <InfraScene infra={infra} activeTool={readOnly ? "select" : activeTool} onSelect={setSelectedId} onChange={readOnly ? undefined : commitInfra} visualization={visualization} onPresentationReady={setPresentationApi} />
+           {!readOnly && design && <div className="pointer-events-auto absolute bottom-3 left-3 z-10"><VisualizationControls design={design} presentationApi={presentationApi} onChange={(next) => onVisualizationChange?.(next)} /></div>}
            <div className="pointer-events-none absolute left-3 top-3 rounded-xl bg-slate-950/80 px-3 py-2 text-xs text-slate-300 backdrop-blur">
              {INFRA_LABELS[kind]} · {infra.section?.enabled ? `Section ${infra.section.axis.toUpperCase()} / ${infra.section.depth} m` : "Full model"}
           </div>
            <div className="pointer-events-none absolute bottom-3 left-3 max-w-[70%] rounded-xl bg-slate-950/85 px-3 py-2 text-xs text-emerald-300 backdrop-blur">
              {infraSummary(infra)}
            </div>
-           <div className="pointer-events-auto absolute bottom-3 right-3 z-20">
+           {!readOnly && <div className="pointer-events-auto absolute bottom-3 right-3 z-20">
              <DesignAssistantPanel messages={assistantMessages} onCommand={(message) => void requestPlan(message)} plan={assistantPlan} busy={assistantBusy} previews={assistantPreviews} onPreview={() => setAssistantPreviewOpen(true)} onApply={() => setAssistantPreviewOpen(true)} />
-           </div>
-           <Modal open={assistantPreviewOpen} onClose={() => setAssistantPreviewOpen(false)} title="Assistant action preview" wide>
+           </div>}
+           <Modal open={!readOnly && assistantPreviewOpen} onClose={() => setAssistantPreviewOpen(false)} title="Assistant action preview" wide>
              <div className="space-y-3">
                <p className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-200">Confirm only the bounded infrastructure parameter, facility, and model-generation updates you intend to make. Structural, MEP, and analysis suggestions remain preview-only.</p>
                <div className="max-h-[50vh] space-y-2 overflow-auto rounded-xl border border-slate-800 bg-slate-950 p-3">

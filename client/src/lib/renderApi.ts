@@ -75,7 +75,7 @@ export async function fetchRenderCapabilities(projectId: string): Promise<Render
 }
 
 export async function listRenderJobs(projectId: string): Promise<{
-  project: { id: string; name: string; revision: number };
+  project: { id: string; name: string; revision: number; role: "owner" | "editor" | "viewer" };
   jobs: RenderJobSummary[];
   capabilities: RenderCapabilities;
 }> {
@@ -138,6 +138,17 @@ export async function cancelRenderJob(projectId: string, jobId: string): Promise
     throw new Error(errorData.error || `HTTP ${res.status}`);
   }
   return res.json();
+}
+
+export async function removeRenderHistoryEntry(projectId: string, jobId: string): Promise<void> {
+  const res = await fetch(`/api/projects/${projectId}/renders/${jobId}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({ error: "Failed to remove render attempt" }));
+    throw new Error(errorData.error || `HTTP ${res.status}`);
+  }
 }
 
 export function getRenderImageUrl(projectId: string, jobId: string, type: "output" | "source" = "output"): string {

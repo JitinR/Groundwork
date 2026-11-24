@@ -60,9 +60,9 @@ async function run() {
     const base = `http://127.0.0.1:${server.address().port}`;
     class Client {
       cookies = new Map(); csrf = '';
-      async request(method, endpoint, body) {
+      async request(method, endpoint, body, headers = {}) {
         const response = await fetch(base + endpoint, { method,
-          headers: { 'content-type': 'application/json', cookie: [...this.cookies].map(([k,v]) => `${k}=${v}`).join('; '), ...(this.csrf ? { 'x-csrf-token': this.csrf } : {}) },
+          headers: { 'content-type': 'application/json', cookie: [...this.cookies].map(([k,v]) => `${k}=${v}`).join('; '), ...(this.csrf ? { 'x-csrf-token': this.csrf } : {}), ...headers },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         });
         for (const cookie of response.headers.getSetCookie()) {
@@ -87,8 +87,10 @@ async function run() {
     const design = { version:1, walls:[], rooms:[], note:'private-fixture-design' };
     const saved = await owner.request('PATCH',`/api/projects/${id}`,{ designData:JSON.stringify(design),baseRevision:0 });
     assert.equal(saved.status,200,JSON.stringify(saved.data));
-    const read = await owner.request('GET',`/api/projects/${id}`);
+    const read = await owner.request('GET',`/api/projects/${id}`,undefined,{ 'X-Groundwork-Account':'pg-owner' });
     assert.equal(read.status,200); assert.deepEqual(read.data.design,design);
+    assert.equal(read.data.accountId,'pg-owner');
+    assert.equal(read.cacheControl,'private, no-store');
     const stored = await db.prepare('SELECT design_data FROM projects WHERE id=?').get(id);
     assert(!stored.design_data.includes(design.note));
     const revision = await owner.request('POST',`/api/projects/${id}/revisions`,{ name:'Verified snapshot' });
@@ -107,9 +109,13 @@ async function run() {
     assert.equal((await other.request('GET',`${collaboration}/items`)).status,404);
     assert.equal((await owner.request('POST',`${collaboration}/members`,{ identifier:'pg-other@example.invalid',role:'viewer' })).status,201);
     assert.equal((await other.request('GET',`${collaboration}/items`)).status,200);
+    const copied = await other.request('POST',`/api/projects/${id}/duplicate`,{ name:'Personal draft' });
+    assert.equal(copied.status,201);
+    assert.deepEqual((await other.request('GET',`/api/projects/${copied.data.id}`)).data.design,design);
     assert.equal((await other.request('PATCH',`/api/projects/${id}`,{ name:'Unauthorized change' })).status,403);
     assert.equal((await owner.request('DELETE',`${collaboration}/members/pg-other`)).status,200);
     assert.equal((await other.request('GET',`${collaboration}/items`)).status,404);
+    assert.equal((await other.request('POST',`/api/projects/${id}/duplicate`,{ name:'Second draft' })).status,404);
     assert.equal((await owner.request('DELETE',`/api/projects/${id}/share-links/${link.data.id}`)).status,200);
     const revokedRead = await anonymous.request('GET',shareUrl);
     assert.equal(revokedRead.status,404);

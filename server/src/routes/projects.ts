@@ -121,7 +121,7 @@ async function projectForUser(projectId: string, userId: string) {
       id: string; user_id: string; name: string; project_type: string; design_data: string | null; width_mm: number; depth_mm: number; revision: number;
       photo_file_id: string | null; folder: string; archived: number; is_template: number; created_at: number; updated_at: number;
     } | undefined;
-  return row ? { ...row, ownerId: access.ownerId, role: access.role } : undefined;
+  return row ? { ...row, ownerId: access.ownerId, role: access.role, organizationId: access.organizationId } : undefined;
 }
 
 function revisionResponse(row: { id: string; name: string; project_type: string; width_mm: number; depth_mm: number; created_at: number }) {
@@ -202,6 +202,11 @@ router.post(
 
 /* GET /api/projects/:id */
 router.get("/:id", asyncHandler(async (req: AuthedRequest, res) => {
+  const expectedAccountId = req.get("X-Groundwork-Account");
+  if (expectedAccountId !== undefined && expectedAccountId !== req.user!.id) {
+    res.status(409).json({ error: "The signed-in account changed. Refresh your session before opening this project.", code: "ACCOUNT_CHANGED" });
+    return;
+  }
   const row = (await projectForUser(routeParam(req, "id"), req.user!.id));
   if (!row) {
     res.status(404).json({ error: "Project not found" });
@@ -218,6 +223,7 @@ router.get("/:id", asyncHandler(async (req: AuthedRequest, res) => {
     }
   }
   res.json({
+    accountId: req.user!.id,
     id: row.id,
     name: row.name,
     projectType: row.project_type,
@@ -235,37 +241,44 @@ router.get("/:id", asyncHandler(async (req: AuthedRequest, res) => {
 
 /* POST /api/projects/:id/duplicate — read access is required even for templates. */
 router.post("/:id/duplicate", asyncHandler(async (req: AuthedRequest, res) => {
-  const source = (await projectForUser(routeParam(req, "id"), req.user!.id));
-  if (!source) { res.status(404).json({ error: "Project not found" }); return; }
-  const sourceAccess = (await getProjectAccess(routeParam(req, "id"), req.user!.id));
-  if (sourceAccess?.organizationId) { res.status(403).json({ error: "Tenant projects cannot be duplicated into a personal workspace" }); return; }
-  const parsed = z.object({ name: z.string().trim().min(1).max(80) }).safeParse(req.body || {});
-  if (!parsed.success) { res.status(400).json({ error: "A project name of 1–80 characters is required" }); return; }
-  let designData: string | null = null;
-  try {
-    if (source.design_data) {
-      const plaintext = decryptForUser(source.design_data, source.ownerId);
-      if (plaintext.length > 4_000_000) throw new Error("Design exceeds the project size limit");
-      JSON.parse(plaintext);
-      designData = encryptForUser(plaintext, req.user!.id);
+  const sourceId = routeParam(req, "id");
+  const userId = req.user!.id;
+  const duplicate = await withTransaction(async () => {
+    // Membership and project-scope updates share this transaction boundary.
+    const source = await projectForUser(sourceId, userId);
+    if (!source) return { status: 404, body: { error: "Project not found" } } as const;
+    if (source.organizationId) {
+      return { status: 403, body: { error: "Tenant projects cannot be duplicated into a personal workspace" } } as const;
     }
-  } catch {
-    res.status(422).json({ error: "The source design cannot be copied because its stored data is unreadable or too large" });
-    return;
-  }
-  const id = randomId();
-  const t = now();
-  const created = (await withTransaction(async () => {
-    if (!(await canAddActiveProject(req.user!.id))) return false;
-    (await db.prepare("INSERT INTO projects (id, user_id, name, project_type, design_data, width_mm, depth_mm, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(id, req.user!.id, parsed.data.name, source.project_type, designData, source.width_mm, source.depth_mm, t, t));
-    return true;
-  }));
-  if (!created) { res.status(403).json({ error: ACTIVE_PROJECT_LIMIT, code: "ACTIVE_PROJECT_LIMIT" }); return; }
+    const parsed = z.object({ name: z.string().trim().min(1).max(80) }).safeParse(req.body || {});
+    if (!parsed.success) return { status: 400, body: { error: "A project name of 1–80 characters is required" } } as const;
+    if (!(await canAddActiveProject(userId))) return { status: 403, body: { error: ACTIVE_PROJECT_LIMIT, code: "ACTIVE_PROJECT_LIMIT" } } as const;
+    let designData: string | null = null;
+    try {
+      if (source.design_data) {
+        const plaintext = decryptForUser(source.design_data, source.ownerId);
+        if (plaintext.length > 4_000_000) throw new Error("Design exceeds the project size limit");
+        JSON.parse(plaintext);
+        designData = encryptForUser(plaintext, userId);
+      }
+    } catch {
+      return { status: 422, body: { error: "The source design cannot be copied because its stored data is unreadable or too large" } } as const;
+    }
+    const id = randomId();
+    const t = now();
+    const name = parsed.data.name;
+    await db.prepare("INSERT INTO projects (id, user_id, name, project_type, design_data, width_mm, depth_mm, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(id, userId, name, source.project_type, designData, source.width_mm, source.depth_mm, t, t);
+    return {
+      status: 201, fromTemplate: Boolean(source.is_template),
+      body: { id, name, projectType: source.project_type, widthMm: source.width_mm, depthMm: source.depth_mm,
+        createdAt: t, updatedAt: t, hasPhoto: false, revision: 0, role: "owner", folder: "", archived: false, isTemplate: false },
+    } as const;
+  });
+  if (duplicate.status !== 201) { res.status(duplicate.status).json(duplicate.body); return; }
   // Photos, team permissions, share links, history, locks and operations stay with the source.
-  (await logAudit(req.user!.id, "project.duplicated", { projectId: id, sourceProjectId: source.id, name: parsed.data.name, fromTemplate: Boolean(source.is_template) }, req));
-  res.status(201).json({ id, name: parsed.data.name, projectType: source.project_type, widthMm: source.width_mm, depthMm: source.depth_mm,
-    createdAt: t, updatedAt: t, hasPhoto: false, revision: 0, role: "owner", folder: "", archived: false, isTemplate: false });
+  await logAudit(userId, "project.duplicated", { projectId: duplicate.body.id, sourceProjectId: sourceId, name: duplicate.body.name, fromTemplate: duplicate.fromTemplate }, req);
+  res.status(201).json(duplicate.body);
 }));
 
 /* PATCH /api/projects/:id — name, dims, or encrypted design data */

@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import { requestReleaseJson } from './release-readiness.mjs';
 
 // Resolve the mail transport from its owning workspace, including nested installs.
-const nodemailer = createRequire(new URL('../server/package.json', import.meta.url))('nodemailer');
+const requireServer = createRequire(new URL('../server/package.json', import.meta.url));
 
 export function allowedOrigin(value, allowlist, { isolated = false } = {}) {
   let url;
@@ -30,15 +30,19 @@ export async function probe(origin, { fetcher = fetch, timeoutMs = 15000 } = {})
   } catch { return { ok: false, status: null, reason: 'network_or_invalid_health', durationMs: Math.round(performance.now() - started) }; }
   finally { clearTimeout(timer); }
 }
-export async function alert(report, env = process.env, createTransport = nodemailer.createTransport) {
+export async function alert(report, env = process.env, createTransport) {
   if (env.OPS_SEND_ALERTS !== '1') return { sent: false, reason: 'alerts_not_enabled' };
   const email = /^[^\s<>@\r\n]+@[^\s<>@\r\n]+\.[^\s<>@\r\n]+$/;
   if (!email.test(env.OPS_ALERT_TO || '') || !email.test(env.MAIL_FROM || '') || !env.MAIL_HOST || !env.MAIL_USER || !env.MAIL_PASS) throw new Error('Private SMTP and an explicitly authorized recipient are required');
   const port = Number(env.MAIL_PORT || 465);
   if (![465, 587].includes(port)) throw new Error('Operational SMTP requires TLS port 465 or 587');
-  const transport = createTransport({ host: env.MAIL_HOST, port, secure: port === 465, requireTLS: true, auth: { user: env.MAIL_USER, pass: env.MAIL_PASS }, tls: { rejectUnauthorized: true }, connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000, logger: false, debug: false });
+  const transport = (createTransport ?? requireServer('nodemailer').createTransport)({ host: env.MAIL_HOST, port, secure: port === 465, requireTLS: true, auth: { user: env.MAIL_USER, pass: env.MAIL_PASS }, tls: { rejectUnauthorized: true }, connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000, logger: false, debug: false });
+  const cadence = report.samples.length === 0;
+  const subject = cadence ? '[Groundwork] External monitoring cadence needs attention' : '[Groundwork] Operational check failed';
+  const summary = cadence ? 'Groundwork could not verify timely external health monitoring.' : `Groundwork operational check failed after ${report.samples.length} health attempts.`;
+  const age = cadence && Number.isFinite(report.ageMinutes) ? `\nPrevious scheduled check completed ${report.ageMinutes} minutes ago.` : '';
   try {
-    await transport.sendMail({ from: env.MAIL_FROM, to: env.OPS_ALERT_TO, subject: '[Groundwork] Operational check failed', text: `Groundwork operational check failed after ${report.samples.length} health attempts.\nTarget: ${report.origin}\nUTC: ${report.checkedAt}\nReason: ${report.reason || report.samples.at(-1).reason}\nInspect the GitHub Actions Operations health run and docs/INCIDENTS.md.\nNo customer data or credentials are attached.` });
+    await transport.sendMail({ from: env.MAIL_FROM, to: env.OPS_ALERT_TO, subject, text: `${summary}\nTarget: ${report.origin}\nUTC: ${report.checkedAt}\nReason: ${report.reason || report.samples.at(-1)?.reason}${age}\nInspect the GitHub Actions Operations health run and docs/INCIDENTS.md.\nNo customer data or credentials are attached.` });
     return { sent: true };
   } finally { transport.close(); }
 }
@@ -62,16 +66,16 @@ export async function backupFreshness(env = process.env, request = fetch, now = 
     return { enabled: true, ok: Boolean(artifact), reason: artifact ? 'backup_fresh' : 'backup_artifact_missing', ageHours: Math.round(ageHours * 100) / 100 };
   } catch { return { enabled: true, ok: false, reason: 'backup_evidence_unavailable' }; }
 }
-export async function monitorCadence(env = process.env, request = fetch, now = Date.now()) {
+export async function monitorCadence(env = process.env, request = fetch, now = Date.now(), { includeLatest = false } = {}) {
   const failed = reason => ({ ok: false, reason });
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(env.GITHUB_REPOSITORY || '') ||
-      !/^\d+$/.test(env.GITHUB_RUN_ID || '') || !env.OPS_DEFAULT_BRANCH || !env.GITHUB_TOKEN) return failed('monitor_evidence_config');
+      (!includeLatest && !/^\d+$/.test(env.GITHUB_RUN_ID || '')) || !env.OPS_DEFAULT_BRANCH || !env.GITHUB_TOKEN) return failed('monitor_evidence_config');
   const headers = { authorization: `Bearer ${env.GITHUB_TOKEN}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' };
   const get = path => requestReleaseJson(request, `https://api.github.com/repos/${env.GITHUB_REPOSITORY}/${path}`, { headers });
   try {
     const query = new URLSearchParams({ branch: env.OPS_DEFAULT_BRANCH, event: 'schedule', status: 'completed', per_page: '10' });
     const { workflow_runs: runs } = await get(`actions/workflows/operations-health.yml/runs?${query}`);
-    const previous = runs.find(run => Number.isSafeInteger(run.id) && run.id > 0 && String(run.id) !== env.GITHUB_RUN_ID &&
+    const previous = runs.find(run => Number.isSafeInteger(run.id) && run.id > 0 && (includeLatest || String(run.id) !== env.GITHUB_RUN_ID) &&
       run.head_branch === env.OPS_DEFAULT_BRANCH && run.event === 'schedule' && run.status === 'completed' &&
       Date.parse(run.created_at) <= now && ['success', 'failure'].includes(run.conclusion));
     if (!previous) return failed('monitor_run_missing');
@@ -87,6 +91,17 @@ export async function monitorCadence(env = process.env, request = fetch, now = D
     return { ok: true, reason: 'monitor_cadence_fresh', ageMinutes };
   } catch { return failed('monitor_evidence_unavailable'); }
 }
+export async function checkMonitorCadence(env = process.env, { request = fetch, now = Date.now(), independent = false, notify = alert } = {}) {
+  const report = await monitorCadence(env, request, now, { includeLatest: independent });
+  if (report.ok || env.OPS_SEND_ALERTS !== '1') return report;
+  try {
+    const origin = allowedOrigin(env.OPS_HEALTH_ORIGIN, env.OPS_HEALTH_ALLOWED_ORIGINS);
+    const delivery = await notify({ ...report, origin, checkedAt: new Date(now).toISOString(), samples: [] }, env);
+    return { ...report, alert: delivery };
+  } catch {
+    return { ...report, alert: { sent: false, reason: 'alert_delivery_failed' } };
+  }
+}
 export async function checkHealth(env = process.env) {
   const origin = allowedOrigin(env.OPS_HEALTH_ORIGIN, env.OPS_HEALTH_ALLOWED_ORIGINS);
   const samples = [];
@@ -101,6 +116,8 @@ export async function checkHealth(env = process.env) {
   return report;
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const check = process.argv[2] === '--cadence' ? monitorCadence : checkHealth;
+  const mode = process.argv[2];
+  const check = mode === '--cadence' ? checkMonitorCadence
+    : mode === '--watch-cadence' ? () => checkMonitorCadence(process.env, { independent: true }) : checkHealth;
   check().then(result => { console.log(JSON.stringify(result)); if (!result.ok) process.exitCode = 1; }).catch(() => { console.error('External monitoring failed: check the explicit origin allowlist and private alert configuration.'); process.exitCode = 1; });
 }

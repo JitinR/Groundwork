@@ -15,10 +15,10 @@ process.env.PREVIOUS_MASTER_KEY = previous.toString("base64");
 const directory = mkdtempSync(join(tmpdir(), "groundwork-render-input-"));
 process.env.GROUNDWORK_DATA_DIR = directory;
 delete process.env.DB_PATH;
-const { db, now } = await import("../src/db.js");
+const { db, now, withTransaction } = await import("../src/db.js");
 const { createWorkspaceArtifact } = await import("../src/workspaces.js");
 const { submitRenderJob, retryRenderJob, getRenderJob } = await import("../src/renderJobs.js");
-const { setRenderProviderForTesting, UnconfiguredRenderProvider } = await import("../src/renderProvider.js");
+const { DemoRenderProvider, setRenderProviderForTesting, UnconfiguredRenderProvider } = await import("../src/renderProvider.js");
 setRenderProviderForTesting(new UnconfiguredRenderProvider());
 after(async () => { setRenderProviderForTesting(null); await db.close(); rmSync(directory, { force: true, recursive: true }); });
 const actor = { userId: "render-privacy-user", sessionId: "render-privacy-session" }, projectId = "render-privacy-project", organizationId = "render-privacy-organization";
@@ -72,4 +72,37 @@ test("authorized reads lazily encrypt legacy plaintext and previous-key rows and
   const other = await submitRenderJob(projectId, actor, input);
   await db.prepare("UPDATE project_render_jobs SET prompt=? WHERE id=?").run(rotated.prompt, other.id);
   await assert.rejects(getRenderJob(projectId, other.id, actor), /could not be authenticated/);
+});
+
+test("old unsuccessful history leaves capacity for a retry while successful outputs remain attached", async () => {
+  const entries = Array.from({ length: 200 }, (_, i) => (i + 1).toString(16).padStart(32, "0"));
+  const output = await createWorkspaceArtifact(projectId, "geometry", actor, "original-render.png", png);
+  const insert = db.prepare(`INSERT INTO project_render_jobs (
+    id,project_id,source_revision,source_image_artifact_id,source_image_sha256,prompt,
+    provider,model,version,status,output_artifact_id,output_sha256,created_by,created_at,updated_at,completed_at
+  ) VALUES (?,?,0,?,?,'Imported architecture study','fixture','fixture','1',?,?,?,?,?,?,?)`);
+  const oldest = now() - entries.length;
+  await withTransaction(async () => {
+    for (const [i, id] of entries.entries()) {
+      const time = oldest + i;
+      const succeeded = i === 0;
+      await insert.run(id, projectId, source.id, source.sha256, succeeded ? "succeeded" : "failed",
+        succeeded ? output.id : null, succeeded ? output.sha256 : null, actor.userId, time, time, time);
+    }
+  });
+  setRenderProviderForTesting(new DemoRenderProvider());
+  const [successful, retrySource, retired] = entries;
+  const retried = await retryRenderJob(projectId, retrySource, actor);
+  let result = await getRenderJob(projectId, retried.id, actor);
+  for (let i = 0; i < 30 && (result.status === "queued" || result.status === "running"); i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    result = await getRenderJob(projectId, retried.id, actor);
+  }
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.parameters.retriedFromJobId, retrySource);
+  assert.equal((await getRenderJob(projectId, successful, actor)).outputArtifactId, output.id);
+  assert.equal((await getRenderJob(projectId, retrySource, actor)).status, "failed");
+  assert.equal(await db.prepare("SELECT id FROM project_render_jobs WHERE id=?").get(retired), undefined);
+  const history = await db.prepare("SELECT COUNT(*) AS count FROM project_render_jobs WHERE project_id=? AND status<>'unconfigured'").get(projectId) as { count: number };
+  assert.equal(history.count, 200);
 });

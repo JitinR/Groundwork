@@ -1,7 +1,8 @@
 import * as THREE from "three";
-import type { MepDesign, MepElement, MepElementKind, MepPoint, MepPlanningInputs, MepSystemType, VisualizationSettings } from "../types";
+import type { MepDesign, MepElement, MepElementKind, MepPoint, MepPlanningInputs, VisualizationSettings } from "../types";
 import { material, prismAt, uid } from "./modelcore";
-import { calculateMepPlan, validateMepInputs } from "./mep-calculations";
+import { calculateMepPlan, mepPressureLosses, mepRouteLength, validateMepInputs } from "./mep-calculations";
+import { defaultSystem, electricalPlanningLoads } from "./mepNetwork";
 import { engineeringProfile } from "./engineering";
 import { familyForMepKind, familyMetadata } from "./families";
 import { phaseVisible } from "./visualization";
@@ -34,14 +35,7 @@ export const DEFAULT_MEP_PLANNING: MepPlanningInputs = {
 export function normalizeMep(value: MepDesign | undefined): MepDesign {
   const base = defaultMep();
   const elements = value?.elements ?? [];
-  return value ? { ...base, ...value, elements: elements.map((element) => ({ ...element, system: element.system ?? legacySystem(element.kind), connectedTo: element.connectedTo ?? [] })), zones: value.zones ?? [], planning: { ...DEFAULT_MEP_PLANNING, ...value.planning } } : { ...base, planning: { ...DEFAULT_MEP_PLANNING }, zones: [] };
-}
-
-function legacySystem(kind: MepElementKind): MepSystemType {
-  if (kind === "duct") return "hvac-supply";
-  if (kind === "pipe") return "plumbing-supply";
-  if (kind === "cable-tray" || kind === "equipment") return "electrical-power";
-  return "controls";
+  return value ? { ...base, ...value, elements: elements.map((element) => ({ ...element, system: defaultSystem(element), connectedTo: element.connectedTo ?? [] })), zones: value.zones ?? [], planning: { ...DEFAULT_MEP_PLANNING, ...value.planning } } : { ...base, planning: { ...DEFAULT_MEP_PLANNING }, zones: [] };
 }
 
 export interface MepPlanningSummary {
@@ -56,58 +50,70 @@ export interface MepPlanningSummary {
   pipeLengthM: number;
   pipeCapacityLps: number;
   connectedSystems: number;
-  pressureDropPa: number;
+  ductPressureLossPa: number;
+  pipePressureLossPa: number;
   connectivityWarnings: string[];
   warnings: string[];
-}
-
-function routeLength(element: MepElement): number {
-  let length = 0;
-  for (let i = 1; i < element.route.length; i++) {
-    const a = element.route[i - 1]; const b = element.route[i];
-    length += Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
-  }
-  return length;
 }
 
 export function mepPlanningSummary(value: MepDesign | undefined): MepPlanningSummary {
   const mep = normalizeMep(value); const p = mep.planning ?? DEFAULT_MEP_PLANNING;
   const volume = Math.max(p.areaM2, 0) * Math.max(p.ceilingHeightM, 0);
   const airflowM3h = volume * Math.max(p.airChangesPerHour, 0);
-  const ductElements = mep.elements.filter((element) => element.kind === "duct" && element.visible);
-  const pipeElements = mep.elements.filter((element) => element.kind === "pipe" && element.visible);
+  const ductElements = mep.elements.filter((element) => element.kind === "duct");
+  const pipeElements = mep.elements.filter((element) => element.kind === "pipe");
   const ductAreaM2 = ductElements.reduce((sum, element) => sum + Math.max(element.width, 0) * Math.max(element.height, 0), 0);
   const ductCapacityM3h = ductAreaM2 * Math.max(p.designAirVelocityMps, 0) * 3600;
   const pipeCapacityLps = pipeElements.reduce((sum, element) => sum + Math.PI * Math.pow(Math.max(element.diameter, 0), 2) / 4 * Math.max(p.pipeVelocityMps, 0) * 1000, 0);
-  const connectedLoadKw = mep.elements.filter((element) => element.visible).reduce((sum, element) => sum + (element.ratedPowerKw ?? (element.kind === "equipment" ? 1.5 : element.kind === "fixture" ? 0.1 : 0)), 0);
-  const demandLoadKw = connectedLoadKw * Math.min(Math.max(p.electricalDemandFactor, 0), 1);
+  const electricalElements = mep.elements.filter((element) => defaultSystem(element) === "electrical-power");
+  const { connectedKw: connectedLoadKw, demandKw: demandLoadKw } = electricalPlanningLoads(electricalElements, p.electricalDemandFactor);
   const warnings: string[] = [];
   const connectivityWarnings: string[] = [];
-  const visibleElements = mep.elements.filter((element) => element.visible);
-  const connectedSystems = visibleElements.filter((element) => (element.connectedTo ?? []).some((id) => visibleElements.some((candidate) => candidate.id === id))).length;
-  const pressureDropPa = ductElements.reduce((sum, element) => sum + routeLength(element) * Math.max(p.designAirVelocityMps, 0) ** 2 * 0.8, 0) + pipeElements.reduce((sum, element) => sum + routeLength(element) * Math.max(p.pipeVelocityMps, 0) ** 2 * 2, 0);
+  const elementIds = new Set(mep.elements.map((element) => element.id));
+  const connectedSystems = mep.elements.filter((element) => element.connectedTo?.some((id) => elementIds.has(id))).length;
+  const ductLengthM = ductElements.reduce((sum, element) => sum + mepRouteLength(element), 0);
+  const pipeLengthM = pipeElements.reduce((sum, element) => sum + mepRouteLength(element), 0);
+  const pressureLosses = mepPressureLosses(ductLengthM, pipeLengthM, p);
   if (ductElements.length === 0) warnings.push("No duct routes are modeled for the estimated HVAC airflow.");
   else if (ductCapacityM3h < airflowM3h) warnings.push(`Duct cross-section screens below target airflow (${Math.round(ductCapacityM3h).toLocaleString()} vs ${Math.round(airflowM3h).toLocaleString()} m³/h).`);
   if (pipeElements.length > 0 && pipeCapacityLps < Math.max(p.plumbingFlowLps, 0)) warnings.push(`Pipe capacity screens below target flow (${pipeCapacityLps.toFixed(1)} vs ${p.plumbingFlowLps.toFixed(1)} L/s).`);
   for (const element of pipeElements) if (element.diameter < 0.05) warnings.push(`${element.name} is below the 50 mm preliminary pipe diameter screen.`);
-  for (const element of mep.elements.filter((item) => item.visible && item.route.length > 0)) {
+  for (const element of mep.elements.filter((item) => item.route.length > 0)) {
     const lowestClearance = Math.min(...element.route.map((point) => p.ceilingHeightM - point.y - (element.kind === "duct" ? element.height : element.diameter) / 2));
     if (lowestClearance < p.minimumClearanceM) warnings.push(`${element.name} has about ${Math.max(lowestClearance, 0).toFixed(2)} m ceiling clearance, below the ${p.minimumClearanceM.toFixed(2)} m planning minimum.`);
   }
   if (connectedLoadKw > 0 && demandLoadKw < connectedLoadKw * 0.5) warnings.push("Demand factor is below 50%; confirm diversity assumptions with the electrical engineer.");
-  if (pressureDropPa > (p.designPressurePa ?? 300)) warnings.push(`Estimated route pressure loss ${pressureDropPa.toFixed(0)} Pa exceeds ${p.designPressurePa ?? 300} Pa planning allowance.`);
-  for (const element of visibleElements) {
+  if (electricalElements.some((element) => (element.kind === "equipment" || element.kind === "fixture") && element.ratedPowerKw === undefined)) warnings.push("Some electrical equipment or fixtures have no rated power. Enter their loads to complete the demand screen.");
+  if (pressureLosses.ductPressureLossPa > (p.designPressurePa ?? 300)) warnings.push(`Estimated duct pressure loss ${pressureLosses.ductPressureLossPa.toFixed(0)} Pa exceeds the ${p.designPressurePa ?? 300} Pa duct planning allowance.`);
+  for (const element of mep.elements) {
     if (element.route.length > 1 && !element.connectedTo?.length) connectivityWarnings.push(`${element.name} has no explicit system connection; verify source, terminal, and flow direction.`);
     if ((element.supportSpacingM ?? 0) <= 0 && ["duct", "pipe", "cable-tray"].includes(element.kind)) warnings.push(`${element.name} has no support spacing input; seismic restraint and hanger design are not screened.`);
     if (element.system === "fire-protection" && element.kind !== "pipe") warnings.push(`${element.name} is typed as fire protection but is not a pipe; verify fire system modeling.`);
   }
-  if (mep.zones?.length === 0 && visibleElements.length) connectivityWarnings.push("No typed zones are defined; airflow and electrical demand are applied to the whole planning area.");
-  return { airflowM3h, airflowLps: airflowM3h / 3.6, coolingLoadKw: Math.max(p.areaM2, 0) * Math.max(p.coolingLoadWPerM2, 0) / 1000, ductAreaM2, ductCapacityM3h, connectedLoadKw, demandLoadKw, ductLengthM: ductElements.reduce((sum, element) => sum + routeLength(element), 0), pipeLengthM: pipeElements.reduce((sum, element) => sum + routeLength(element), 0), pipeCapacityLps, connectedSystems, pressureDropPa, connectivityWarnings, warnings };
+  if (mep.zones?.length === 0 && mep.elements.length) connectivityWarnings.push("No typed zones are defined; airflow and electrical demand are applied to the whole planning area.");
+  return { airflowM3h, airflowLps: airflowM3h / 3.6, coolingLoadKw: Math.max(p.areaM2, 0) * Math.max(p.coolingLoadWPerM2, 0) / 1000, ductAreaM2, ductCapacityM3h, connectedLoadKw, demandLoadKw, ductLengthM, pipeLengthM, pipeCapacityLps, connectedSystems, ...pressureLosses, connectivityWarnings, warnings };
 }
 
 export function buildMepReport(value: MepDesign | undefined): string {
   const mep = normalizeMep(value); const p = mep.planning!; const s = mepPlanningSummary(mep);
-  return ["PRELIMINARY MEP PLANNING REPORT", "Not code-compliant, for coordination only; verify with licensed discipline engineers.", "", `Inputs: ${p.areaM2} m² area | ${p.ceilingHeightM} m ceiling | ${p.occupancy} occupants | ${p.airChangesPerHour} ACH | ${p.designVoltageV ?? 230} V`, `HVAC: ${s.airflowM3h.toFixed(0)} m³/h (${s.airflowLps.toFixed(0)} L/s) airflow | ${s.coolingLoadKw.toFixed(2)} kW cooling screen`, `Ducts: ${s.ductLengthM.toFixed(1)} m modeled | ${s.ductAreaM2.toFixed(3)} m² section | ${s.ductCapacityM3h.toFixed(0)} m³/h capacity | ${s.pressureDropPa.toFixed(0)} Pa route loss`, `Pipes: ${s.pipeLengthM.toFixed(1)} m modeled | ${s.pipeCapacityLps.toFixed(1)} L/s capacity`, `Electrical: ${s.connectedLoadKw.toFixed(2)} kW connected | ${s.demandLoadKw.toFixed(2)} kW demand screen`, `Connectivity: ${s.connectedSystems} explicitly connected element(s) across ${(mep.zones ?? []).length} typed zone(s).`, "", "Warnings:", ...(s.warnings.length ? s.warnings.map((warning) => `- ${warning}`) : ["- None from these preliminary screens."]), ...s.connectivityWarnings.map((warning) => `- Connectivity: ${warning}`), "", "Clash envelopes use axis-aligned route bounds and conservative section sizes; they are approximations, not rotated segment solids or code clearances.", "Confirm equipment schedules, diversity, velocities, pressure loss, pipe sizing, voltage/drop, fault current, access, fire/life safety, supports, local codes, and construction clearances before use.",].join("\n");
+  return [
+    "PRELIMINARY MEP PLANNING REPORT",
+    "Not code-compliant, for coordination only; verify with licensed discipline engineers.",
+    "",
+    `Inputs: ${p.areaM2} m² area | ${p.ceilingHeightM} m ceiling | ${p.occupancy} occupants | ${p.airChangesPerHour} ACH | ${p.designVoltageV ?? 230} V`,
+    `HVAC: ${s.airflowM3h.toFixed(0)} m³/h (${s.airflowLps.toFixed(0)} L/s) airflow | ${s.coolingLoadKw.toFixed(2)} kW cooling screen`,
+    `Ducts: ${s.ductLengthM.toFixed(1)} m modeled | ${s.ductAreaM2.toFixed(3)} m² section | ${s.ductCapacityM3h.toFixed(0)} m³/h capacity | ${s.ductPressureLossPa.toFixed(0)} Pa route loss screen`,
+    `Pipes: ${s.pipeLengthM.toFixed(1)} m modeled | ${s.pipeCapacityLps.toFixed(1)} L/s capacity | ${s.pipePressureLossPa.toFixed(0)} Pa route loss screen`,
+    `Electrical: ${s.connectedLoadKw.toFixed(2)} kW connected | ${s.demandLoadKw.toFixed(2)} kW demand screen`,
+    `Connectivity: ${s.connectedSystems} explicitly connected element(s) across ${(mep.zones ?? []).length} typed zone(s).`,
+    "",
+    "Warnings:",
+    ...(s.warnings.length ? s.warnings.map((warning) => `- ${warning}`) : ["- None from these preliminary screens."]),
+    ...s.connectivityWarnings.map((warning) => `- Connectivity: ${warning}`),
+    "",
+    "Clash envelopes use axis-aligned route bounds and conservative section sizes; they are approximations, not rotated segment solids or code clearances.",
+    "Confirm equipment schedules, diversity, velocities, pressure loss, pipe sizing, voltage/drop, fault current, access, fire/life safety, supports, local codes, and construction clearances before use.",
+  ].join("\n");
 }
 
 /** Machine-readable companion to the legacy text report. */
@@ -123,7 +129,7 @@ export function makeMepElement(kind: MepElementKind, index = 0): MepElement {
   const option = MEP_KINDS.find((item) => item.kind === kind) ?? MEP_KINDS[0];
   const route: MepPoint[] = [{ x: -2, y: kind === "fixture" ? 2.4 : 2.7, z: index * 0.8 }, { x: 2, y: kind === "fixture" ? 2.4 : 2.7, z: index * 0.8 }];
   const family = familyForMepKind(kind)[0];
-  return { id: uid("mep"), kind, name: `${option.label} ${index + 1}`, route, width: kind === "duct" ? 0.45 : 0.2, height: kind === "duct" ? 0.3 : 0.2, diameter: 0.15, color: option.color, visible: true, system: legacySystem(kind), connectedTo: [], family: family ? familyMetadata(family) : undefined };
+  return { id: uid("mep"), kind, name: `${option.label} ${index + 1}`, route, width: kind === "duct" ? 0.45 : 0.2, height: kind === "duct" ? 0.3 : 0.2, diameter: 0.15, color: option.color, visible: true, system: defaultSystem({ kind }), connectedTo: [], family: family ? familyMetadata(family) : undefined };
 }
 
 function bounds(element: MepElement) {

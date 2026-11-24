@@ -25,7 +25,7 @@ import { readResponseJson, retryAfterDelay, withRequestTimeout } from "./lib/req
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string, public readonly retryAfterMs?: number) {
+  constructor(status: number, message: string, public readonly retryAfterMs?: number, public readonly code?: string) {
     super(message);
     this.status = status;
   }
@@ -134,11 +134,13 @@ export async function request<T>(
     const res = await fetch(path, { ...init, headers, credentials: "same-origin", signal });
     if (!res.ok) {
       let message = `Request failed (${res.status})`;
+      let code: string | undefined;
       try {
-        const body = await readResponseJson<{ error?: string }>(res, signal);
+        const body = await readResponseJson<{ error?: string; code?: string }>(res, signal);
         if (body.error) message = body.error;
+        if (typeof body.code === "string") code = body.code;
       } catch (error) { if (signal.aborted) throw error; /* no json body */ }
-      throw new ApiError(res.status, message, retryAfterDelay(res.headers.get("retry-after")));
+      throw new ApiError(res.status, message, retryAfterDelay(res.headers.get("retry-after")), code);
     }
     return readResponseJson<T>(res, signal);
   }, init.signal);
@@ -363,8 +365,18 @@ export function duplicateProject(id: string, name: string): Promise<Project> {
   });
 }
 
-export async function getProject(id: string): Promise<ProjectDetail> {
-  return request<ProjectDetail>(`/api/projects/${id}`, { method: "GET" });
+export async function getProject(id: string, expectedAccountId: string, signal?: AbortSignal): Promise<ProjectDetail> {
+  if (!expectedAccountId) throw new ApiError(401, "Sign in before opening a project.");
+  const result = await request<(ProjectDetail & { accountId: string }) | null>(`/api/projects/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+    headers: { "x-groundwork-account": expectedAccountId },
+    signal,
+  });
+  if (result?.accountId !== expectedAccountId) {
+    throw new ApiError(409, "The project account could not be verified. Reload Groundwork to refresh your session.", undefined, "ACCOUNT_CHANGED");
+  }
+  const { accountId: _accountId, ...project } = result;
+  return project;
 }
 
 export function patchProject(

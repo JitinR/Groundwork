@@ -128,6 +128,7 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
     // Sample base64 image (valid pure PNG 32x32)
     const samplePngBuffer = generatePurePng(32, 32, () => [220, 230, 240, 255]);
     const sampleBase64 = `data:image/png;base64,${samplePngBuffer.toString("base64")}`;
+    let unconfiguredAttempt: { id: string; sourceImageArtifactId: string };
     await t.test("capabilities endpoint reflects current render provider and style presets", async () => {
         const res = await client.request(`/api/projects/${projectId}/renders/capabilities`);
         assert.equal(res.status, 200);
@@ -172,7 +173,24 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
         assert.equal(job.errorCode, "PROVIDER_UNCONFIGURED");
         assert.ok(job.errorMessage.includes("AI photorealistic rendering requires"));
         assert.ok(job.sourceImageArtifactId);
-        // Reset provider to Demo
+        unconfiguredAttempt = job;
+        for (let i = 0; i < 3; i += 1) {
+            const additional = await client.request(`/api/projects/${projectId}/renders`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt: "Material study", sourceRevision: 0, sourceImageArtifactId: job.sourceImageArtifactId }),
+            });
+            assert.equal(additional.status, 201);
+        }
+        const blocked = await client.json<{ code: string }>(`/api/projects/${projectId}/renders`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: "Daylight study", sourceRevision: 0, sourceImageBase64: sampleBase64 }),
+        });
+        assert.equal(blocked.response.status, 503);
+        assert.equal(blocked.body.code, "PROVIDER_UNCONFIGURED");
+        const storage = await db.prepare("SELECT COUNT(*) AS count FROM project_workspace_artifacts WHERE project_id=?").get(projectId) as { count: number };
+        assert.equal(storage.count, 1, "unavailable submissions must leave existing project files unchanged");
         setRenderProviderForTesting(new DemoRenderProvider());
     });
     let succeededJobId = "";
@@ -334,5 +352,17 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
         // Verify artifact is still safely readable
         const read = await readWorkspaceArtifact(projectId, outputArtifactId, actor);
         assert.ok(read.bytes.length > 0);
+    });
+    await t.test("project owner can remove an unsuccessful attempt while preserving project images and successful history", async () => {
+        const retained = await client.request(`/api/projects/${projectId}/renders/${succeededJobId}`, { method: "DELETE" });
+        assert.equal(retained.status, 409);
+        const remove = await client.request(`/api/projects/${projectId}/renders/${unconfiguredAttempt.id}`, { method: "DELETE" });
+        assert.equal(remove.status, 204);
+        const removed = await client.request(`/api/projects/${projectId}/renders/${unconfiguredAttempt.id}`);
+        assert.equal(removed.status, 404);
+        const sessionRow = await db.prepare("SELECT id FROM sessions WHERE user_id=? AND status='active'").get(userId) as { id: string };
+        const actor = { userId, sessionId: sessionRow.id };
+        assert.deepEqual((await readWorkspaceArtifact(projectId, unconfiguredAttempt.sourceImageArtifactId, actor)).bytes, samplePngBuffer);
+        assert.ok((await readWorkspaceArtifact(projectId, outputArtifactId, actor)).bytes.length > 0);
     });
 });

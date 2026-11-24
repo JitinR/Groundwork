@@ -32,12 +32,17 @@ export interface MepNetworkReport {
 
 const routeLength = (element: MepElement) => element.route.reduce((sum, point, index) => index ? sum + Math.hypot(point.x - element.route[index - 1].x, point.y - element.route[index - 1].y, point.z - element.route[index - 1].z) : 0, 0);
 
-export function defaultSystem(element: MepElement): MepSystemType {
+export function defaultSystem(element: Pick<MepElement, "kind" | "system">): MepSystemType {
   if (element.system) return element.system;
   if (element.kind === "duct") return "hvac-supply";
   if (element.kind === "pipe") return "plumbing-supply";
   if (element.kind === "cable-tray" || element.kind === "equipment") return "electrical-power";
   return "controls";
+}
+
+export function electricalPlanningLoads(elements: MepElement[], demandFactor: number) {
+  const connectedKw = elements.reduce((sum, item) => sum + (item.ratedPowerKw ?? 0), 0);
+  return { connectedKw, demandKw: connectedKw * Math.min(Math.max(demandFactor, 0), 1) };
 }
 
 export function analyzeMepNetwork(design: MepDesign | undefined): MepNetworkReport {
@@ -131,8 +136,7 @@ export function analyzeMepNetwork(design: MepDesign | undefined): MepNetworkRepo
   });
 
   const electricalElements = elements.filter((item) => defaultSystem(item) === "electrical-power");
-  const connectedKw = electricalElements.reduce((sum, item) => sum + (item.ratedPowerKw ?? 0), 0);
-  const demandKw = connectedKw * Math.min(Math.max(p?.electricalDemandFactor ?? 0.8, 0), 1);
+  const { connectedKw, demandKw } = electricalPlanningLoads(electricalElements, p?.electricalDemandFactor ?? 0.8);
   const voltage = Math.max(p?.designVoltageV ?? 230, 1);
   const currentA = demandKw * 1000 / voltage;
   const maxRoute = electricalElements.reduce((max, element) => Math.max(max, routeLength(element)), 0);

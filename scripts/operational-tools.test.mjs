@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { allowedOrigin, probe, alert, backupFreshness, monitorCadence } from './operational-health.mjs';
+import { allowedOrigin, probe, alert, backupFreshness, monitorCadence, checkMonitorCadence } from './operational-health.mjs';
 import { measure, percentile } from './operational-performance.mjs';
 
 test('operational probes require exact allowlisted origins and isolated performance targets', async () => {
@@ -27,6 +27,11 @@ test('operational alerts are opt-in, TLS-only and never send during tests', asyn
   await alert(report, { OPS_SEND_ALERTS: '1', OPS_ALERT_TO: 'owner@example.test', MAIL_FROM: 'ops@example.test', MAIL_HOST: 'smtp.example.test', MAIL_USER: 'synthetic', MAIL_PASS: 'synthetic', MAIL_PORT: '587' }, factory);
   assert.equal(config.requireTLS, true); assert.equal(config.tls.rejectUnauthorized, true);
   assert.equal(message.to, 'owner@example.test'); assert.equal(message.text.includes('synthetic'), false); assert.equal(closed, true);
+  await alert({ ...report, samples: [], reason: 'monitor_cadence_gap', ageMinutes: 90 },
+    { OPS_SEND_ALERTS: '1', OPS_ALERT_TO: 'owner@example.test', MAIL_FROM: 'ops@example.test', MAIL_HOST: 'smtp.example.test', MAIL_USER: 'synthetic', MAIL_PASS: 'synthetic' }, factory);
+  assert.match(message.subject, /monitoring cadence/);
+  assert.match(message.text, /90 minutes ago/);
+  assert.doesNotMatch(message.text, /0 health attempts|synthetic/);
 });
 test('p99 uses nearest rank over all observed samples', () => {
   const values = Array.from({ length: 100 }, (_, index) => index + 1);
@@ -65,4 +70,32 @@ test('monitor cadence counts the original scheduled probe, excluding manual and 
   assert.equal((await monitorCadence(env, fixture(undefined), now)).reason, 'monitor_probe_unverified');
   assert.equal((await monitorCadence(env, fixture(probeStep, []), now)).reason, 'monitor_run_missing');
   assert.equal((await monitorCadence(env, async () => new Response(null, { status: 503 }), now)).reason, 'monitor_evidence_unavailable');
+});
+
+test('independent cadence check detects overdue Actions without a current GitHub run', async () => {
+  const now = Date.parse('2026-11-06T12:00:00Z');
+  const env = { GITHUB_REPOSITORY: 'fixture/repo', GITHUB_TOKEN: 'synthetic', OPS_DEFAULT_BRANCH: 'main',
+    OPS_HEALTH_ORIGIN: 'https://fixture.example', OPS_HEALTH_ALLOWED_ORIGINS: 'https://fixture.example', OPS_SEND_ALERTS: '1' };
+  const run = { id: 20, head_branch: 'main', event: 'schedule', status: 'completed', conclusion: 'success', created_at: '2026-11-06T09:00:00Z' };
+  const fixture = completed => async (url, options) => {
+    assert.equal(options.redirect, 'error');
+    if (url.includes('/operations-health.yml/runs?')) return Response.json({ workflow_runs: [run] });
+    assert.match(url, /\/actions\/runs\/20\/attempts\/1\/jobs\?/);
+    return Response.json({ jobs: [{ name: 'health', steps: [{ name: 'Check external health and send authorized SMTP alert on failure', status: 'completed', conclusion: 'success', completed_at: completed }] }] });
+  };
+  let deliveries = 0;
+  const notify = async payload => {
+    deliveries += 1;
+    assert.equal(payload.origin, env.OPS_HEALTH_ORIGIN);
+    assert.equal(payload.reason, 'monitor_cadence_gap');
+    assert.equal(payload.ageMinutes, 120);
+    return { sent: true };
+  };
+  const stale = { independent: true, request: fixture('2026-11-06T10:00:00Z'), now, notify };
+  assert.deepEqual(await checkMonitorCadence(env, stale), { ok: false, reason: 'monitor_cadence_gap', ageMinutes: 120, alert: { sent: true } });
+  assert.deepEqual(await checkMonitorCadence({ ...env, OPS_SEND_ALERTS: '0' }, stale), { ok: false, reason: 'monitor_cadence_gap', ageMinutes: 120 });
+  assert.equal((await checkMonitorCadence(env, { ...stale, request: fixture('2026-11-06T11:30:00Z') })).ok, true);
+  assert.equal(deliveries, 1);
+  const unavailable = await checkMonitorCadence(env, { ...stale, request: async () => new Response(null, { status: 503 }), notify: async () => { throw new Error('SMTP internal detail'); } });
+  assert.deepEqual(unavailable, { ok: false, reason: 'monitor_evidence_unavailable', alert: { sent: false, reason: 'alert_delivery_failed' } });
 });

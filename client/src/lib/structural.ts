@@ -129,19 +129,18 @@ export function analyzeCommunity(design: CommunityDesign): StructuralAnalysis {
   }
 
   const structuralDrafts = design.drafts ?? [];
-  const draftedColumnCount = structuralDrafts.filter((draft) => draft.kind === "column").length;
-  const draftedElementCount = structuralDrafts.filter((draft) => draft.kind === "wall" || draft.kind === "slab" || draft.kind === "column" || draft.kind === "roof").length;
+  const draftedElementCount = structuralDrafts.filter((draft) => draft.kind === "wall" || draft.kind === "slab" || draft.kind === "column" || draft.kind === "beam" || draft.kind === "roof").length;
+  const gridX = design.structuralGrid?.filter((line) => line.axis === "x").length ?? 0;
+  const gridZ = design.structuralGrid?.filter((line) => line.axis === "z").length ?? 0;
+  // A drafted occurrence does not establish a load-bearing support or a load path.
+  const columnCount = Math.max(4, (gridX + 1) * (gridZ + 1));
   const results = design.towers.map((tower) => {
     const size = towerMeters(tower);
     const areaM2 = size.w * size.d;
     const loadKN = areaM2 * Math.max(tower.floors, 1) * (settings.deadLoadKPa + settings.liveLoadKPa);
     const deadKN = areaM2 * Math.max(tower.floors, 1) * settings.deadLoadKPa;
     const liveKN = areaM2 * Math.max(tower.floors, 1) * settings.liveLoadKPa;
-    const gridX = design.structuralGrid?.filter((line) => line.axis === "x").length ?? 0;
-    const gridZ = design.structuralGrid?.filter((line) => line.axis === "z").length ?? 0;
-    const gridColumnCount = Math.max(4, (gridX + 1) * (gridZ + 1));
-    // Drafted columns are explicit coordination geometry; legacy designs use the grid fallback.
-    const columnCount = draftedColumnCount > 0 ? draftedColumnCount : gridColumnCount;
+    const draftedColumnCount = structuralDrafts.filter((draft) => draft.kind === "column" && draft.family?.hostId === tower.id).length;
     const columnCapacityKN = settings.concreteStrengthMPa * settings.columnWidthM * settings.columnDepthM * 1000 / settings.safetyFactor;
     const columnUtilization = loadKN / columnCount / columnCapacityKN;
     const beamSpanM = Math.max(size.w / Math.max(gridX, 1), size.d / Math.max(gridZ, 1));
@@ -163,14 +162,13 @@ export function analyzeCommunity(design: CommunityDesign): StructuralAnalysis {
     const lateralUtilization = lateralDemandKN / Math.max(lateralCapacityKN, 1);
     const driftRatio = lateralDemandKN * Math.max(size.h, 1) / Math.max(lateralCapacityKN * 100, 1);
     const slendernessRatio = size.h / Math.max(Math.min(settings.columnWidthM, settings.columnDepthM), 0.01);
-    const loadPath = ["floor area", "slab/beam diaphragm", "columns or walls", "footings", "soil"].slice(0, draftedElementCount ? 5 : 3);
+    const loadPath = ["floor area", "slab/beam diaphragm", "columns or walls", "footings", "soil"];
     const connectionWarnings = [
       ...(design.structuralGrid?.length ? [] : ["Structural grid is not defined; collector and diaphragm connections cannot be coordinated."]),
-      ...(draftedColumnCount ? [] : ["No drafted columns are available; column-to-beam and foundation connections are not represented."]),
-      ...(structuralDrafts.some((draft) => draft.kind === "wall") ? [] : ["No drafted lateral walls are available; verify the selected lateral-force-resisting system."]),
+      "Verify the assumed load path, column-to-beam and foundation connections, and lateral-force-resisting system.",
     ];
     const checks: StructuralCheck[] = [
-      { status: governing.loadKN / columnCount / columnCapacityKN <= 1 ? "pass" : "warning", text: `${draftedColumnCount > 0 ? "Drafted" : "Fallback"} column screening utilization ${((governing.loadKN / columnCount / columnCapacityKN) * 100).toFixed(0)}% under ${governing.combination.label}` },
+      { status: governing.loadKN / columnCount / columnCapacityKN <= 1 ? "pass" : "warning", text: `Column screening utilization ${((governing.loadKN / columnCount / columnCapacityKN) * 100).toFixed(0)}% under ${governing.combination.label} using ${columnCount} assumed supports` },
       { status: beamUtilization <= 1 ? "pass" : "warning", text: `Beam screening utilization ${(beamUtilization * 100).toFixed(0)}%` },
       { status: foundationPressureKPa <= settings.soilBearingKPa ? "pass" : "warning", text: `Foundation pressure ${foundationPressureKPa.toFixed(0)} kPa vs ${settings.soilBearingKPa.toFixed(0)} kPa soil input` },
       { status: lateralUtilization <= 1 ? "pass" : "warning", text: `Lateral demand screen ${lateralUtilization.toFixed(2)}x (${lateralDemandKN.toFixed(0)} kN demand)` },
@@ -193,8 +191,8 @@ export function analyzeCommunity(design: CommunityDesign): StructuralAnalysis {
       ...(settings.soilType === "unknown" ? ["Soil type is unknown; bearing, settlement, liquefaction, lateral resistance, and foundation depth are not established."] : []),
       ...(settings.windExposure === "unknown" ? ["Wind exposure is unknown; pressure is a user-entered planning value, not a site wind study."] : []),
       ...(design.towers.length === 0 ? ["Add at least one tower or block to produce checks."] : []),
-      ...(design.structuralGrid?.length || draftedColumnCount ? [] : ["No structural grid or drafted columns are defined; default column count is used."]),
-      ...(draftedElementCount ? [`${draftedElementCount} drafted structural element${draftedElementCount === 1 ? "" : "s"} included as coordination context.`] : ["No drafted structural elements are defined; column checks use the grid fallback."]),
+      ...(design.structuralGrid?.length ? [] : ["No structural grid is defined; four supports per tower are assumed."]),
+      ...(draftedElementCount ? [`${draftedElementCount} drafted structural element${draftedElementCount === 1 ? "" : "s"} present for coordination only. Screening uses the grid-based support assumption.`] : []),
     ],
     assumptions: structuralAssumptions(settings),
   };

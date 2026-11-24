@@ -3,14 +3,37 @@ import assert from "node:assert/strict";
 import { defaultDesign, type Design, type DraftElement } from "../src/types";
 import { cadFootprintArea, cadQuantities, createCadObject, executeCadCommand, localCadAxis, resizeDraft, resolveCadSnap } from "../src/lib/cadModel";
 import { buildDxf } from "../src/lib/dxf";
-import { buildBimExchange, buildIfcStep, ifcSourceGuid, validateIfcProfile, validateIfcStep } from "../src/lib/bim";
+import { defaultCommunity, defaultTower, makeAmenity } from "../src/lib/community";
+import { defaultInfra } from "../src/lib/infra";
+import { buildBimExchange, buildBimScheduleCsv, buildIfcStep, ifcSourceGuid, validateIfcProfile, validateIfcStep } from "../src/lib/bim";
 import { inspectBimGeometry } from "../src/lib/bimValidation";
-import { documentationInventory } from "../src/lib/documentationSchedule";
+import { documentationInventory, documentationScheduleCsv } from "../src/lib/documentationSchedule";
 import { exportIfcMeshObj, exportIfcRoundTrip, ifcGeometryCoverageWarnings, importIfcGeometry } from "../src/lib/ifcGeometry";
-import { buildObjMtl } from "../src/lib/obj";
+import { buildBillOfMaterials, buildObjMtl } from "../src/lib/obj";
+import { buildBoqCsv } from "../src/lib/notes";
 
 const close = (actual: number, expected: number, tolerance = 1e-8) => assert.ok(Math.abs(actual - expected) < tolerance, `${actual} != ${expected}`);
 const project = (...objects: DraftElement[]): Design => ({ ...defaultDesign(), drafts: objects, cad: { version: 1, revision: 7 } });
+
+test("model CSV exports preserve literal labels, separators and typed quantities", () => {
+  const design = defaultDesign();
+  const customType = '- Existing "bench"';
+  const furniture = { id: "bench-a", type: customType, name: '\n- Existing "bench", north', x: 0, z: 0, rotationDeg: 0, scale: 1, color: "Blue" };
+  design.furniture = [furniture, { ...furniture, id: "bench-b", color: "Green" }];
+  design.curtains = { enabled: true, style: "sheer", color: "Warm, white", wall: "north", heightPercent: 80, widthPercentPerPanel: 25 };
+
+  assert.ok(buildBimScheduleCsv(design).includes(`"bench-a","FURNISHING","'\n- Existing ""bench"", north",`));
+  assert.equal(buildBillOfMaterials(design), [
+    "Qty,Item,Type,Size W x D x H (mm),Colours",
+    `2,"'- Existing ""bench""","'- Existing ""bench""","0 x 0 x 0","Blue, Green"`,
+    `1,"Curtains","sheer","wall-mounted","Warm, white"`,
+    "",
+  ].join("\n"));
+  assert.ok(buildBoqCsv([{ group: "Furniture", label: customType, qty: 2, unit: "ea", basis: "Survey, level 1" }])
+    .includes(`"Furniture","'- Existing ""bench""","2","ea","Survey, level 1"`));
+  assert.ok(documentationScheduleCsv({ fields: ["Name", "Elevation m"], rows: [{ id: "bench-a", sourceIds: [], cells: [customType, -1.23456] }], sourceCount: 1, warnings: [] })
+    .includes(`"'- Existing ""bench""","-1.2346"`));
+});
 
 test("OBJ retains hidden authored mesh dimensions, rotated position and stable identity", () => {
   const column = { ...createCadObject("column"), x: 12, z: 7, w: .6, d: .5, h: 4.2, rotationDeg: 90, visible: false };
@@ -106,6 +129,39 @@ test("DXF plan coordinates follow the same positive-Y rotation as the viewport",
   const z = entity.values.filter(([code]) => code === 20).map(([,value]) => Number(value));
   assert.deepEqual(x, [2900,2900,3100,3100]); assert.deepEqual(z, [7000,3000,3000,7000]);
   assert.match(buildIfcStep(project(wall)), /IFCDIRECTION\(\(0\.000000000,-1\.000000000,0\.\)\)/);
+});
+
+test("community DXF uses the rotated tower footprint from the design without exporting the default room", () => {
+  const community = { ...defaultCommunity("commercial"), commercialStyle: "hotel" as const };
+  community.towers = [{
+    ...defaultTower("commercial", "Hotel", 45, 12),
+    unitsPerFloor: 4, unitWidth: 6, unitDepth: 8, commonAreaPerFloor: 25, rotY: 90,
+  }];
+  community.amenities = [{ ...makeAmenity("circle-platform", 20, 30), w: 16, d: 8 }];
+  const entities = dxfEntities(buildDxf({ ...defaultDesign(), community }));
+  const walls = entities.filter(entity => entity.values.some(([code, value]) => code === 8 && value === "WALLS"));
+  assert.equal(walls.length, 1, "only the hotel contributes a wall footprint");
+  const [tower] = walls;
+  assert.deepEqual(tower.values.filter(([code]) => code === 10).map(([, value]) => Number(value)), [36000, 36000, 54000, 54000]);
+  assert.deepEqual(tower.values.filter(([code]) => code === 20).map(([, value]) => Number(value)), [19000, 5000, 5000, 19000]);
+  const circle = entities.find(entity => entity.kind === "CIRCLE");
+  assert.ok(circle);
+  assert.ok(circle.values.some(([code, value]) => code === 40 && Number(value) === 4000));
+  assert.ok(!entities.some(entity => entity.values.some(([code, value]) => code === 8 && value === "DIMENSIONS")));
+});
+
+test("highway DXF contains the concept carriageway, median and shoulders instead of a room", () => {
+  const infra = defaultInfra("highway");
+  const source = buildDxf({ ...defaultDesign(), infra });
+  const entities = dxfEntities(source);
+  const onLayer = (name: string) => entities.filter(entity => entity.kind === "LWPOLYLINE" && entity.values.some(([code, value]) => code === 8 && value === name));
+  const xCoordinates = (entity: (typeof entities)[number]) => entity.values.filter(([code]) => code === 10).map(([, value]) => Number(value));
+  const zCoordinates = (entity: (typeof entities)[number]) => entity.values.filter(([code]) => code === 20).map(([, value]) => Number(value));
+  assert.deepEqual(onLayer("HIGHWAY_CARRIAGEWAY").map(xCoordinates), [[-8500, -1500, -1500, -8500], [1500, 8500, 8500, 1500]]);
+  assert.deepEqual(onLayer("HIGHWAY_MEDIAN").map(zCoordinates), [[-400000, -400000, 400000, 400000]]);
+  assert.deepEqual(onLayer("HIGHWAY_SHOULDER").map(xCoordinates), [[-10000, -8500, -8500, -10000], [8500, 10000, 10000, 8500]]);
+  assert.equal(onLayer("WALLS").length, 0);
+  assert.match(source, /Straight local highway concept plan/);
 });
 
 test("polygon exchange preserves its authored footprint and net quantities", () => {

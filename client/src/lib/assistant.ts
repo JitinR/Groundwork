@@ -1,5 +1,5 @@
 import type { AssistantAction, BuildingBranch, CommunityDesign, DraftElement, DraftElementKind, FurnitureItem, InfraDesign, InfraFacility, UnitSystem } from "../types";
-import { AMENITIES, amenityAllowed, amenityKind, defaultTower, makeAmenity } from "./community";
+import { AMENITIES, amenityAllowed, amenityFootprint, amenityKind, defaultTower, makeAmenity, updateAmenity } from "./community";
 import { catalogEntry, furnitureMount } from "./catalog";
 import { uid } from "./modelcore";
 
@@ -46,6 +46,10 @@ function validAmenityPatch(value: unknown): boolean {
   });
 }
 
+function validCircleDimensions(dimensions: { w?: number; d?: number }): boolean {
+  return dimensions.w === undefined || dimensions.d === undefined || dimensions.w === dimensions.d;
+}
+
 function actionLabel(action: AssistantAction): string {
   switch (action.type) {
     case "set_plot_dimensions": return `Set plot to ${action.width} x ${action.depth} ${action.unit}`;
@@ -90,9 +94,13 @@ function invalidAction(action: AssistantAction, design: CommunityDesign, branch:
         (action.unitsPerFloor === undefined || (Number.isInteger(action.unitsPerFloor) && action.unitsPerFloor >= 1 && action.unitsPerFloor <= 1000)) ? undefined : "Tower values are invalid.";
     case "remove_tower": return design.towers.some((tower) => tower.id === action.towerId) ? undefined : "Tower was not found.";
     case "update_tower": return design.towers.some((tower) => tower.id === action.towerId) && validTowerPatch(action.patch) ? undefined : "Tower was not found or its patch is invalid.";
-    case "add_amenity": return Boolean(amenityKind(action.kind)) && amenityAllowed(action.kind, branch) && isFiniteNumber(action.x) && isFiniteNumber(action.z) && (action.w === undefined || validDimension(action.w, 10000)) && (action.d === undefined || validDimension(action.d, 10000)) && (action.h === undefined || validDimension(action.h, 10000)) ? undefined : "Amenity is unavailable for this branch or has invalid dimensions.";
+    case "add_amenity": return amenityAllowed(action.kind, branch, design.commercialStyle) && (amenityKind(action.kind)?.shape !== "circle" || validCircleDimensions(action)) && isFiniteNumber(action.x) && isFiniteNumber(action.z) && (action.w === undefined || validDimension(action.w, 10000)) && (action.d === undefined || validDimension(action.d, 10000)) && (action.h === undefined || validDimension(action.h, 10000)) ? undefined : "Amenity is unavailable for this branch or has invalid dimensions.";
     case "remove_amenity": return design.amenities.some((amenity) => amenity.id === action.amenityId) ? undefined : "Amenity was not found.";
-    case "update_amenity": return design.amenities.some((amenity) => amenity.id === action.amenityId) && validAmenityPatch(action.patch) ? undefined : "Amenity was not found or its patch is invalid.";
+    case "update_amenity": {
+      const amenity = design.amenities.find((item) => item.id === action.amenityId);
+      return amenity && validAmenityPatch(action.patch) && (amenityFootprint(amenity).diameter === undefined || validCircleDimensions(action.patch))
+        ? undefined : "Amenity was not found or its patch is invalid. Circular amenities require one diameter.";
+    }
     case "add_drafting_element": return validDraftKind(action.kind) && validDimension(action.w, 10000) && validDimension(action.d, 10000) && isFiniteNumber(action.x) && isFiniteNumber(action.z) && isFiniteNumber(action.rotationDeg) && validColor(action.color) && (action.h === undefined || validDimension(action.h, 10000)) && (action.label === undefined || typeof action.label === "string") ? undefined : "Drafting geometry is invalid.";
     case "update_room_opening": {
       const room = design.interiors.find((item) => item.id === action.roomId);
@@ -141,9 +149,13 @@ export function applyCommunityAssistantActions(actions: AssistantAction[], desig
       }
       case "remove_tower": next = { ...next, towers: next.towers.filter((tower) => tower.id !== action.towerId), interiors: next.interiors.filter((room) => room.towerId !== action.towerId), exteriors: next.exteriors.filter((panel) => panel.towerId !== action.towerId) }; if (selectedId === action.towerId) selectedId = undefined; step = "towers"; break;
       case "update_tower": next = { ...next, towers: next.towers.map((tower) => tower.id === action.towerId ? { ...tower, ...action.patch } : tower) }; selectedId = action.towerId; step = "towers"; break;
-      case "add_amenity": { const amenity = { ...makeAmenity(action.kind, action.x, action.z), ...(action.w === undefined ? {} : { w: action.w }), ...(action.d === undefined ? {} : { d: action.d }), ...(action.h === undefined ? {} : { h: action.h }) }; next = { ...next, amenities: [...next.amenities, amenity] }; selectedId = amenity.id; step = "amenities"; break; }
+      case "add_amenity": { const amenity = updateAmenity(makeAmenity(action.kind, action.x, action.z), {
+        ...(action.w === undefined ? {} : { w: action.w }),
+        ...(action.d === undefined ? {} : { d: action.d }),
+        ...(action.h === undefined ? {} : { h: action.h }),
+      }); next = { ...next, amenities: [...next.amenities, amenity] }; selectedId = amenity.id; step = "amenities"; break; }
       case "remove_amenity": next = { ...next, amenities: next.amenities.filter((amenity) => amenity.id !== action.amenityId) }; if (selectedId === action.amenityId) selectedId = undefined; step = "amenities"; break;
-      case "update_amenity": next = { ...next, amenities: next.amenities.map((amenity) => amenity.id === action.amenityId ? { ...amenity, ...action.patch } : amenity) }; selectedId = action.amenityId; step = "amenities"; break;
+      case "update_amenity": next = { ...next, amenities: next.amenities.map((amenity) => amenity.id === action.amenityId ? updateAmenity(amenity, action.patch) : amenity) }; selectedId = action.amenityId; step = "amenities"; break;
       case "add_drafting_element": { const draft: DraftElement = { id: uid("ai"), kind: action.kind, x: action.x, z: action.z, w: action.w, d: action.d, h: action.h, rotationDeg: action.rotationDeg, color: action.color, label: action.label }; next = { ...next, drafts: [...(next.drafts ?? []), draft] }; selectedId = draft.id; step = "drafting"; break; }
       case "update_room_opening": {
         next = { ...next, interiors: next.interiors.map((room) => room.id !== action.roomId ? room : {

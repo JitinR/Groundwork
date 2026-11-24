@@ -46,3 +46,12 @@ jobs:
         env:
           OPS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GITHUB_TOKEN: ${{ github.token }}
+          OPS_HEALTH_ORIGIN: ${{ vars.OPS_HEALTH_ORIGIN }}
+          OPS_HEALTH_ALLOWED_ORIGINS: ${{ vars.OPS_HEALTH_ALLOWED_ORIGINS }}
+          OPS_SEND_ALERTS: ${{ steps.probe.outcome == 'success' && '1' || '0' }}
+          OPS_ALERT_TO: ${{ vars.OPS_ALERT_TO }}
+          MAIL_HOST: ${{ secrets.OPS_MAIL_HOST }}
+          MAIL_PORT: ${{ vars.OPS_MAIL_PORT }}
+          MAIL_FROM: ${{ secrets.OPS_MAIL_FROM }}
+          MAIL_USER: ${{ secrets.OPS_MAIL_USER }}
+          MAIL_PASS: ${{ secrets.OPS_MAIL_PASS }}

@@ -92,23 +92,29 @@ request URLs, credentials or underlying exception messages. If acknowledgement
 is unconfirmed, inspect deployments for the exact SHA before deciding on further
 delivery; never automatically rerun the hook to resolve that uncertainty.
 
-The Vercel build command runs `scripts/deploy-after-ci.mjs --build-guard` before
-building. It verifies matching repository/branch/commit metadata against current
-successful CI evidence; production requires `main`. This second check refuses
+Vercel's install command runs `scripts/deploy-after-ci.mjs --install-guard`
+before `npm ci`. The build command then runs `--build-guard` before compiling.
+Both phases verify matching repository, branch and commit metadata against
+current successful CI evidence. Production requires `main`. These checks catch
 an untested branch head if the deploy hook races a later push. CLI deployments
-must also supply matching Git metadata or the explicit
+must supply matching Git metadata or the explicit
 `GROUNDWORK_RELEASE_COMMIT`/`GROUNDWORK_RELEASE_BRANCH` values. The current public
 repository requires no persistent GitHub credential in Vercel for these reads.
 
-Preview builds can start while GitHub Actions is still queued or running. The
-preview guard waits up to 30 minutes, polling only the matching push-CI workflow
-once every two minutes. It then rechecks the exact branch head, newest CI attempt
-and all three required jobs before building. Failed, cancelled, foreign or
-malformed evidence remains blocked. Production keeps the immediate strict guard
-and the existing post-CI deploy hook. Logs distinguish waiting for CI from an
-actual verification failure; a waiting preview does not need a manual redeploy.
+An admitted preview can wait in the install guard while GitHub Actions is queued
+or running. It polls the matching push-CI workflow every two minutes for up to
+30 minutes. It then rechecks the exact branch head, newest CI attempt and all
+three required jobs before installing dependencies. The build-stage check
+refuses stale evidence immediately. Failed, cancelled, foreign or malformed
+evidence remains blocked. Production keeps the existing post-CI deploy hook.
 The bounded wait fits within Vercel's
 [45-minute build limit](https://vercel.com/docs/deployments/troubleshoot-a-build).
+
+Keep [Git Fork Protection](https://vercel.com/docs/project-configuration/security-settings#git-fork-protection)
+enabled and verify who can approve or start previews in Vercel. Those settings
+govern whether a branch can enter the build environment. A branch can change
+its own install and build commands. Scope application credentials to Production
+and verify any shared or integration-managed credentials have the same scope.
 
 The hook/build guard path is activated and the 1.1.1 exact-source deployment
 above passed. Main requires `release-gate` with branch protection. For a new

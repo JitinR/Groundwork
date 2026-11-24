@@ -26,7 +26,8 @@ function filteredHeaders(headers: IncomingHttpHeaders, request: boolean): Outgoi
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase();
     if (value === undefined || hopHeaders.has(lower) || connectionNames.has(lower)) continue;
-    if (lower.startsWith("x-groundwork-") && (request || lower !== "x-groundwork-authority-id")) continue;
+    if (lower.startsWith("x-groundwork-") &&
+        lower !== (request ? "x-groundwork-account" : "x-groundwork-authority-id")) continue;
     if (request && (lower === "host" || lower === "forwarded" || lower.startsWith("x-forwarded-") || ["x-real-ip", "true-client-ip", "cf-connecting-ip"].includes(lower))) continue;
     result[name] = value;
   }
@@ -120,6 +121,7 @@ function proxyApi(req: Request, res: Response): void {
     const declaredLength = incoming.headers["content-length"];
     if (!sse && declaredLength !== undefined && (!/^\d+$/.test(declaredLength) || !Number.isSafeInteger(Number(declaredLength)) || Number(declaredLength) > configuration.maximumResponseBytes)) { fail(502, "Authority response exceeds the gateway transfer budget"); return; }
     const outgoing = filteredHeaders(incoming.headers, false);
+    outgoing["cache-control"] = "private, no-store";
     const location = incoming.headers.location;
     if (location) {
       // Preserve browser redirects (including configured OIDC authorization).
@@ -156,7 +158,10 @@ function proxyApi(req: Request, res: Response): void {
   // are preserved through the bounded transforms, including webhook signatures.
   req.pipe(requestLimit).pipe(upstream);
 }
-app.use("/api", proxyApi);
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  next();
+}, proxyApi);
 app.use("/api", (_req, res) => { res.status(502).json({ error: "Central API routing failed" }); });
 mountPublicSite(app, clientDist);
 app.use((_req, res) => { res.status(404).json({ error: "Secondary host asset not found" }); });

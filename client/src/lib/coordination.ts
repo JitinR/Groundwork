@@ -1,5 +1,6 @@
 import type { ReviewComment, ReviewMarker, ReviewViewpoint } from "../types";
 import type { ReviewFinding } from "./review";
+import { quoteCsvCell } from "./csv";
 
 export const MAX_REVIEW_MARKERS = 2000;
 export const MAX_REVIEW_COMMENTS = 100;
@@ -95,13 +96,9 @@ export function mergeImportedReviewMarkers(current: ReviewMarker[], imported: Re
   return { markers: next, added, existing, skipped };
 }
 
-const csvCell = (value: string | number) => {
-  const safe = typeof value === "string" && /^[\s]*[=+\-@]/.test(value) ? `'${value}` : String(value);
-  return `"${safe.replace(/"/g, '""')}"`;
-};
 export function reviewRegisterCsv(markers: ReviewMarker[]): string {
   const header = ["ID", "Issue", "Severity", "Workflow", "Category", "Assignee", "Due date", "Target IDs", "X (m)", "Z (m)", "Comments", "Created", "Updated", "BCF topic GUID"];
-  return [header, ...markers.map(marker => [marker.id, marker.text, marker.severity, reviewWorkflow(marker), marker.category ?? "manual", marker.assignee ?? "", marker.dueDate ?? "", (marker.targetIds ?? []).join(";"), marker.x, marker.z, marker.comments?.length ?? 0, marker.createdAt ?? "", marker.updatedAt ?? "", marker.bcfTopicGuid ?? ""])].map(row => row.map(csvCell).join(",")).join("\r\n");
+  return [header, ...markers.map(marker => [marker.id, marker.text, marker.severity, reviewWorkflow(marker), marker.category ?? "manual", marker.assignee ?? "", marker.dueDate ?? "", (marker.targetIds ?? []).join(";"), marker.x, marker.z, marker.comments?.length ?? 0, marker.createdAt ?? "", marker.updatedAt ?? "", marker.bcfTopicGuid ?? ""])].map(row => row.map(quoteCsvCell).join(",")).join("\r\n");
 }
 
 export function reviewRegisterJson(markers: ReviewMarker[]): string {

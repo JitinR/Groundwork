@@ -56,6 +56,7 @@ import {
   FACADES,
   INTERIOR_TYPES,
   UNIT_LABELS,
+  amenityFootprint,
   amenityKind,
   amenitiesFor,
   defaultUnderground,
@@ -66,6 +67,10 @@ import {
   makeAmenity,
   makeRoom,
   towerMeters,
+  undergroundDepth,
+  undergroundParkingBayLayout,
+  undergroundRamp,
+  updateAmenity,
 } from "../lib/community";
 
 type StepId = "land" | "parking" | "basement" | "levels" | "drafting" | "analysis" | "amenities" | "towers" | "exterior" | "interiors" | "mep" | "takeoff" | "review";
@@ -98,6 +103,7 @@ interface CommunityEditorProps {
   branch: BuildingBranch;
   community: CommunityDesign;
   onChange: (c: CommunityDesign) => void;
+  readOnly?: boolean;
   initialStep?: StepId;
   projectName?: string;
   design?: import("../types").Design;
@@ -157,7 +163,8 @@ function UndergroundForm({
 }) {
   const ug = park.underground ?? defaultUnderground();
   const setUg = (patch: Partial<typeof ug>) => update({ parking: { ...park, underground: { ...ug, ...patch } } });
-  const total = ug.levels * ug.floorHeight + ug.foundationDepth;
+  const ramp = undergroundRamp(ug);
+  const total = undergroundDepth(ug);
   return (
     <>
       <p className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-xs leading-relaxed text-slate-400">
@@ -165,17 +172,13 @@ function UndergroundForm({
       </p>
       <div className="grid grid-cols-2 gap-3">
         <Num label="Basement floors" value={ug.levels} onChange={(v) => setUg({ levels: Math.max(Math.round(v) || 1, 1) })} min={1} step={1} unit=" lvl" />
-        <Num label="Clear height / floor" value={ug.floorHeight} onChange={(v) => setUg({ floorHeight: Math.max(v || 2.4, 2.4) })} min={2.4} step={0.1} unit=" m" />
+        <Num label="Basement storey height" value={ug.floorHeight} onChange={(v) => setUg({ floorHeight: Math.max(v || 2.4, 2.4) })} min={2.4} step={0.1} unit=" m" />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <Num
           label="Parking Breadth (Width)"
           value={ug.parkingWidthM ?? 36}
-          onChange={(v) => {
-            const width = Math.max(v || 10, 6);
-            const cols = Math.max(1, Math.floor((width - 4) / ((ug.bayWidth || 2.5) + 0.5)));
-            setUg({ parkingWidthM: width, bayCols: cols });
-          }}
+          onChange={(v) => setUg({ parkingWidthM: Math.max(v || 10, 6) })}
           min={6}
           step={1}
           unit=" m"
@@ -183,11 +186,7 @@ function UndergroundForm({
         <Num
           label="Parking Length (Depth)"
           value={ug.parkingLengthM ?? 28}
-          onChange={(v) => {
-            const length = Math.max(v || 10, 6);
-            const rows = Math.max(1, Math.floor((length - 6) / ((ug.bayLength || 5) + 2.0)));
-            setUg({ parkingLengthM: length, bayRows: rows });
-          }}
+          onChange={(v) => setUg({ parkingLengthM: Math.max(v || 10, 6) })}
           min={6}
           step={1}
           unit=" m"
@@ -198,15 +197,19 @@ function UndergroundForm({
         <Num label="Total dig depth" value={total} onChange={() => {}} disabled unit=" m" />
       </div>
       <div className="grid grid-cols-2 gap-3">
-        <Num label="Ramp width" value={ug.rampWidth} onChange={(v) => setUg({ rampWidth: Math.max(v || 2.5, 2.5) })} min={2.5} step={0.25} unit=" m" />
-        <Num label="Ramp length" value={ug.rampLength} onChange={(v) => setUg({ rampLength: Math.max(v || 8, 8) })} min={8} step={1} unit=" m" />
+        <Num label="Ramp width" value={ramp.width} onChange={(v) => setUg({ rampWidth: Math.max(v || 2.5, 2.5) })} min={2.5} step={0.25} unit=" m" />
+        <Num label="Ramp horizontal run" value={ramp.length} onChange={(v) => setUg({ rampLength: Math.max(v || 8, 8) })} min={8} step={1} unit=" m" />
       </div>
-      <Num label="Ramp slope" value={ug.rampSlope} onChange={(v) => setUg({ rampSlope: Math.max(v || 2, 2) })} min={2} step={0.5} unit=" %" />
+      <Num label="Ramp slope" value={ramp.slope} onChange={(v) => setUg({ rampSlope: Math.max(v || 2, 2) })} min={2} step={0.5} unit=" %" />
+      <p className="text-xs text-slate-400">
+        The first parking deck is {ramp.rise.toFixed(2)} m below the site datum. Ramp run and grade set this depth. Subsequent decks use the storey height.
+      </p>
+      {ramp.rise < ug.floorHeight && <p className="text-xs text-amber-300">The first deck is shallower than the selected storey height. Review headroom before using this layout.</p>}
     </>
   );
 }
 
-export function CommunityEditor({ branch, community, onChange, projectName, design, onVisualizationChange, initialStep }: CommunityEditorProps) {
+export function CommunityEditor({ branch, community, onChange, readOnly = false, projectName, design, onVisualizationChange, initialStep }: CommunityEditorProps) {
   const toast = useToast();
   const [step, setStep] = useState<StepId>(initialStep ?? "land");
   const [focusMode, setFocusMode] = useState(false);
@@ -266,6 +269,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
   const assistantPreviews = useMemo(() => assistantPlan ? previewAssistantActions(assistantPlan.actions, c, branch) : [], [assistantPlan, c, branch]);
 
   const commitDesign = (next: CommunityDesign) => {
+    if (readOnly) return;
     historyRef.current.past = [...historyRef.current.past.slice(-49), c];
     historyRef.current.future = [];
     onChange(next);
@@ -277,6 +281,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
   const toggleLayer = (id: string) => update({ layers: layers.map((layer) => layer.id === id ? { ...layer, visible: !layer.visible } : layer) });
 
   const undo = () => {
+    if (readOnly) return;
     const previous = historyRef.current.past.pop();
     if (!previous) return;
     historyRef.current.future.unshift(c);
@@ -284,6 +289,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
   };
 
   const redo = () => {
+    if (readOnly) return;
     const next = historyRef.current.future.shift();
     if (!next) return;
     historyRef.current.past.push(c);
@@ -291,6 +297,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
   };
 
   useEffect(() => {
+    if (readOnly) return;
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT") return;
@@ -300,10 +307,16 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [redo, undo]);
+  }, [readOnly, redo, undo]);
 
   const selectedTower = c.towers.find((t) => t.id === selectedId);
   const selectedAmenity = c.amenities.find((a) => a.id === selectedId);
+  const selectedAmenityFootprint = selectedAmenity ? amenityFootprint(selectedAmenity) : undefined;
+  const selectedAmenitySize = selectedAmenityFootprint && (
+    selectedAmenityFootprint.diameter === undefined
+      ? `${selectedAmenityFootprint.w} × ${selectedAmenityFootprint.d} m`
+      : `Ø ${selectedAmenityFootprint.diameter} m`
+  );
   const selectedDraft = (c.drafts ?? []).find((d) => d.id === selectedId);
   const reviewAnalysis = useReviewFindings("community", c);
   const reviewFindings = reviewAnalysis.findings;
@@ -500,6 +513,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
 
   /* ----------------------------- Basement step ------------------------------ */
   const ug = park.underground;
+  const bayLayout = undergroundParkingBayLayout(c);
   const basementPanel = park.mode !== "underground" || !ug ? (
     <p className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-500">
       Select <span className="text-emerald-300">Underground parking</span> in the previous step to build the basement structure.
@@ -510,11 +524,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
         <Num
           label="Parking Breadth (Width)"
           value={ug.parkingWidthM ?? 36}
-          onChange={(v) => {
-            const width = Math.max(v || 10, 6);
-            const cols = Math.max(1, Math.floor((width - 4) / ((ug.bayWidth || 2.5) + 0.5)));
-            update({ parking: { ...park, underground: { ...ug, parkingWidthM: width, bayCols: cols } } });
-          }}
+          onChange={(v) => update({ parking: { ...park, underground: { ...ug, parkingWidthM: Math.max(v || 10, 6) } } })}
           min={6}
           step={1}
           unit=" m"
@@ -522,11 +532,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
         <Num
           label="Parking Length (Depth)"
           value={ug.parkingLengthM ?? 28}
-          onChange={(v) => {
-            const length = Math.max(v || 10, 6);
-            const rows = Math.max(1, Math.floor((length - 6) / ((ug.bayLength || 5) + 2.0)));
-            update({ parking: { ...park, underground: { ...ug, parkingLengthM: length, bayRows: rows } } });
-          }}
+          onChange={(v) => update({ parking: { ...park, underground: { ...ug, parkingLengthM: Math.max(v || 10, 6) } } })}
           min={6}
           step={1}
           unit=" m"
@@ -549,7 +555,9 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
         <Toggle checked={ug.stairLobby} onChange={(v) => update({ parking: { ...park, underground: { ...ug, stairLobby: v } } })} label="Staircase lobby" />
       </div>
       <p className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
-        Capacity: up to <span className="text-emerald-300">{ug.bayCols * ug.bayRows * ug.levels}</span> cars across {ug.levels} level{ug.levels > 1 ? "s" : ""}.
+        Modeled bays: <span className="text-emerald-300">{bayLayout.capacity}</span> across {bayLayout.levels} level{bayLayout.levels !== 1 ? "s" : ""}.
+        {(bayLayout.cols !== ug.bayCols || bayLayout.rows !== ug.bayRows) && ` The basement fits ${bayLayout.cols} × ${bayLayout.rows} of the requested ${ug.bayCols} × ${ug.bayRows} per level.`}
+        {" "}Review drive aisles, lobby clearances, and access between levels separately.
       </p>
     </Section>
   );
@@ -572,7 +580,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
   };
 
   const patchAmenity = (id: string, patch: Partial<AmenityData>) =>
-    update({ amenities: c.amenities.map((a) => (a.id === id ? { ...a, ...patch } : a)) });
+    update({ amenities: c.amenities.map((a) => (a.id === id ? updateAmenity(a, patch) : a)) });
 
   const patchDraft = (id: string, patch: Partial<DraftElement>) => {
     const drafts = c.drafts ?? [];
@@ -670,8 +678,12 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
             <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">
               <Num label="X" value={a.x} onChange={(v) => patchAmenity(a.id, { x: v })} step={1} unit=" m" />
               <Num label="Z" value={a.z} onChange={(v) => patchAmenity(a.id, { z: v })} step={1} unit=" m" />
-              <Num label="W" value={a.w} onChange={(v) => patchAmenity(a.id, { w: Math.max(v || 1, 1) })} step={0.5} unit=" m" />
-              <Num label="D" value={a.d} onChange={(v) => patchAmenity(a.id, { d: Math.max(v || 1, 1) })} step={0.5} unit=" m" />
+              {amenityFootprint(a).diameter !== undefined ? (
+                <Num label="Diameter" value={amenityFootprint(a).w} onChange={(v) => patchAmenity(a.id, { w: Math.max(v || 1, 1) })} min={1} step={0.5} unit=" m" />
+              ) : <>
+                <Num label="W" value={a.w} onChange={(v) => patchAmenity(a.id, { w: Math.max(v || 1, 1) })} step={0.5} unit=" m" />
+                <Num label="D" value={a.d} onChange={(v) => patchAmenity(a.id, { d: Math.max(v || 1, 1) })} step={0.5} unit=" m" />
+              </>}
               <Num label="H" value={a.h} onChange={(v) => patchAmenity(a.id, { h: Math.max(v || 0.1, 0.1) })} min={0.1} step={0.1} unit=" m" />
             </div>
             <Select label="Construction phase" value={a.phaseId ?? ""} onChange={(e) => patchAmenity(a.id, { phaseId: e.target.value || undefined })}>
@@ -1381,7 +1393,8 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
          <span className="hidden px-2 text-xs font-semibold uppercase tracking-wide text-slate-500 sm:inline">
            Workspace
          </span>
-         {design && <DesignExportMenu design={design} projectName={projectName} onChange={(next) => onChange(next.community ?? community)} />}
+         {design && <DesignExportMenu design={design} projectName={projectName} onChange={readOnly ? undefined : onVisualizationChange} />}
+         {readOnly && <span role="status" className="shrink-0 text-xs text-slate-300">Read-only access</span>}
         {focusMode && (
           <nav className="flex min-w-0 flex-1 gap-1 overflow-x-auto" aria-label="Workspace tools">
             {STEPS.map((s, i) => (
@@ -1413,13 +1426,13 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
           </svg>
           <span className="hidden sm:inline">{focusMode ? "Show tools" : "Expand canvas"}</span>
         </Button>
-        <div className="hidden items-center gap-1 border-l border-slate-800 pl-2 sm:flex">
+        {!readOnly && <div className="hidden items-center gap-1 border-l border-slate-800 pl-2 sm:flex">
           <Button variant="ghost" size="sm" onClick={undo} disabled={historyRef.current.past.length === 0} title="Undo (Ctrl/Cmd+Z)">Undo</Button>
           <Button variant="ghost" size="sm" onClick={redo} disabled={historyRef.current.future.length === 0} title="Redo (Ctrl/Cmd+Shift+Z)">Redo</Button>
           <Button variant="ghost" size="sm" onClick={() => setLayersOpen((open) => !open)} title="Layer visibility">Layers</Button>
-        </div>
+        </div>}
       </div>
-      {layersOpen && (
+      {!readOnly && layersOpen && (
         <div className="absolute right-3 top-12 z-30 w-56 rounded-xl border border-slate-700 bg-slate-900/95 p-2 shadow-2xl backdrop-blur">
           <p className="px-2 py-1 text-[10px] font-bold uppercase tracking-[.16em] text-slate-500">Layer visibility</p>
           {layers.map((layer) => (
@@ -1434,12 +1447,12 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
       {focusMode && (
         <div className="mb-2 flex flex-wrap items-center gap-1.5 rounded-xl border border-slate-800 bg-slate-900/70 px-2 py-1.5">
           <span className="px-2 text-[10px] font-bold uppercase tracking-[.16em] text-slate-500">Tools</span>
-          <CadToolPalette active={activeTool} onChange={runSceneTool} compact />
+          {!readOnly && <CadToolPalette active={activeTool} onChange={runSceneTool} compact />}
           <Button variant="ghost" size="sm" onClick={() => setFocusPanelOpen((open) => !open)}>
             {focusPanelOpen ? "Close features" : "Open features"}
           </Button>
           <span className="ml-auto hidden text-[11px] text-slate-500 md:inline">
-            {activeTool === "measure" && (selectedAmenity ? `${selectedAmenity.w} × ${selectedAmenity.d} m` : selectedTower ? `${towerMeters(selectedTower).w.toFixed(1)} × ${towerMeters(selectedTower).d.toFixed(1)} m` : "Select an object")}
+            {activeTool === "measure" && (selectedAmenitySize ? selectedAmenitySize : selectedTower ? `${towerMeters(selectedTower).w.toFixed(1)} × ${towerMeters(selectedTower).d.toFixed(1)} m` : "Select an object")}
             {activeTool === "move" && "Drag a selected object in the canvas"}
             {activeTool === "select" && "Click an object to inspect it"}
           </span>
@@ -1454,7 +1467,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
             </div>
             <button onClick={() => setFocusPanelOpen(false)} className="rounded-lg px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-100">Close</button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto space-y-4 p-4">{panels[step]}</div>
+          <fieldset disabled={readOnly} className="min-h-0 min-w-0 flex-1 overflow-y-auto space-y-4 p-4">{panels[step]}</fieldset>
         </aside>
       )}
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
@@ -1481,7 +1494,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
               </button>
             ))}
           </div>
-          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4"><SectionControls value={c.section} onChange={(section) => update({ section })} />{panels[step]}</div>
+          <fieldset disabled={readOnly} className="min-h-0 min-w-0 flex-1 space-y-4 overflow-y-auto p-4"><SectionControls value={c.section} onChange={(section) => update({ section })} />{panels[step]}</fieldset>
         </div>
 
         {/* Right: 3D scene */}
@@ -1491,17 +1504,17 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
             design={c}
             selectedId={selectedId}
             onSelect={setSelectedId}
-             onChange={commitDesign}
-             activeTool={activeTool}
+             onChange={readOnly ? undefined : commitDesign}
+             activeTool={readOnly ? "select" : activeTool}
              visualization={visualization}
-            onContextTarget={(t) => {
+            onContextTarget={readOnly ? undefined : (t) => {
               setSelectedId(t.id ?? null);
               setContext(t);
             }}
            />
-           {design && <div className="absolute bottom-3 left-3 z-10"><VisualizationControls design={design} presentationApi={presentationApi} onChange={(next) => onVisualizationChange?.(next)} /></div>}
+           {!readOnly && design && <div className="absolute bottom-3 left-3 z-10"><VisualizationControls design={design} presentationApi={presentationApi} onChange={(next) => onVisualizationChange?.(next)} /></div>}
           <div className="pointer-events-none absolute left-3 top-3 rounded-xl bg-slate-950/80 px-3 py-2 text-xs text-slate-300 backdrop-blur">
-            {branch === "residential" ? "Residential community" : "Commercial complex"} · drag objects to move · right-click for actions
+            {branch === "residential" ? "Residential community" : "Commercial complex"} · {readOnly ? "read-only review" : "drag objects to move · right-click for actions"}
           </div>
           {selectedTower && (
             <div className="pointer-events-none absolute bottom-3 left-3 rounded-xl bg-slate-950/85 px-3 py-2 text-xs text-emerald-300 backdrop-blur">
@@ -1510,14 +1523,14 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
           )}
           {selectedAmenity && (
             <div className="pointer-events-none absolute bottom-3 left-3 rounded-xl bg-slate-950/85 px-3 py-2 text-xs text-emerald-300 backdrop-blur">
-              {selectedAmenity.label ?? amenityKind(selectedAmenity.kind)?.label ?? selectedAmenity.kind} · {selectedAmenity.w} × {selectedAmenity.d} m
+              {selectedAmenity.label ?? amenityKind(selectedAmenity.kind)?.label ?? selectedAmenity.kind} · {selectedAmenitySize}
             </div>
           )}
         </div>
       </div>
 
       {/* Right-click context menu */}
-      {context && (
+      {!readOnly && context && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setContext(null)} onContextMenu={(e) => { e.preventDefault(); setContext(null); }} />
           <div
@@ -1577,7 +1590,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
       )}
 
       {/* Offline object generator */}
-      <Modal open={Boolean(gen)} onClose={() => setGen(null)} title={gen?.mode === "room" ? "Add furniture" : "Add object"}>
+      <Modal open={!readOnly && Boolean(gen)} onClose={() => setGen(null)} title={gen?.mode === "room" ? "Add furniture" : "Add object"}>
         <div className="space-y-4">
           <Input
             label="What should I add?"
@@ -1605,7 +1618,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
         </div>
       </Modal>
 
-      {furnishRoomId && (() => {
+      {!readOnly && furnishRoomId && (() => {
         const room = c.interiors.find((r) => r.id === furnishRoomId);
         if (!room) return null;
         const tower = c.towers.find((t) => t.id === room.towerId)?.label ?? "Building";
@@ -1618,7 +1631,7 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
           />
         );
       })()}
-      <div className="pointer-events-auto absolute bottom-3 right-3 z-20">
+      {!readOnly && <div className="pointer-events-auto absolute bottom-3 right-3 z-20">
         <DesignAssistantPanel
           messages={assistantMessages}
           onCommand={(message) => void requestPlan(message)}
@@ -1628,8 +1641,8 @@ export function CommunityEditor({ branch, community, onChange, projectName, desi
            onPreview={() => setAssistantPreviewOpen(true)}
            onApply={() => setAssistantPreviewOpen(true)}
          />
-       </div>
-      <Modal open={assistantPreviewOpen} onClose={() => setAssistantPreviewOpen(false)} title="Assistant action preview" wide>
+       </div>}
+      <Modal open={!readOnly && assistantPreviewOpen} onClose={() => setAssistantPreviewOpen(false)} title="Assistant action preview" wide>
         <div className="space-y-3">
             <p className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-relaxed text-amber-200">Review the typed actions before confirming. Nothing is persisted by the assistant, and infrastructure, MEP, structural, and analysis actions stay preview-only in this building editor.</p>
            <div className="max-h-[50vh] space-y-2 overflow-auto rounded-xl border border-slate-800 bg-slate-950 p-3">

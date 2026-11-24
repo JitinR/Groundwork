@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Box3, Vector3, type Group, type Mesh, type Object3D } from "three";
 import { defaultCommunity } from "../src/lib/community";
-import { buildInfraScene, defaultInfra, infraExtent, normalizeInfra } from "../src/lib/infra";
+import { buildInfraScene, computeInfraTakeoff, defaultInfra, infraExtent, normalizeInfra } from "../src/lib/infra";
 import { communityAtSite, createSiteReference, infraAtSite, siteLocationValue, siteMeasuresInUnit, siteReferenceFields, type SiteReferenceInput } from "../src/lib/siteLocation";
 import { boundaryMetrics, haversine, localToLatLng, toLocalMetres } from "../src/lib/geo";
 import type { AirportDesign, InfraDesign, SiteLocation } from "../src/types";
@@ -164,6 +164,29 @@ function runwayMesh(scene: Group): Mesh {
   assert.ok(runway?.isMesh);
   return runway;
 }
+
+test("airport shoulder takeoff matches both shoulders along the generated runways", () => {
+  for (const [runways, runwayLengthM, total] of [[1, 3000, 9000], [2, 1200, 7200]]) {
+    const base = airportAtHeading(90);
+    const infra = { ...base, airport: { ...base.airport!, runways, runwayLengthM } };
+    const scene = buildInfraScene(infra);
+    let modeledArea = 0;
+    for (let index = 1; index <= runways; index++) {
+      for (const side of ["left", "right"]) {
+        const shoulder = scene.getObjectByName(`airport-runway-${index}-shoulder-${side}`) as Mesh;
+        assert.ok(shoulder?.isMesh);
+        const size = new Box3().setFromObject(shoulder).getSize(new Vector3());
+        near(size.x, runwayLengthM);
+        near(size.z, 1.5);
+        modeledArea += size.x * size.z;
+      }
+    }
+    const shoulderItem = computeInfraTakeoff(infra).items.find(item => item.key === "shoulder");
+    assert.equal(shoulderItem?.qty, total);
+    assert.equal(shoulderItem?.unit, "m²");
+    near(modeledArea, total);
+  }
+});
 
 test("generated runway cardinal and oblique bearings preserve actual length and width in world coordinates", () => {
   // Independent compass convention: east=+X, north=-Z. These expectations use
