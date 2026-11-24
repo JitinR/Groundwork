@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ApiError, assertHostedRequestSize, getCsrfToken } from "../api";
+import { ApiError, assertHostedRequestSize, getCsrfToken, getProject } from "../api";
 import { offlineProjectStore } from "./offlineProjectStore";
 import { offlineQueueStore, type OfflineQueueItem } from "./offlineQueue";
 import { captureLocalWrite, localWriteAllowed, subscribeLocalDataFence } from "./localDataFence";
@@ -212,7 +212,7 @@ class OfflineSyncManager {
       if (signal.aborted || err instanceof DOMException && err.name === "AbortError") throw err;
       assertCurrent();
       const errorMsg = err instanceof Error ? err.message : "Synchronization failed";
-      if (transientSyncError(err)) {
+      if (transientSyncError(err) || err instanceof ApiError && err.code === "ACCOUNT_CHANGED") {
         // A timed-out PATCH may have committed. The next attempt always reads
         // the server revision again before deciding whether it can send.
         await offlineQueueStore.updateStatus(item.id, "queued", errorMsg);
@@ -225,26 +225,19 @@ class OfflineSyncManager {
   private async syncProjectSave(userId: string, item: OfflineQueueItem, signal: AbortSignal, assertCurrent: () => void): Promise<void> {
     assertCurrent();
     // Permission & Project verification check: inspect server state first
-    const { response: getRes, data: projectData } = await fetchJsonResponse<ProjectDetail>(`/api/projects/${encodeURIComponent(item.projectId)}`, {
-      credentials: "same-origin",
-      signal,
-    });
-    assertCurrent();
-
-    if (getRes.status === 403 || getRes.status === 404) {
-      await offlineQueueStore.updateStatus(
-        item.id,
-        "failed",
-        getRes.status === 403
-          ? "Permission revoked on this project while offline"
-          : "Project was deleted on server while offline",
-      );
+    let projectData: ProjectDetail;
+    try {
+      projectData = await getProject(item.projectId, userId, signal);
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 403 && error.status !== 404) throw error;
+      assertCurrent();
+      const message = error.status === 403
+        ? "Permission revoked on this project while offline"
+        : "Project was deleted on server while offline";
+      await offlineQueueStore.updateStatus(item.id, "failed", message);
       return;
     }
-
-    if (!getRes.ok) {
-      throw responseError(getRes, `Failed to check project status (${getRes.status})`);
-    }
+    assertCurrent();
 
     if (projectData?.id !== item.projectId || !Number.isSafeInteger(projectData.revision) || projectData.revision < 0) {
       throw new Error("Server returned an invalid project revision. The offline edit remains available for recovery.");
@@ -290,7 +283,9 @@ class OfflineSyncManager {
     if (patchRes.status === 409) {
       const conflictRes = patchData;
       assertCurrent();
-      if (conflictRes.code === "ACCOUNT_CHANGED") throw new Error("The signed-in account changed during synchronization. The queued body remains retained for its original account.");
+      if (conflictRes.code === "ACCOUNT_CHANGED") {
+        throw new ApiError(409, "The signed-in account changed during synchronization. The queued body remains retained for its original account.", undefined, conflictRes.code);
+      }
       await offlineQueueStore.updateStatus(
         item.id,
         "conflicted",

@@ -16,7 +16,7 @@ import {
   TOTP_LOCK_SECONDS,
   TOTP_ATTEMPT_WINDOW_SECONDS,
 } from "../config.js";
-import { hashPassword, randomId, randomToken, sha256Hex, verifyPassword } from "../crypto.js";
+import { hashPassword, randomId, randomToken, sha256Hex, verifyPassword, verifyPasswordAsync } from "../crypto.js";
 import { db, now, withTransaction } from "../db.js";
 import { openTotpSecret, sealTotpSecret } from "../mfa.js";
 import { sendOtpEmail, testMailConnection } from "../mailer.js";
@@ -525,41 +525,46 @@ router.post(
 router.post(
   "/login",
   asyncHandler(async (req, res) => {
-    // Commit one-use credentials and their session before sending the response.
+    const parsed = loginSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || "Invalid input" });
+      return;
+    }
+    const { email: identifier, password } = parsed.data;
+    const candidate = await resolveUser(identifier);
+    const invalidPassword = { error: "Invalid email, username, or password" };
+    if (!candidate) { res.status(401).json(invalidPassword); return; }
+    const needsVerification = {
+      error: "Verify your email address before signing in.",
+      needsEmailVerification: true,
+    };
+    if (candidate.email_verified === 0) { res.status(403).json(needsVerification); return; }
+    // Key derivation runs before acquiring the shared database lock. Re-read the
+    // account while holding that lock before committing an attempt or a session.
+    const passwordMatches = await verifyPasswordAsync(password, candidate.password_salt, candidate.password_hash);
     const result = await withTransaction(async () => {
-      const parsed = loginSchema.safeParse(req.body);
-      if (!parsed.success) {
-        return { status: 400, body: { error: parsed.error.issues[0]?.message || "Invalid input" } };
+      const user = await resolveUser(identifier);
+      if (!user || user.id !== candidate.id || user.credential_version !== candidate.credential_version ||
+          user.password_hash !== candidate.password_hash || user.password_salt !== candidate.password_salt) {
+        return { status: 401, body: invalidPassword };
       }
-      const { email: identifier, password } = parsed.data;
+      if (user.email_verified === 0) return { status: 403, body: needsVerification };
 
-      const user = (await resolveUser(identifier));
-
-      if (user && user.email_verified === 0) {
-        return { status: 403, body: {
-          error: "Verify your email address before signing in.",
-          needsEmailVerification: true,
-        } };
-      }
-
-      if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) {
+      if (!passwordMatches) {
         let detail = `Failed login for ${identifier}`;
-        if (user) {
-          const failed = user.failed_attempts + 1;
-          let lockedUntil: number | null = null;
-          if (failed >= MAX_FAILED_ATTEMPTS) {
-            lockedUntil = now() + LOCK_SECONDS;
-            detail = `Failed login for ${identifier} — account locked for ${LOCK_SECONDS / 60} min (${failed} attempts)`;
-          }
-          (await db.prepare(
-            "UPDATE users SET failed_attempts = ?, locked_until = ?, updated_at = ? WHERE id = ?",
-          ).run(failed, lockedUntil, now(), user.id));
-          (await logAudit(user.id, "auth.login_failed", detail, req));
+        const failed = user.failed_attempts + 1;
+        let lockedUntil: number | null = null;
+        if (failed >= MAX_FAILED_ATTEMPTS) {
+          lockedUntil = now() + LOCK_SECONDS;
+          detail = `Failed login for ${identifier} — account locked for ${LOCK_SECONDS / 60} min (${failed} attempts)`;
         }
+        await db.prepare("UPDATE users SET failed_attempts = ?, locked_until = ?, updated_at = ? WHERE id = ?")
+          .run(failed, lockedUntil, now(), user.id);
+        await logAudit(user.id, "auth.login_failed", detail, req);
         return { status: 401, body: {
-          error: user && user.locked_until && user.locked_until > now()
+          error: user.locked_until && user.locked_until > now()
             ? "Account temporarily locked. Try again later."
-            : "Invalid email, username, or password",
+            : invalidPassword.error,
         } };
       }
 

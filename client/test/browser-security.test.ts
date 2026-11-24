@@ -216,12 +216,15 @@ test("offline sync saves the exact draft through the flat project API and acknow
   const queued = await offlineQueueStore.enqueue(userId, projectId, "project_save", {
     name: pending.name, projectType: pending.projectType, widthMm: 4200, depthMm: 3700, designData, design: pending.design,
   }, pending.baseRevision);
-  const oldProject = { id: projectId, name: "server", projectType: pending.projectType, revision: 3, role: "editor", updatedAt: 1, design: null };
+  const oldProject = { id: projectId, accountId: userId, name: "server", projectType: pending.projectType, revision: 3, role: "editor", updatedAt: 1, design: null };
   let body: Record<string, unknown> | undefined;
   globalThis.fetch = (async (input, init) => {
     if (String(input) === "/api/auth/me") return Response.json({ user: { id: userId } });
     assert.equal(String(input), "/api/projects/project");
-    if (init?.method !== "PATCH") return Response.json(oldProject);
+    if (init?.method !== "PATCH") {
+      assert.equal(new Headers(init?.headers).get("x-groundwork-account"), userId);
+      return Response.json(oldProject);
+    }
     body = JSON.parse(String(init.body));
     return Response.json({ ok: true, revision: 4 });
   }) as typeof fetch;
@@ -246,6 +249,7 @@ test("offline sync saves the exact draft through the flat project API and acknow
     const cached = await offlineProjectStore.getCachedProject(userId, projectId);
     assert.equal(cached?.revision, 4);
     assert.equal(cached?.role, "editor");
+    assert.equal(cached?.accountBound, true);
   } finally {
     unsubscribeSave(); unsubscribeStatus(); offlineSyncManager.setActiveUser(null); globalThis.fetch = originalFetch;
   }
@@ -264,7 +268,7 @@ test("a delayed synchronization response cannot recreate data after removal and 
       // Deliberately ignore AbortSignal: a completed network response can still be delayed.
       return new Promise<Response>(resolve => { finishPatch = resolve; });
     }
-    return Response.json({ id: projectId, name: "server", revision: 3, projectType: "house" });
+    return Response.json({ id: projectId, accountId: userId, name: "server", revision: 3, projectType: "house" });
   }) as typeof fetch;
   let unsubscribe: () => void = () => undefined;
   try {

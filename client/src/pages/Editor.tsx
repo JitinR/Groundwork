@@ -145,32 +145,32 @@ export function Editor() {
   const latestDraft = useRef<PendingDraft | null>(null);
   const blockedSaveStatus = useRef<number | undefined>(undefined);
   const loadGeneration = useRef(0);
-  const scope = (user?.id ?? "") + ":" + (id ?? "");
+  const accountId = user?.id;
+  const scope = (accountId ?? "") + ":" + (id ?? "");
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
   latestDraft.current = pendingDraft;
 
   const load = useCallback(async () => {
-    const write = user ? captureLocalWrite(user.id) : null;
+    if (!id || !accountId) return;
+    const write = captureLocalWrite(accountId);
     const request = ++loadGeneration.current, currentScope = scopeRef.current;
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     editGeneration.current++;
     setLoaded(false); setLoadError(""); setMergeOpen(false); setSaving(false);
     try {
-      const project = await getProject(id!);
-      if (request !== loadGeneration.current || currentScope !== scopeRef.current || user && !localWriteAllowed(user.id, write)) return;
+      const project = await getProject(id, accountId);
+      if (request !== loadGeneration.current || currentScope !== scopeRef.current || !localWriteAllowed(accountId, write)) return;
       const document = projectDocument(project);
       acknowledged.current = document;
       revisionRef.current = project.revision ?? 0;
       setRemoteRevision(null); setProjectRole(project.role ?? "owner");
-      if (user?.id) {
-        void offlineProjectStore.cacheProject(user.id, project, document.design);
-      }
-      const recovery = user ? readPendingDraftResult(user.id, id!) : { draft: null, error: undefined };
+      void offlineProjectStore.cacheProject(accountId, project, document.design);
+      const recovery = readPendingDraftResult(accountId, id);
       let recovered = recovery.draft;
-      if (user && recovered && draftMatchesSavedProject(recovered, project)) {
-        if (recoveryFromAnotherTab(recovered)) clearRecoveredDraft(user.id, id!, recovered);
-        else clearPendingDraft(user.id, id!);
+      if (recovered && draftMatchesSavedProject(recovered, project)) {
+        if (recoveryFromAnotherTab(recovered)) clearRecoveredDraft(accountId, id, recovered);
+        else clearPendingDraft(accountId, id);
         recovered = null;
       }
       recoveryOrigin.current = recovered; latestDraft.current = recovered;
@@ -182,9 +182,9 @@ export function Editor() {
       setPhotoUrl(project.hasPhoto ? `/api/projects/${id}/photo?v=${project.updatedAt}` : null);
       setLoaded(true);
     } catch (err) {
-      if (err instanceof TypeError && user?.id && id) {
-        const cached = await offlineProjectStore.getCachedProject(user.id, id);
-        if (cached && request === loadGeneration.current && currentScope === scopeRef.current) {
+      if (err instanceof TypeError) {
+        const cached = await offlineProjectStore.getCachedProject(accountId, id);
+        if (cached && request === loadGeneration.current && currentScope === scopeRef.current && localWriteAllowed(accountId, write)) {
           revisionRef.current = cached.revision;
           setProjectRole(cached.role);
           setName(cached.name);
@@ -201,7 +201,7 @@ export function Editor() {
         toast.push({ title: "Could not open project", description: err instanceof Error ? err.message : undefined, tone: "error" });
       }
     }
-  }, [id, toast, user?.id]);
+  }, [id, toast, accountId]);
 
   useEffect(() => {
     void load();
@@ -383,7 +383,7 @@ export function Editor() {
     <Button size="sm" variant="ghost" disabled={saving || discardingDraft} onClick={() => void discardLocalAndReload()}>
       {pendingDraft ? "Discard local & queued edits" : "Reload project"}
     </Button>
-    {mergeOpen && pendingDraft && <DraftConflictPanel projectId={id!} draft={pendingDraft} remoteDocument={projectDocument} onClose={() => setMergeOpen(false)} onApply={(document, remote) => {
+    {mergeOpen && pendingDraft && accountId && <DraftConflictPanel key={accountId} accountId={accountId} projectId={id!} draft={pendingDraft} remoteDocument={projectDocument} onClose={() => setMergeOpen(false)} onApply={(document, remote) => {
       const base = projectDocument(remote);
       const recovery: PendingDraft = { ...document, baseDesign: base.design, baseName: base.name, baseProjectType: base.projectType, baseRevision: remote.revision, savedAt: Date.now() };
       setDesign(document.design); setName(document.name); setProjectType(document.projectType); setMergeOpen(false);

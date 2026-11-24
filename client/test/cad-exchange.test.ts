@@ -5,14 +5,35 @@ import { cadFootprintArea, cadQuantities, createCadObject, executeCadCommand, lo
 import { buildDxf } from "../src/lib/dxf";
 import { defaultCommunity, defaultTower, makeAmenity } from "../src/lib/community";
 import { defaultInfra } from "../src/lib/infra";
-import { buildBimExchange, buildIfcStep, ifcSourceGuid, validateIfcProfile, validateIfcStep } from "../src/lib/bim";
+import { buildBimExchange, buildBimScheduleCsv, buildIfcStep, ifcSourceGuid, validateIfcProfile, validateIfcStep } from "../src/lib/bim";
 import { inspectBimGeometry } from "../src/lib/bimValidation";
-import { documentationInventory } from "../src/lib/documentationSchedule";
+import { documentationInventory, documentationScheduleCsv } from "../src/lib/documentationSchedule";
 import { exportIfcMeshObj, exportIfcRoundTrip, ifcGeometryCoverageWarnings, importIfcGeometry } from "../src/lib/ifcGeometry";
-import { buildObjMtl } from "../src/lib/obj";
+import { buildBillOfMaterials, buildObjMtl } from "../src/lib/obj";
+import { buildBoqCsv } from "../src/lib/notes";
 
 const close = (actual: number, expected: number, tolerance = 1e-8) => assert.ok(Math.abs(actual - expected) < tolerance, `${actual} != ${expected}`);
 const project = (...objects: DraftElement[]): Design => ({ ...defaultDesign(), drafts: objects, cad: { version: 1, revision: 7 } });
+
+test("model CSV exports preserve literal labels, separators and typed quantities", () => {
+  const design = defaultDesign();
+  const customType = '- Existing "bench"';
+  const furniture = { id: "bench-a", type: customType, name: '\n- Existing "bench", north', x: 0, z: 0, rotationDeg: 0, scale: 1, color: "Blue" };
+  design.furniture = [furniture, { ...furniture, id: "bench-b", color: "Green" }];
+  design.curtains = { enabled: true, style: "sheer", color: "Warm, white", wall: "north", heightPercent: 80, widthPercentPerPanel: 25 };
+
+  assert.ok(buildBimScheduleCsv(design).includes(`"bench-a","FURNISHING","'\n- Existing ""bench"", north",`));
+  assert.equal(buildBillOfMaterials(design), [
+    "Qty,Item,Type,Size W x D x H (mm),Colours",
+    `2,"'- Existing ""bench""","'- Existing ""bench""","0 x 0 x 0","Blue, Green"`,
+    `1,"Curtains","sheer","wall-mounted","Warm, white"`,
+    "",
+  ].join("\n"));
+  assert.ok(buildBoqCsv([{ group: "Furniture", label: customType, qty: 2, unit: "ea", basis: "Survey, level 1" }])
+    .includes(`"Furniture","'- Existing ""bench""","2","ea","Survey, level 1"`));
+  assert.ok(documentationScheduleCsv({ fields: ["Name", "Elevation m"], rows: [{ id: "bench-a", sourceIds: [], cells: [customType, -1.23456] }], sourceCount: 1, warnings: [] })
+    .includes(`"'- Existing ""bench""","-1.2346"`));
+});
 
 test("OBJ retains hidden authored mesh dimensions, rotated position and stable identity", () => {
   const column = { ...createCadObject("column"), x: 12, z: 7, w: .6, d: .5, h: 4.2, rotationDeg: 90, visible: false };

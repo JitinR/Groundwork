@@ -126,13 +126,13 @@ export function vercelBuildTarget(env) {
   if (env.VERCEL_ENV === 'production' && branch !== 'main') throw new Error('Production deployments require the main branch');
   return validateRelease({ repository: DEPLOYMENT_REPOSITORY, commit: env.VERCEL_GIT_COMMIT_SHA || env.GROUNDWORK_RELEASE_COMMIT, branch });
 }
-/** Vercel executes this before building Git-hook or CLI deployments. Preview
- * commits require successful CI for their own branch; production requires main.
+/** Vercel executes this before dependency installation and again before building.
+ * Only the install phase waits for preview CI. Production requires main.
  * Public GitHub evidence needs no persistent Vercel-side GitHub credential. */
-export async function guardVercelBuild(env = process.env, request = fetch, waitOptions = {}) {
+export async function guardVercelBuild(env = process.env, request = fetch, { waitForCi = true, ...waitOptions } = {}) {
   let target;
   try { target = vercelBuildTarget(env); } catch { throw new DeploymentDeliveryError('RELEASE_CONFIGURATION_INVALID', 'build'); }
-  if (env.VERCEL_ENV === 'preview') await waitForPreviewCi(target, request, waitOptions);
+  if (env.VERCEL_ENV === 'preview' && waitForCi) await waitForPreviewCi(target, request, waitOptions);
   const evidence = await verifiedRelease({ GITHUB_REPOSITORY: target.repository, RELEASE_COMMIT: target.commit, RELEASE_BRANCH: target.branch }, request, waitOptions.evidenceOptions, 'build');
   return { ...evidence, environment: env.VERCEL_ENV, buildPermitted: true };
 }
@@ -158,7 +158,17 @@ export async function deployAfterCi(env = process.env, request = fetch, { checkO
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const args = process.argv.slice(2);
-  const action = args.length === 1 && args[0] === '--build-guard' ? (env => guardVercelBuild(env, fetch, { onProgress: ({ status }) => console.log(`Preview CI ${status}; waiting for the exact commit before building (up to 30 minutes).`) })) : args.length === 1 && args[0] === '--check' ? (env => deployAfterCi(env, fetch, { checkOnly: true })) : args.length === 0 ? deployAfterCi : null;
-  if (!action) { console.error('Use --build-guard, --check, or no arguments for the authorized CI hook trigger.'); process.exitCode = 1; }
+  let action;
+  if (args.length === 0) action = deployAfterCi;
+  if (args.length === 1 && args[0] === '--check') action = env => deployAfterCi(env, fetch, { checkOnly: true });
+  if (args.length === 1 && args[0] === '--install-guard') {
+    action = env => guardVercelBuild(env, fetch, {
+      onProgress: ({ status }) => console.log(`Preview CI ${status}; waiting for the exact commit before installing dependencies (up to 30 minutes).`),
+    });
+  }
+  if (args.length === 1 && args[0] === '--build-guard') {
+    action = env => guardVercelBuild(env, fetch, { waitForCi: false });
+  }
+  if (!action) { console.error('Use --install-guard, --build-guard, --check, or no arguments for the authorized CI hook trigger.'); process.exitCode = 1; }
   else action().then(result => console.log(JSON.stringify(result))).catch(error => { console.error(deploymentFailureDiagnostic(error)); process.exitCode = 1; });
 }

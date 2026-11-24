@@ -3,6 +3,7 @@ import { FACADES, UNIT_LABELS, amenityFootprint, amenityKind, landAreaSqYards, l
 import { computeTakeoff, type TakeoffResult } from "./takeoff";
 import { communityReviewFindings } from "./review";
 import { analyzeCommunity } from "./structural";
+import { quoteCsvCell } from "./csv";
 
 /**
  * Notes-app export.
@@ -164,10 +165,9 @@ export function boqFilename(projectName: string): string {
 }
 
 export function buildBoqCsv(items: Array<{ group: string; label: string; qty: number; unit: string; basis: string }>): string {
-  const cell = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`;
   return [
-    ["Group", "Item", "Quantity", "Unit", "Basis"].map(cell).join(","),
-    ...items.map((item) => [item.group, item.label, item.qty, item.unit, item.basis].map(cell).join(",")),
+    ["Group", "Item", "Quantity", "Unit", "Basis"].map(quoteCsvCell).join(","),
+    ...items.map((item) => [item.group, item.label, item.qty, item.unit, item.basis].map(quoteCsvCell).join(",")),
   ].join("\n");
 }
 

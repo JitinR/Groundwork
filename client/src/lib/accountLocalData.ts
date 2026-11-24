@@ -49,7 +49,7 @@ async function accountRecords(database: typeof DATABASES[number], userId: string
         const scopedKey = Array.isArray(cursor.key) && cursor.key[0] === userId || database.name === "groundwork-workspaces" && typeof cursor.key === "string" && cursor.key.startsWith(`${userId}:`);
         if (row?.userId === userId || scopedKey) {
           if (remove) cursor.delete();
-          else {
+          else if (store !== "cached_projects" || row?.accountBound === true && row.userId === userId) {
             // Bound collection before serializing or copying binary attachments.
             bytes += typeof row.content === "string" ? new Blob([row.content]).size : new Blob([JSON.stringify(row)]).size;
             const files = Array.isArray(row.files) ? row.files : [];

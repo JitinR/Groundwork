@@ -4,6 +4,7 @@ import * as THREE from "three";
 import { cadLevels, cadObjects } from "./cadModel";
 import { cadMep, cadNetworkState } from "./cadNetworks";
 import { cadMepGeometry, cadObjectGeometry, disposeCadObject } from "./cadViewportGeometry";
+import { quoteCsvCell } from "./csv";
 
 const m = (v: number) => (v / 1000).toFixed(4);
 
@@ -134,15 +135,14 @@ export function buildBillOfMaterials(design: Design): string {
     row.qty += 1;
     row.colors.push(item.color);
   }
-  const header = "Qty,Item,Type,Size W x D x H (mm),Colours\n";
-  const body = Object.entries(rows)
-    .map(
-      ([, r]) =>
-        `${r.qty},${r.type},${r.type},${r.w} x ${r.d} x ${r.h},${r.colors.join(", ")}`,
-    )
-    .join("\n");
-  const curtain = design.curtains?.enabled
-    ? `\n1,Curtains,${design.curtains.style},wall-mounted,${design.curtains.color}`
-    : "";
-  return header + body + curtain + "\n";
+  const records = ["Qty,Item,Type,Size W x D x H (mm),Colours"];
+  for (const row of Object.values(rows)) {
+    const fields = [row.type, row.type, `${row.w} x ${row.d} x ${row.h}`, row.colors.join(", ")];
+    records.push([row.qty, ...fields.map(quoteCsvCell)].join(","));
+  }
+  const curtains = design.curtains;
+  if (curtains?.enabled) {
+    records.push([1, ...["Curtains", curtains.style, "wall-mounted", curtains.color].map(quoteCsvCell)].join(","));
+  }
+  return records.join("\n") + "\n";
 }

@@ -154,6 +154,11 @@ test("password change invalidates active/pending sessions and outstanding email 
     assert.equal((await other.client.request("GET", "/api/auth/me")).status, 401);
     assert.equal((await pending.client.request("POST", "/api/auth/verify-2fa", { code: totpCode(account.secret) })).status, 401);
     assert.equal((await owner.client.request("GET", "/api/auth/me")).status, 200);
+    const signedOut = new Client("", "");
+    assert.equal((await signedOut.request("POST", "/api/auth/login", { email: account.email, password })).status, 401);
+    const newLogin = await signedOut.request("POST", "/api/auth/login", { email: account.email, password: "ReplacementPassword456!" });
+    assert.equal(newLogin.status, 200);
+    assert.equal(newLogin.body.needsTwoFactor, true);
     const row = await db.prepare("SELECT credential_version,otp_code_hash FROM users WHERE id=?").get(account.id) as {
         credential_version: number;
         otp_code_hash: string | null;

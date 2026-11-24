@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { getMe, logout, request, setCsrfToken } from "../src/api.ts";
+import { getMe, getProject, logout, request, setCsrfToken } from "../src/api.ts";
 import { fetchJsonResponse, readResponseJson, retryAfterDelay, syncRetryDelay, withRequestTimeout } from "../src/lib/requestResilience.ts";
 import { CoordinationSync } from "../src/lib/operationSync.ts";
 
@@ -19,6 +19,30 @@ test("finite browser requests compose cancellation and retain credentials and CS
     caller.abort(); assert.equal(signal?.aborted, false, "finished requests remove caller listeners");
     await logout();
   } finally { globalThis.fetch = original; setCsrfToken(null); }
+});
+
+test("project details require an authoritative account before returning model data", async context => {
+  const accountId = "design-account";
+  const project = { id: "sample-project", name: "Sample project", revision: 7 };
+  const responses = [
+    Response.json({ ...project, accountId }),
+    Response.json(project),
+    Response.json({ error: "Account changed", code: "ACCOUNT_CHANGED" }, { status: 409 }),
+  ];
+  context.mock.method(globalThis, "fetch", async (path: string, init: RequestInit) => {
+    assert.equal(path, "/api/projects/sample-project");
+    assert.equal(init.credentials, "same-origin");
+    assert.equal(init.cache, "no-store");
+    assert.equal(new Headers(init.headers).get("x-groundwork-account"), accountId);
+    const response = responses.shift();
+    assert.ok(response);
+    return response;
+  });
+
+  assert.deepEqual(await getProject(project.id, accountId), project);
+  await assert.rejects(getProject(project.id, accountId), { status: 409, code: "ACCOUNT_CHANGED" });
+  await assert.rejects(getProject(project.id, accountId), { status: 409, code: "ACCOUNT_CHANGED" });
+  assert.equal(responses.length, 0);
 });
 
 test("a browser deadline cancels an ignored connection and a stalled streamed body", async () => {
@@ -92,7 +116,7 @@ test("a lost offline save acknowledgement rechecks server revision before sendin
     if (String(input) === "/api/auth/me") return Response.json({ user: { id: userId } });
     if (init?.method === "PATCH") { patches += 1; throw new TypeError("connection lost after commit"); }
     reads += 1;
-    return Response.json({ id: projectId, name: "server", revision: reads === 1 ? 3 : 4 });
+    return Response.json({ id: projectId, accountId: userId, name: "server", revision: reads === 1 ? 3 : 4 });
   }) as typeof fetch;
   let unsubscribe = () => undefined;
   try {

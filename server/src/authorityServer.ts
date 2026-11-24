@@ -85,7 +85,10 @@ app.use((req, res, next) => {
   if (/^\/api(?:\/|\?|$)/.test(req.url)) res.setHeader("X-API-Version", "1");
   next();
 });
-app.use("/api", telemetryMiddleware);
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  next();
+}, telemetryMiddleware);
 if (SERVERLESS) app.use("/api", vercelRequestContext(process.env));
 app.use("/api", authorityGatewayMiddleware(topology));
 app.get("/api/live", (_req, res) => { res.json({ ok: true }); });

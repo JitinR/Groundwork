@@ -3,6 +3,7 @@ import type {
   ConstructionScheduleBaseline,
   ConstructionScheduleSettings,
 } from "../types";
+import { quoteCsvCell } from "./csv";
 
 const MAX_PHASES = 1_000;
 const MAX_DEPENDENCIES = 10_000;
@@ -425,11 +426,7 @@ export function constructionScheduleProgressAtDay(report: ConstructionScheduleRe
 }
 
 function csvCell(value: string | number | undefined): string {
-  if (typeof value === "number") return String(value);
-  let text = value ?? "";
-  // Quote CSV separators and neutralize formulas even after leading whitespace.
-  if (/^[\s\uFEFF]*[=+\-@]/.test(text)) text = `'${text}`;
-  return `"${text.replace(/"/g, '""')}"`;
+  return typeof value === "number" ? String(value) : quoteCsvCell(value);
 }
 
 export function constructionScheduleCsv(report: ConstructionScheduleReport): string {

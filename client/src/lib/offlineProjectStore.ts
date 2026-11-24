@@ -6,6 +6,7 @@ import { exportAccountDrafts } from "./offlineDraft";
 
 export interface CachedProjectRecord {
   userId: string;
+  accountBound: true;
   projectId: string;
   name: string;
   projectType: ProjectType;
@@ -130,6 +131,7 @@ class OfflineProjectStore {
     const now = Date.now();
     const record: CachedProjectRecord = {
       userId,
+      accountBound: true,
       projectId: project.id,
       name: project.name,
       projectType: (project.projectType || "house") as ProjectType,
@@ -190,7 +192,9 @@ class OfflineProjectStore {
         req.onerror = () => reject(req.error);
       });
 
-      if (record && record.userId === userId && localWriteAllowed(userId, write)) {
+      // Older entries have no authenticated account binding. Opening the
+      // project online replaces the entry without discarding saved drafts.
+      if (record?.accountBound === true && record.userId === userId && localWriteAllowed(userId, write)) {
         record.lastAccessedAt = Date.now();
         store.put(record);
         this.memoryCache.set(cacheKey, record);
@@ -223,7 +227,7 @@ class OfflineProjectStore {
         req.onerror = () => reject(req.error);
       });
 
-      return records.filter((r) => r.userId === userId);
+      return records.filter((r) => r.userId === userId && r.accountBound === true);
     } catch {
       return Array.from(this.memoryCache.values()).filter((r) => r.userId === userId);
     }

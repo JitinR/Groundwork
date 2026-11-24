@@ -5,6 +5,7 @@ import {
   fetchRenderCapabilities,
   getRenderImageUrl,
   listRenderJobs,
+  removeRenderHistoryEntry,
   retryRenderJob,
   submitRenderJob,
   type RenderCapabilities,
@@ -30,6 +31,7 @@ export function RenderStudioModal({
 }: RenderStudioModalProps) {
   const [capabilities, setCapabilities] = useState<RenderCapabilities | null>(null);
   const [jobs, setJobs] = useState<RenderJobSummary[]>([]);
+  const [canRemoveAttempts, setCanRemoveAttempts] = useState(false);
   const [currentProjectRevision, setCurrentProjectRevision] = useState(sourceRevision);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -62,6 +64,7 @@ export function RenderStudioModal({
     scopeGeneration.current += 1;
     requestGeneration.current += 1;
     setCapabilities(null); setJobs([]); setSelectedPreviewJob(null); setError(null);
+    setCanRemoveAttempts(false);
     setCurrentProjectRevision(sourceRevision); setLoading(false); setSubmitting(false);
     setBusyJob(null); busyJobRef.current = null;
     setSourceImageBase64(initialSourceImageBase64 || null);
@@ -83,6 +86,7 @@ export function RenderStudioModal({
       if (!isCurrent()) return;
       setCapabilities(caps);
       setJobs(jobData.jobs);
+      setCanRemoveAttempts(jobData.project.role === "owner");
       setCurrentProjectRevision(jobData.project.revision);
       setError(null);
     } catch (err: unknown) {
@@ -117,6 +121,7 @@ export function RenderStudioModal({
         void listRenderJobs(projectId).then((data) => {
           if (!isCurrent()) return;
           setJobs(data.jobs);
+          setCanRemoveAttempts(data.project.role === "owner");
           setCurrentProjectRevision(data.project.revision);
         }).catch((cause: unknown) => {
           if (isCurrent()) setError(cause instanceof Error ? cause.message : "Couldn't refresh rendering progress. Use Refresh to try again.");
@@ -227,6 +232,30 @@ export function RenderStudioModal({
       if (isCurrent()) setError(err instanceof Error ? err.message : "Cancellation failed");
     } finally {
       if (isCurrent()) { busyJobRef.current = null; setBusyJob(null); }
+    }
+  };
+
+  const handleRemove = async (jobId: string) => {
+    if (busyJobRef.current || !window.confirm("Remove this attempt from render history? Its source image will remain in the project files.")) return;
+    const scope = scopeGeneration.current;
+    const isCurrent = () => aliveRef.current && scopeRef.current.projectId === projectId && scopeRef.current.isOpen && scope === scopeGeneration.current;
+    busyJobRef.current = jobId;
+    setBusyJob(`remove-${jobId}`);
+    try {
+      setError(null);
+      await removeRenderHistoryEntry(projectId, jobId);
+      if (isCurrent()) {
+        requestGeneration.current += 1;
+        setLoading(false);
+        setJobs((prev) => prev.filter((job) => job.id !== jobId));
+      }
+    } catch (err: unknown) {
+      if (isCurrent()) setError(err instanceof Error ? err.message : "Couldn't remove the render attempt");
+    } finally {
+      if (isCurrent()) {
+        busyJobRef.current = null;
+        setBusyJob(null);
+      }
     }
   };
 
@@ -394,6 +423,7 @@ export function RenderStudioModal({
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {jobs.map((job) => {
                   const isStale = job.sourceRevision !== currentProjectRevision;
+                  const unsuccessful = job.status === "failed" || job.status === "cancelled" || job.status === "unconfigured";
                   return (
                     <Card
                       key={job.id}
@@ -472,7 +502,7 @@ export function RenderStudioModal({
                       </div>
 
                       {/* Actions */}
-                      <div className="flex items-center justify-between border-t border-slate-800/80 pt-2 text-xs">
+                      <div className="flex flex-wrap items-center gap-2 border-t border-slate-800/80 pt-2 text-xs">
                         {job.status === "succeeded" && (
                           <Button
                             variant="outline"
@@ -495,7 +525,7 @@ export function RenderStudioModal({
                             Cancel
                           </Button>
                         )}
-                        {(job.status === "failed" || job.status === "cancelled" || job.status === "unconfigured") && (
+                        {unsuccessful && (
                           <Button
                             variant="outline"
                             size="sm"
@@ -507,7 +537,19 @@ export function RenderStudioModal({
                             Retry
                           </Button>
                         )}
-                        <span className="text-[10px] text-slate-500 font-mono">
+                        {canRemoveAttempts && unsuccessful && !job.outputArtifactId && job.completedAt !== null && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={Boolean(busyJob)}
+                            loading={busyJob === `remove-${job.id}`}
+                            onClick={() => void handleRemove(job.id)}
+                            className="text-xs h-7"
+                          >
+                            Remove attempt
+                          </Button>
+                        )}
+                        <span className="ml-auto text-[10px] text-slate-500 font-mono">
                           ID: {job.id.slice(0, 8)}
                         </span>
                       </div>

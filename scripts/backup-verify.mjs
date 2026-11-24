@@ -18,8 +18,16 @@ export async function verifyBackup(file, env = process.env) {
     const { rows: [row] } = await client.query("SELECT count(*)::int AS count FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','v','m','S','f')");
     const { rows: schemas } = await client.query("SELECT 1 FROM pg_namespace WHERE nspname='groundwork'");
     if (row.count || schemas.length) throw new Error('Restore rehearsal target must be empty');
-    // Recreate only the NOLOGIN policy role required by the application archive.
-    await client.query("DO $role$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='groundwork_runtime') THEN CREATE ROLE groundwork_runtime NOLOGIN; END IF; END $role$");
+    // Restore RLS policies in a fresh cluster without copying any login or grants.
+    await client.query(`DO $roles$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='groundwork_runtime') THEN
+          CREATE ROLE groundwork_runtime NOLOGIN;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='groundwork_backup_export') THEN
+          CREATE ROLE groundwork_backup_export NOLOGIN;
+        END IF;
+      END $roles$`);
     await runTool('pg_restore', ['--dbname=' + pgEnv.PGDATABASE, '--single-transaction', '--exit-on-error', '--no-owner', '--no-acl'], pgEnv, archive);
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
     const actual = await fingerprint(client);

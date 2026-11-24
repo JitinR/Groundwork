@@ -2,7 +2,7 @@ import { z } from "zod";
 import { randomId, sha256Hex } from "./crypto.js";
 import { db, now, withTransaction } from "./db.js";
 import { organizationAudit } from "./organization.js";
-import { canWriteProject, getProjectAccess, type ProjectAccess, type ProjectRole } from "./projectAccess.js";
+import { canManageProject, canWriteProject, getProjectAccess, type ProjectAccess, type ProjectRole } from "./projectAccess.js";
 import { admitProviderRequest, isBoundedProviderJson, releaseProviderPermit, renderOutputBytes, providerLimits, withProviderDeadline, ProviderResourceError, type ProviderPermit, } from "./providerBudget.js";
 import { getRenderProvider, RENDER_STYLE_PRESETS, type RenderPreset, type RenderProvider, type RenderProviderResult, } from "./renderProvider.js";
 import { artifactIdSchema, createWorkspaceArtifact, readWorkspaceArtifact, WorkspaceError, type WorkspaceActor, } from "./workspaces.js";
@@ -11,6 +11,10 @@ import { createRenderPayloadCodec, type RenderInputField } from "./renderPayload
 const renderPayload = createRenderPayloadCodec(MASTER_KEY, PREVIOUS_MASTER_KEY);
 export const RENDER_JOB_STATES = ["queued", "running", "succeeded", "failed", "cancelled", "unconfigured"] as const;
 export type RenderJobState = (typeof RENDER_JOB_STATES)[number];
+const MAX_RENDER_HISTORY = 200;
+// Preserve a few diagnostic attempts while the provider is disconnected. They
+// are accounted for separately from configured render history.
+const MAX_UNCONFIGURED_ATTEMPTS = 4;
 export const submitRenderJobSchema = z.object({
     prompt: z.string().trim().min(1, "Prompt cannot be empty").max(2000, "Prompt cannot exceed 2000 characters"),
     negativePrompt: z.string().trim().max(1000).optional(),
@@ -80,6 +84,7 @@ interface RenderJobRow {
     updated_at: number;
     completed_at: number | null;
 }
+type RenderAuditEntry = Pick<RenderJobRow, "id" | "project_id" | "source_revision" | "status">;
 // In-memory active job cancellation controllers
 const activeRenderJobs = new Map<string, AbortController>();
 async function authorizeProject(projectId: string, actor: WorkspaceActor, write = false): Promise<{
@@ -130,6 +135,21 @@ function parseParameters(jsonStr: string): Record<string, unknown> {
 function sealRenderInput(value: string, projectId: string, jobId: string, field: RenderInputField): string {
     return renderPayload.seal(value, { projectId, jobId, field });
 }
+async function sanitizeLegacyRenderAudits(row: RenderAuditEntry): Promise<void> {
+    // Retain the event while removing historical copies of free-form inputs.
+    const audits = await db.prepare(`SELECT id,detail FROM organization_audit
+        WHERE organization_id=(SELECT organization_id FROM projects WHERE id=?) AND action='render.submit' AND detail LIKE ?`)
+        .all(row.project_id, `%${row.id}%`) as { id: number; detail: string }[];
+    for (const audit of audits) {
+        let detail: Record<string, unknown>;
+        try { detail = JSON.parse(audit.detail) as Record<string, unknown>; } catch { continue; }
+        if (!detail || detail.jobId !== row.id) continue;
+        await db.prepare("UPDATE organization_audit SET detail=? WHERE id=?").run(JSON.stringify({
+            projectId: row.project_id, jobId: row.id, sourceRevision: row.source_revision,
+            status: RENDER_JOB_STATES.includes(detail.status as RenderJobState) ? detail.status : row.status,
+        }), audit.id);
+    }
+}
 async function openJobInputs(row: RenderJobRow): Promise<{ prompt: string; negativePrompt: string | null; stylePreset: string | null; parameters: Record<string, unknown> }> {
     try {
         const context = { projectId: row.project_id, jobId: row.id };
@@ -143,16 +163,7 @@ async function openJobInputs(row: RenderJobRow): Promise<{ prompt: string; negat
                 await db.prepare("UPDATE project_render_jobs SET prompt=?,negative_prompt=?,style_preset=?,parameters_json=? WHERE id=? AND project_id=?")
                     .run(sealRenderInput(prompt.plaintext, row.project_id, row.id, "prompt"), negative ? sealRenderInput(negative.plaintext, row.project_id, row.id, "negative_prompt") : null,
                         style ? sealRenderInput(style.plaintext, row.project_id, row.id, "style_preset") : null, sealRenderInput(parameters.plaintext, row.project_id, row.id, "parameters_json"), row.id, row.project_id);
-                // Old render.submit audits duplicated the plaintext prompt. Keep
-                // event identity/timestamp while removing free-form input copies.
-                const audits = await db.prepare("SELECT id,detail FROM organization_audit WHERE action='render.submit' AND detail LIKE ?").all(`%${row.id}%`) as { id: number; detail: string }[];
-                for (const audit of audits) {
-                    let detail: Record<string, unknown>;
-                    try { detail = JSON.parse(audit.detail) as Record<string, unknown>; } catch { continue; }
-                    if (!detail || detail.jobId !== row.id) continue;
-                    await db.prepare("UPDATE organization_audit SET detail=? WHERE id=?").run(JSON.stringify({ projectId: row.project_id, jobId: row.id, sourceRevision: row.source_revision,
-                        status: RENDER_JOB_STATES.includes(detail.status as RenderJobState) ? detail.status : row.status }), audit.id);
-                }
+                await sanitizeLegacyRenderAudits(row);
             });
         }
         return { prompt: prompt.plaintext, negativePrompt: negative?.plaintext ?? null, stylePreset: style?.plaintext ?? null, parameters: parsedParameters };
@@ -322,10 +333,10 @@ export async function submitRenderJob(projectId: string, actor: WorkspaceActor, 
     let permit: ProviderPermit | undefined;
     const summary = await withTransaction(async () => {
         const { access, project } = await authorizeProject(projectId, actor, true);
-        await ensureRenderHistoryCapacity(projectId);
         if (input.sourceRevision > project.revision) {
             throw new WorkspaceError(409, "Source revision is ahead of current project revision", "SOURCE_REVISION_AHEAD");
         }
+        await reserveRenderHistorySlot(access, actor, configured);
         if (configured)
             permit = await admitRender(projectId, actor, input);
         let sourceArtifactId = input.sourceImageArtifactId;
@@ -379,12 +390,51 @@ export async function submitRenderJob(projectId: string, actor: WorkspaceActor, 
         });
     return summary;
 }
-async function ensureRenderHistoryCapacity(projectId: string): Promise<void> {
-    const row = await db.prepare("SELECT COUNT(*) AS count FROM project_render_jobs WHERE project_id=?").get(projectId) as {
-        count: number;
-    };
-    if (row.count >= 200)
-        throw new WorkspaceError(409, "Project render history capacity reached", "RENDER_HISTORY_CAPACITY");
+async function removeRenderRecord(access: ProjectAccess, actor: WorkspaceActor, row: RenderAuditEntry, reason: "retention" | "owner"): Promise<void> {
+    await sanitizeLegacyRenderAudits(row);
+    // Workspace artifact deletion applies its own authorization and reference
+    // checks. Removing metadata does not delete a source image.
+    await db.prepare("DELETE FROM project_render_jobs WHERE id=? AND project_id=?").run(row.id, access.projectId);
+    await tenantAudit(access, actor, "render.history.remove", { jobId: row.id, reason });
+}
+
+async function reserveRenderHistorySlot(access: ProjectAccess, actor: WorkspaceActor, configured: boolean, originalId = ""): Promise<void> {
+    const projectId = access.projectId;
+    if (!configured) {
+        const { count } = await db.prepare("SELECT COUNT(*) AS count FROM project_render_jobs WHERE project_id=? AND status='unconfigured'")
+            .get(projectId) as { count: number };
+        if (count >= MAX_UNCONFIGURED_ATTEMPTS) {
+            throw new WorkspaceError(503, "Connect a rendering provider before creating another render attempt.", "PROVIDER_UNCONFIGURED");
+        }
+        return;
+    }
+    const { count } = await db.prepare("SELECT COUNT(*) AS count FROM project_render_jobs WHERE project_id=? AND status<>'unconfigured'")
+        .get(projectId) as { count: number };
+    if (count < MAX_RENDER_HISTORY) return;
+    const oldest = await db.prepare(`SELECT id,project_id,source_revision,status FROM project_render_jobs
+        WHERE project_id=? AND id<>? AND status IN ('failed','cancelled') AND completed_at IS NOT NULL AND output_artifact_id IS NULL
+        ORDER BY completed_at, id LIMIT 1`).get(projectId, originalId) as RenderAuditEntry | undefined;
+    if (!oldest) {
+        throw new WorkspaceError(409, "Project render history capacity reached. Wait for active renders or remove unsuccessful attempts.", "RENDER_HISTORY_CAPACITY");
+    }
+    await removeRenderRecord(access, actor, oldest, "retention");
+}
+
+export async function removeRenderHistoryEntry(projectId: string, jobId: string, actor: WorkspaceActor): Promise<void> {
+    await withTransaction(async () => {
+        const { access } = await authorizeProject(projectId, actor, true);
+        if (!canManageProject(access)) {
+            throw new WorkspaceError(403, "Owner access required to remove render history", "OWNER_REQUIRED");
+        }
+        const row = await db.prepare(`SELECT id,project_id,source_revision,status,completed_at,output_artifact_id
+            FROM project_render_jobs WHERE project_id=? AND id=?`).get(projectId, jobId) as
+            Pick<RenderJobRow, keyof RenderAuditEntry | "completed_at" | "output_artifact_id"> | undefined;
+        if (!row) throw new WorkspaceError(404, "Render job not found", "JOB_NOT_FOUND");
+        if (row.completed_at === null || row.output_artifact_id !== null || !["failed", "cancelled", "unconfigured"].includes(row.status)) {
+            throw new WorkspaceError(409, "Only completed render attempts without an output can be removed", "INVALID_STATE");
+        }
+        await removeRenderRecord(access, actor, row, "owner");
+    });
 }
 async function admitRender(projectId: string, actor: WorkspaceActor, input: {
     prompt: string;
@@ -418,7 +468,7 @@ export async function retryRenderJob(projectId: string, jobId: string, actor: Wo
         if (original.status === "queued" || original.status === "running") {
             throw new WorkspaceError(409, "An active render cannot be retried", "INVALID_STATE");
         }
-        await ensureRenderHistoryCapacity(projectId);
+        await reserveRenderHistorySlot(access, actor, configured, jobId);
         const originalInputs = await openJobInputs(original);
         const newParams = { ...originalInputs.parameters, retriedFromJobId: jobId };
         if (!isBoundedProviderJson(newParams, 16_384)) throw new WorkspaceError(409, "Retried render parameters exceed the supported limit", "RENDER_INPUT_INVALID");

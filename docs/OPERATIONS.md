@@ -40,7 +40,8 @@ credentials and variable values remain private. It never changes GitHub settings
 
 ## External monitoring and existing SMTP
 
-`operations-health.yml` runs every 15 minutes, subject to GitHub scheduling delay.
+`operations-health.yml` requests a run every 15 minutes. GitHub may delay or drop
+scheduled runs.
 It performs up to three bounded, unauthenticated GET requests to `/api/health`.
 It rejects redirects, HTML, oversized bodies, non-200 responses, network failures
 and JSON without `ok: true`. This checks the public route and database connection;
@@ -59,11 +60,11 @@ Settings → Secrets and variables → Actions; preserve the existing production
 
 Configure separate Actions secrets `OPS_MAIL_HOST`, `OPS_MAIL_USER`,
 `OPS_MAIL_PASS`, `OPS_MAIL_FROM` from the existing verified SMTP account. No new
-mail provider is needed. Credentials are injected only into the checking step;
-they are never printed, added to artifacts, or used by dependency installation.
-Alerts require TLS with certificate verification. The workflow opts in to sending
-only after three consecutive failures within that run. A sustained outage sends
-at most one message per scheduled run; it does not yet deduplicate across runs.
+mail provider is needed. Credentials are injected into the probe and cadence
+steps. They are never printed, added to artifacts, or used by dependency
+installation. Alerts require TLS with certificate verification. The workflow
+sends after three failed health attempts, stale backup evidence when enabled, or
+failed cadence verification. It sends at most one message per workflow attempt.
 SMTP failure fails the workflow, so enable GitHub failed-workflow notifications
 as the independent fallback. No success email is sent.
 
@@ -79,9 +80,20 @@ run and inbox delivery. GitHub schedules can be delayed or disabled; inspect the
 On each first-attempt scheduled run, a separate read-only evidence check fails
 the workflow if the preceding scheduled probe step cannot be verified or
 completed more than 45 minutes earlier. A rerun or manual probe does not
-refresh this evidence. This records a missed interval when GitHub resumes and
-keeps probe results separate from scheduling failures. Maintain an independent
-freshness alert for detection while GitHub is quiet.
+refresh this evidence. When the health step succeeds and the cadence check
+fails, the workflow sends a separate cadence alert through the configured SMTP
+route.
+
+Run `node scripts/operational-health.mjs --watch-cadence` on an existing
+scheduler outside GitHub Actions to detect gaps while Actions is quiet. Set
+`GITHUB_REPOSITORY`, `OPS_DEFAULT_BRANCH` and a GitHub credential with read-only
+Actions access in that scheduler. The command examines the latest completed
+scheduled run's first attempt and exits nonzero for missing, stale or
+unverifiable evidence. Use the scheduler's own failure notifications or set
+`OPS_SEND_ALERTS=1` with the same allowlisted origin and approved SMTP
+configuration. Install dependencies without credentials in scope if using its
+SMTP option. Verify a missed-check alert and inbox delivery before relying on
+this independent check. [GitHub scheduled run behavior](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflows-running-at-unexpected-times)
 
 ## Encrypted offsite PostgreSQL export
 
@@ -101,7 +113,7 @@ in the public source repository.
 | --- | --- | --- |
 | Variable | `OPS_BACKUP_ENABLED` | `true` after owner review and credential setup |
 | Variable | `BACKUP_ALLOWED_HOST` | Exact copied Session-pooler/direct host and explicit port as represented by the URL |
-| Secret | `BACKUP_DATABASE_URL` | Restricted export/runtime login with full-schema SELECT policies, never an administrator URL |
+| Secret | `BACKUP_DATABASE_URL` | Dedicated login with the `groundwork_backup_export` role |
 | Secret | `BACKUP_ENCRYPTION_KEY` | New, random, canonical base64 32-byte key, independent of every application key |
 
 Generate the backup key in the owner's password manager/secret store. Preserve
@@ -110,16 +122,20 @@ an independent recovery copy there. Never put that key or application
 separate owner-controlled recovery vault, labelled with rotation history.
 The export process refuses to run when application encryption keys are present.
 
-The existing restricted runtime login can export using the private schema's
-`groundwork_runtime` SELECT policies, which grant full row visibility. The tool
-uses `--enable-row-security` and does not require or grant BYPASSRLS. It holds a
-read-only transaction and gives native `pg_dump` read-only connection options.
-Prefer a separate login granted only CONNECT, schema USAGE, SELECT on application
-tables/sequences and explicit full-row SELECT policies, without write, CREATE,
-role-management, schema-ownership or RLS-bypass privileges. Its SELECT policies
-must cover **all** application rows: row-security-aware exports can otherwise
-successfully back up a subset. Review row visibility and new tables/sequences
-after every migration. Never use a service-role API key or administrator URL.
+Apply `scripts/backup-role.sql` as the private schema owner after application
+migrations. Grant `groundwork_backup_export` and database CONNECT to a dedicated
+login provisioned in the owner-controlled database console. Give the login an
+independent password and no additional roles or object ownership. Update
+`BACKUP_DATABASE_URL` in the private recovery repository and verify a successful
+backup and restore before retiring the previous credential or adopting this
+export release. Run the SQL again after schema changes so new tables,
+sequences, and row security policies are covered.
+
+The exporter checks database role membership, application write privileges,
+and full SELECT coverage before producing an archive. A missing policy, an
+applicable restrictive policy, or a runtime/admin credential fails the check.
+The export uses `--enable-row-security`, a read-only transaction, and read-only
+connection options for native `pg_dump`.
 
 The export holds a read-only repeatable-read transaction, fingerprints every
 table using sorted SHA-256 row hashes and counts, and supplies its exported

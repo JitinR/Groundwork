@@ -75,6 +75,40 @@ test("ordinary cache writes automatically retain queued, failed and draft recove
   removeAccountDrafts(userId); offlineProjectStore.clearActiveUserSession(userId);
 });
 
+test("pre-binding project copies are unavailable until they are refreshed online", async () => {
+  const userId = "cached-project-owner";
+  const legacy = { userId, projectId: "legacy-copy" };
+  const verified = { userId, projectId: "verified-copy", accountBound: true, lastAccessedAt: 1 };
+  const stored = [legacy, verified];
+  const request = (result: unknown) => {
+    const pending: { result: unknown; onsuccess?: () => void } = { result };
+    queueMicrotask(() => pending.onsuccess?.());
+    return pending;
+  };
+  const store = {
+    get: ([, projectId]: string[]) => request(stored.find(record => record.projectId === projectId)),
+    index: () => ({ getAll: () => request(stored) }),
+    put: () => undefined,
+  };
+  const db = { transaction: () => ({ objectStore: () => store }), close: () => undefined, onversionchange: () => undefined };
+  const factory = { open: () => request(db) };
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalIndexedDB = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { indexedDB: factory } });
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: factory });
+  try {
+    assert.equal(await offlineProjectStore.getCachedProject(userId, legacy.projectId), null);
+    assert.equal((await offlineProjectStore.getCachedProject(userId, verified.projectId))?.projectId, verified.projectId);
+    const listed = await offlineProjectStore.listCachedProjects(userId);
+    assert.deepEqual(listed.map(project => project.projectId), [verified.projectId]);
+  } finally {
+    db.onversionchange();
+    offlineProjectStore.clearActiveUserSession(userId);
+    if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow); else Reflect.deleteProperty(globalThis, "window");
+    if (originalIndexedDB) Object.defineProperty(globalThis, "indexedDB", originalIndexedDB); else Reflect.deleteProperty(globalThis, "indexedDB");
+  }
+});
+
 test("an unreadable durable queue preserves every cached copy instead of evicting from a partial memory view", async (context) => {
   const userId = "cache-unreadable-queue-owner";
   const design = { room: { widthMm: 5000, depthMm: 4000 }, furniture: [] } as unknown as Design;

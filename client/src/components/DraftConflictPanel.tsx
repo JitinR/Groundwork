@@ -6,7 +6,7 @@ import { mergeDesignDocuments, type MergeChoice, type MergeDocument } from "../l
 import { download } from "../lib/download";
 import { Button, Modal, Select } from "./ui";
 
-export function DraftConflictPanel({ projectId, draft, remoteDocument, onApply, onClose }: { projectId: string; draft: PendingDraft; remoteDocument: (project: ProjectDetail) => MergeDocument; onApply: (document: MergeDocument, remote: ProjectDetail) => void; onClose: () => void }) {
+export function DraftConflictPanel({ accountId, projectId, draft, remoteDocument, onApply, onClose }: { accountId: string; projectId: string; draft: PendingDraft; remoteDocument: (project: ProjectDetail) => MergeDocument; onApply: (document: MergeDocument, remote: ProjectDetail) => void; onClose: () => void }) {
   const [remote, setRemote] = useState<ProjectDetail | null>(null);
   const [choices, setChoices] = useState<Record<string, MergeChoice>>({});
   const [message, setMessage] = useState("");
@@ -16,11 +16,11 @@ export function DraftConflictPanel({ projectId, draft, remoteDocument, onApply, 
   useEffect(() => {
     const current = ++generation.current;
     setBusy(true); setRemote(null); setChoices({}); setPage(0); setMessage("");
-    void getProject(projectId).then(project => { if (generation.current === current) setRemote(project); })
+    void getProject(projectId, accountId).then(project => { if (generation.current === current) setRemote(project); })
       .catch(error => { if (generation.current === current) setMessage(error instanceof Error ? error.message : "Could not fetch the remote project."); })
       .finally(() => { if (generation.current === current) setBusy(false); });
     return () => { generation.current++; };
-  }, [projectId, draft]);
+  }, [projectId, accountId, draft]);
   const result = useMemo(() => {
     if (!remote || !hasMergeBase(draft)) return { merge: null, error: "" };
     try {
@@ -33,7 +33,7 @@ export function DraftConflictPanel({ projectId, draft, remoteDocument, onApply, 
     const current = generation.current;
     setBusy(true); setMessage("");
     try {
-      const fresh = await getProject(projectId);
+      const fresh = await getProject(projectId, accountId);
       if (current !== generation.current) return;
       if (fresh.role === "viewer") throw new Error("Editor access is required to save the merge.");
       if (fresh.revision !== remote.revision) { setRemote(fresh); setChoices({}); setPage(0); setMessage("The remote project changed again. Review the updated comparison before applying."); return; }

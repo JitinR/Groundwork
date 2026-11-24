@@ -267,6 +267,20 @@ test('preview waits for CI registration and completion, then checks fresh jobs a
   assert.equal(fixture.calls.length, 10, 'pending polls must not repeat the full five-request verification');
 });
 
+test('Vercel gates dependency installation before npm and rechecks fresh CI before building', async () => {
+  const configuration = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url), 'utf8'));
+  assert.equal(configuration.installCommand, 'node scripts/deploy-after-ci.mjs --install-guard && npm ci --include=dev');
+  assert.equal(configuration.buildCommand, 'node scripts/deploy-after-ci.mjs --build-guard && npm run build');
+  const branch = 'codex/preview-fixture';
+  const pending = previewFixture([[run({ head_branch: branch, status: 'in_progress', conclusion: null })]]);
+  await assert.rejects(guardVercelBuild(pending.env, pending.request, { ...pending.options, waitForCi: false }), { code: 'EVIDENCE_REJECTED' });
+  assert.deepEqual(pending.sleeps, []);
+  const current = previewFixture([[run({ head_branch: branch })]]);
+  assert.equal((await guardVercelBuild(current.env, current.request, { ...current.options, waitForCi: false })).buildPermitted, true);
+  assert.equal(current.calls.filter(url => url.includes('/jobs?')).length, 1);
+  assert.deepEqual(current.sleeps, []);
+});
+
 test('preview polling keeps the failed evidence endpoint and redacts malformed response text', async () => {
   const fixture = previewFixture([[]]), body = 'private malformed GitHub response';
   const request = async (url, init) => String(url).includes('/branches/') ? fixture.request(url, init) : new Response(body);

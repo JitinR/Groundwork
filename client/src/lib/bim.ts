@@ -3,6 +3,7 @@ import { resolveDraft, resolveRoomOpening, resolveTowerOpening, parametricIssues
 import { amenityFootprint, towerMeters, undergroundParkingBayLayout } from "./community";
 import { engineeringExchangeProvenance, engineeringProvenanceAscii } from "./exchangeProvenance";
 import { cadFootprintArea } from "./cadModel";
+import { quoteCsvCell } from "./csv";
 
 export interface ExchangeEntity {
   id: string;
@@ -783,16 +784,11 @@ export function buildIfcStep(design: Design): string {
   ].join("\n");
 }
 
-function csvCell(value: unknown): string {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  return `"${text.replace(/"/g, '""')}"`;
-}
-
 export function buildBimScheduleCsv(design: Design): string {
   const exchange = JSON.parse(buildBimExchange(design)) as { entities: ExchangeEntity[] };
   const rows = ["id,type,name,levelId,geometry,properties"];
   for (const item of exchange.entities) {
-    rows.push([item.id, item.type, item.name ?? "", item.levelId ?? "", item.geometry ?? {}, item.properties ?? {}].map(csvCell).join(","));
+    rows.push([item.id, item.type, item.name, item.levelId, JSON.stringify(item.geometry ?? {}), JSON.stringify(item.properties ?? {})].map(quoteCsvCell).join(","));
   }
   return rows.join("\n") + "\n";
 }

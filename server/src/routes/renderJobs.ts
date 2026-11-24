@@ -8,6 +8,7 @@ import {
   getRenderJob,
   getRenderJobArtifact,
   listRenderJobs,
+  removeRenderHistoryEntry,
   retryRenderJob,
   submitRenderJob,
   submitRenderJobSchema,
@@ -141,6 +142,17 @@ router.get("/:jobId", handle(async (req, res) => {
   }
   const job = (await getRenderJob(routeParam(req, "projectId"), routeParam(req, "jobId"), actor(req)));
   res.json({ job });
+}));
+
+router.delete("/:jobId", handle(async (req, res) => {
+  const jobId = routeParam(req, "jobId");
+  if (!jobIdSchema.safeParse(jobId).success) {
+    throw new WorkspaceError(400, "Invalid render job ID", "INVALID_JOB_ID");
+  }
+  const projectId = routeParam(req, "projectId");
+  await removeRenderHistoryEntry(projectId, jobId, actor(req));
+  await logAudit(req.user?.id ?? null, "render.history.remove", { projectId, jobId }, req);
+  res.status(204).end();
 }));
 
 // GET /api/projects/:projectId/renders/:jobId/image

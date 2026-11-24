@@ -363,7 +363,7 @@ export function ProjectWorkspacePanel({ kind, payload, onRestore, onImportProjec
   async function attachProjectModel(): Promise<void> {
     const ctx = context.current, importModel = latest.current.onImportProject;
     if (!ctx || !importModel || !active(ctx) || !ready || busy) return; setBusy(true); setError("");
-    try { const project = await getProject(ctx.projectId); if (!active(ctx)) return; await preserveBeforeReplacement(ctx); if (!active(ctx)) return; importModel(project); setSourceRevision(project.revision); setDirty(true); setNotice("Editor model imported. Review its inputs and assumptions before calculation or saving."); }
+    try { const project = await getProject(ctx.projectId, ctx.userId); if (!active(ctx)) return; await preserveBeforeReplacement(ctx); if (!active(ctx)) return; importModel(project); setSourceRevision(project.revision); setDirty(true); setNotice("Editor model imported. Review its inputs and assumptions before calculation or saving."); }
     catch (cause) { if (active(ctx)) setError(message(cause)); } finally { if (active(ctx)) setBusy(false); }
   }
   async function pruneHistory(): Promise<void> {

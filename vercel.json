@@ -13,7 +13,7 @@
       "schedule": "0 8 * * *"
     }
   ],
-  "installCommand": "npm ci --include=dev",
+  "installCommand": "node scripts/deploy-after-ci.mjs --install-guard && npm ci --include=dev",
   "outputDirectory": "client/dist",
   "regions": [
     "iad1"

@@ -2,6 +2,7 @@ import type { Design, DocumentationSchedule, FurnitureItem, MepDesign, Parametri
 import { amenityFootprint, towerMeters } from "./community";
 import { resolveDraft, resolveRoomOpening, resolveTowerOpening } from "./parametric";
 import { cadFootprintArea } from "./cadModel";
+import { quoteCsvCell } from "./csv";
 
 export type ScheduleCell = string | number | boolean;
 export interface ScheduleRecord {
@@ -152,9 +153,9 @@ export function scheduleCellText(cell: ScheduleCell): string {
 
 export function documentationScheduleCsv(result: ScheduleResult): string {
   const csv = (cell: ScheduleCell) => {
-    let value = scheduleCellText(cell);
-    if (typeof cell === "string" && /^[\s\uFEFF]*[=+\-@]/.test(value)) value = `'${value}`;
-    return `"${value.replace(/"/g, '""')}"`;
+    // Preserve schedule rounding while keeping typed negative numbers numeric.
+    const value = scheduleCellText(cell);
+    return quoteCsvCell(typeof cell === "number" && value !== "" ? Number(value) : value);
   };
-  return [result.fields.map(csv).join(","), ...result.rows.map(row => row.cells.map(csv).join(","))].join("\r\n") + "\r\n";
+  return [result.fields.map(quoteCsvCell).join(","), ...result.rows.map(row => row.cells.map(csv).join(","))].join("\r\n") + "\r\n";
 }
