@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -17,7 +18,7 @@ delete process.env.DB_PATH;
 delete process.env.PREVIOUS_MASTER_KEY;
 const { app } = await import("../src/index.js");
 const { db } = await import("../src/db.js");
-const { performDatabaseBackup, listDatabaseBackups, checkpointDatabase } = await import("../src/databaseBackup.js");
+const { BACKUP_DIR, performDatabaseBackup, listDatabaseBackups, checkpointDatabase, startDatabaseScheduler } = await import("../src/databaseBackup.js");
 const { testMailConnection } = await import("../src/mailer.js");
 const server = app.listen(0, "127.0.0.1");
 await new Promise<void>((resolve, reject) => {
@@ -82,6 +83,44 @@ test("Database backup and maintenance suite", async (t) => {
         const found = list.find((b) => b.filename === result.backupFile);
         assert.ok(found);
         assert.strictEqual(found?.integrity, true);
+    });
+    await t.test("retries a due backup and keeps its verified timestamp across restart", { timeout: 5000 }, async (t) => {
+        for (const backup of await listDatabaseBackups()) {
+            const staleTime = new Date(Date.now() - 13 * 3600_000);
+            await utimes(join(BACKUP_DIR, backup.filename), staleTime, staleTime);
+        }
+        await writeFile(join(BACKUP_DIR, "groundwork-backup-corrupt.db"), "invalid backup");
+        let attempts = 0;
+        const exec = db.exec.bind(db);
+        t.mock.method(db, "exec", async (sql: string) => {
+            if (sql.startsWith("VACUUM INTO") && ++attempts === 1) throw new Error("Backup temporarily busy");
+            await exec(sql);
+        });
+        const completed = new Promise<void>(resolve => {
+            t.mock.method(console, "log", (message: string) => {
+                if (typeof message === "string" && message.includes("Automated backup completed")) resolve();
+            });
+        });
+        t.mock.method(console, "error", () => {});
+        const stop = startDatabaseScheduler({ checkpointIntervalMs: 20 });
+        try {
+            await completed;
+            assert.equal(attempts, 2);
+            assert((await listDatabaseBackups()).some(backup => backup.filename.endsWith("-scheduled.db")));
+        } finally { stop(); }
+
+        const prepare = db.prepare.bind(db);
+        const checkpointed = new Promise<void>(resolve => {
+            t.mock.method(db, "prepare", (sql: string) => {
+                if (sql.startsWith("PRAGMA wal_checkpoint")) resolve();
+                return prepare(sql);
+            });
+        });
+        const stopRestart = startDatabaseScheduler({ checkpointIntervalMs: 20 });
+        try {
+            await checkpointed;
+            assert.equal(attempts, 2);
+        } finally { stopRestart(); }
     });
     await t.test("executes WAL checkpoint without errors", async () => {
         const check = await checkpointDatabase("TRUNCATE");

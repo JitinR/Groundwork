@@ -5,11 +5,78 @@ import { defaultCommunity, defaultTower, defaultUnderground } from "../src/lib/c
 import { buildMepMachineReport, buildMepReport, makeMepElement, mepPlanningSummary, normalizeMep } from "../src/lib/mep.ts";
 import { analyzeMepNetwork } from "../src/lib/mepNetwork.ts";
 import { analyzeCommunity } from "../src/lib/structural.ts";
+import { buildStructuralFrameModel } from "../src/lib/structuralEngine.ts";
+import { createCadObject } from "../src/lib/cadModel.ts";
+import { analyzeAdvancedCivil, type AdvancedAlignment } from "../src/lib/civilAlignment.ts";
 import { computeTakeoff } from "../src/lib/takeoff.ts";
 import type { DraftElement } from "../src/types.ts";
 
 const water = JSON.stringify({ version: 1, medium: "water", densityKgM3: 998.2, kinematicViscosityM2s: 1e-6, sourceNotes: { reviewedBy: "test reviewer", keep: true }, nodes: [{ id: "source", elevationM: 2, fixedPotential: 45, demandM3s: 0 }, { id: "terminal", elevationM: 5, demandM3s: 0.002, minimumPressure: 15 }], links: [{ id: "pipe", from: "source", to: "terminal", lengthM: 80, diameterM: .05, roughnessM: .0001, minorLossK: 3 }], unsupportedForGuide: [1, 2, 3] });
 const frame = JSON.stringify({ version: 1, analysis: "p-delta", nodes: [{ id: "base", xM: 0, yM: 0, restraints: [true, true, true] }, { id: "top", xM: 0, yM: 3, restraints: [false, false, false] }], members: [{ id: "column", start: "base", end: "top", areaM2: .02, inertiaM4: .00008, elasticModulusPa: 200e9, design: { effectiveLengthFactor: 2 } }], loadCases: [{ id: "lateral", nodal: [{ node: "top", fxN: 10000, fyN: 0, mzNm: -500 }], uniform: [] }], combinations: [{ id: "service", factors: { lateral: 1 } }], customMetadata: { note: "preserve exactly" } });
+
+test("structural frames match resolved level elevations and retain authored beams", () => {
+  const design = defaultCommunity("residential");
+  const ground = design.levels![0];
+  const upper = { id: "upper", name: "Upper", elevation: 3.2, floorHeight: 3 };
+  const column = createCadObject("column", upper);
+  column.family = { ...column.family, instanceParameters: { baseOffset: .2 }, typeParameters: { height: 2.7 } };
+  const beam = { ...createCadObject("beam", upper), x: 3, z: 4, rotationDeg: 90 };
+  beam.family = { ...beam.family, typeParameters: { width: 2, depth: .3, height: .45 } };
+  const gridBeam = { ...createCadObject("beam", upper), x: 2.5, z: 0, rotationDeg: 180 };
+  gridBeam.family = { ...gridBeam.family, typeParameters: { width: 5 }, instanceParameters: { baseOffset: 3 } };
+  const legacySlab = { ...createCadObject("slab"), elevationM: 4.5, family: undefined };
+  const model = buildStructuralFrameModel({
+    ...design,
+    levels: [ground, upper],
+    drafts: [column, beam, gridBeam, legacySlab],
+    structuralGrid: [
+      { id: "x0", axis: "x", position: 0, label: "X0", extent: 5, color: "#888888" },
+      { id: "x1", axis: "x", position: 5, label: "X1", extent: 5, color: "#888888" },
+      { id: "z0", axis: "z", position: 0, label: "Z0", extent: 5, color: "#888888" },
+      { id: "z1", axis: "z", position: 5, label: "Z1", extent: 5, color: "#888888" },
+    ],
+  });
+  const node = (id: string) => model.nodes.find(item => item.id === id)!;
+  const authoredColumn = model.members.find(item => item.sourceId === column.id)!;
+  assert(Math.abs(node(authoredColumn.startNodeId).y - 3.4) < 1e-9);
+  assert(Math.abs(node(authoredColumn.endNodeId!).y - 6.1) < 1e-9);
+  const authoredBeam = model.members.find(item => item.sourceId === beam.id)!;
+  assert.equal(authoredBeam.kind, "beam");
+  assert.deepEqual([authoredBeam.lengthM, authoredBeam.widthM, authoredBeam.depthM], [2, .3, .45]);
+  const start = node(authoredBeam.startNodeId), end = node(authoredBeam.endNodeId!);
+  assert.deepEqual([start.x, start.y, start.z], [3, 3.2, 5]);
+  assert.deepEqual([end.x, end.y, end.z], [3, 3.2, 3]);
+  const inferredUpper = model.members.filter(item => item.kind === "beam" && item.levelId === upper.id && !item.sourceId);
+  assert.equal(inferredUpper.length, 3);
+  assert(!inferredUpper.some(item => item.id === "beam-x-upper-x0-x1-z0"));
+  assert(model.members.some(item => item.kind === "beam" && item.sourceId === gridBeam.id));
+  assert(model.members.some(item => item.kind === "beam" && item.levelId === ground.id));
+  assert.equal(node(model.members.find(item => item.sourceId === legacySlab.id)!.startNodeId).y, 4.5);
+});
+
+test("civil cross sections find daylight between the last regular sample and the search limit", () => {
+  const alignment: AdvancedAlignment = {
+    name: "Flat terrain fill", origin: { x: 0, z: 0 }, headingDeg: 0, startElevationM: 2.25, startGradePct: 0,
+    horizontal: [{ kind: "line", lengthM: 10 }], vertical: [], superelevation: [],
+    widthM: 4, crownPct: 0, sideSlopeRatio: 2, stationIntervalM: 5, crossSectionIntervalM: 2, maxDaylightM: 5,
+  };
+  const surface = {
+    points: [[-20, -20], [20, -20], [20, 20], [-20, 20]].map(([x, z]) => ({ x, z, elevationM: 0 })),
+    triangles: [[0, 1, 2], [0, 2, 3]], warnings: [],
+  };
+  const study = analyzeAdvancedCivil(alignment, surface);
+  assert.equal(study.quantifiedLengthM, 10);
+  assert.equal(study.cutM3, 0);
+  assert(Math.abs(study.fillM3 - 191.25) < 1e-6);
+  for (const section of study.sections) {
+    assert.equal(section.complete, true);
+    assert(Math.abs(section.points[0].offsetM + 6.5) < 1e-6);
+    assert(Math.abs(section.points.at(-1)!.offsetM - 6.5) < 1e-6);
+  }
+  const atLimit = analyzeAdvancedCivil({ ...alignment, startElevationM: 2.5 }, surface);
+  assert.equal(atLimit.quantifiedLengthM, 10);
+  assert.equal(atLimit.sections[0].points.at(-1)!.offsetM, 7);
+});
 
 test("hydraulic display units translate mm, L/s and viscosity back into SI", () => {
   const guide = guidedEngineeringFields(water, "water");

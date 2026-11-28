@@ -123,6 +123,44 @@ const PAYPAL_BASE = process.env.PAYPAL_MODE === "live"
   ? "https://api-m.paypal.com"
   : "https://api-m.sandbox.paypal.com";
 
+function paypalCheckoutOrigin(value = process.env.PUBLIC_APP_ORIGIN): string | null {
+  try {
+    const url = new URL(value ?? "");
+    if (url.protocol === "https:" && !url.username && !url.password &&
+        url.pathname === "/" && !url.search && !url.hash) return url.origin;
+  } catch { /* Checkout is unavailable until a public origin is configured. */ }
+  return null;
+}
+
+export function paypalExperienceContext(orderId: string, publicOrigin = process.env.PUBLIC_APP_ORIGIN) {
+  const origin = paypalCheckoutOrigin(publicOrigin);
+  if (!origin) throw new Error("PayPal checkout requires a fixed HTTPS application origin");
+  const checkout = new URL(`/billing/checkout/${encodeURIComponent(orderId)}`, origin);
+  const callback = (result: "approved" | "cancelled") => {
+    checkout.searchParams.set("paypal", result);
+    return checkout.href;
+  };
+  return {
+    brand_name: "Groundwork",
+    shipping_preference: "NO_SHIPPING",
+    user_action: "CONTINUE",
+    return_url: callback("approved"),
+    cancel_url: callback("cancelled"),
+  };
+}
+
+export function paypalApprovalUrl(links: { rel: string; href: string }[] = [], live = process.env.PAYPAL_MODE === "live"): string | null {
+  const expectedOrigin = live ? "https://www.paypal.com" : "https://www.sandbox.paypal.com";
+  for (const link of links) {
+    if (link.rel !== "payer-action" && link.rel !== "approve") continue;
+    try {
+      const url = new URL(link.href);
+      if (url.origin === expectedOrigin && !url.username && !url.password) return url.href;
+    } catch { /* A malformed HATEOAS link cannot be used for checkout. */ }
+  }
+  return null;
+}
+
 const paypalProvider: Provider = {
   id: "paypal",
   supports: ["paypal", "card"],
@@ -130,6 +168,7 @@ const paypalProvider: Provider = {
     const clientId = process.env.PAYPAL_CLIENT_ID;
     const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
     if (!clientId || !clientSecret) throw new Error("PayPal credentials are not configured");
+    const experienceContext = paypalExperienceContext(p.orderId);
 
     const authRes = await outboundRequest(`${PAYPAL_BASE}/v1/oauth2/token`, {
       method: "POST",
@@ -161,20 +200,18 @@ const paypalProvider: Provider = {
             custom_id: p.userId,
             ...(process.env.PAYPAL_MERCHANT_ID ? { payee: { merchant_id: process.env.PAYPAL_MERCHANT_ID } } : {}),
             amount: { currency_code: info.currency, value },
-description: `Groundwork ${p.plan.name} plan`,
+            description: `Groundwork ${p.plan.name} plan`,
           },
         ],
-        application_context: {
-          brand_name: "Groundwork",
-          user_action: "PAY_NOW",
-        },
+        payment_source: { paypal: { experience_context: experienceContext } },
       }),
     }, { service: "paypal-orders", allowedOrigins: [PAYPAL_BASE], safeToRetry: false });
     const order = JSON.parse(res.text) as { id?: string; links?: { rel: string; href: string }[] };
     if (!res.ok || !order.id) {
       throw new Error("PayPal order creation failed");
     }
-    const approveLink = order.links?.find((l) => l.rel === "approve")?.href ?? null;
+    const approveLink = paypalApprovalUrl(order.links);
+    if (!approveLink) throw new Error("PayPal did not provide an approval link");
     return {
       provider: "paypal",
       providerOrderId: order.id,
@@ -217,7 +254,7 @@ export function availableMethods(country: string | undefined | null): MethodOpti
   }
   const out: MethodOption[] = [];
   const raz = RAZORPAY_BASE64 && process.env.RAZORPAY_KEY_ID?.startsWith("rzp_live_") && process.env.RAZORPAY_WEBHOOK_SECRET && process.env.RAZORPAY_ACCOUNT_ID;
-  const pay = process.env.PAYPAL_MODE === "live" && process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET && process.env.PAYPAL_MERCHANT_ID;
+  const pay = process.env.PAYPAL_MODE === "live" && process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET && process.env.PAYPAL_MERCHANT_ID && paypalCheckoutOrigin();
   if (inr && raz) {
     out.push({ method: "upi", label: "UPI", provider: "razorpay" });
     out.push({ method: "card", label: "Credit / Debit Card", provider: "razorpay" });

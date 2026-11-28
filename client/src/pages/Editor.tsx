@@ -36,6 +36,7 @@ import { offlineSyncManager } from "../lib/offlineSyncManager";
 import type { MergeDocument } from "../lib/designMerge";
 import { DraftConflictPanel } from "../components/DraftConflictPanel";
 import { RenderStudioModal } from "../components/RenderStudioModal";
+import type { RenderSourceImage } from "../lib/renderApi";
 
 const Canvas3D = lazy(() => import("../editor/Canvas3D").then((module) => ({ default: module.Canvas3D })));
 const CommunityEditor = lazy(() => import("./CommunityEditor").then((module) => ({ default: module.CommunityEditor })));
@@ -112,27 +113,8 @@ export function Editor() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState<string | null>(null);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel | null>(null);
-  const [renderStudioOpen, setRenderStudioOpen] = useState(false);
-  const [renderSourceImage, setRenderSourceImage] = useState<string | null>(null);
-
-  const openRenderStudio = useCallback(async () => {
-    if (api) {
-      try {
-        const blob = await api.capturePng(1);
-        const reader = new FileReader();
-        reader.onload = () => {
-          setRenderSourceImage(reader.result as string);
-          setRenderStudioOpen(true);
-        };
-        reader.readAsDataURL(blob);
-        return;
-      } catch {
-        // Fallback without capture
-      }
-    }
-    setRenderSourceImage(null);
-    setRenderStudioOpen(true);
-  }, [api]);
+  const [renderStudio, setRenderStudio] = useState<{ scope: string; source: RenderSourceImage | null } | null>(null);
+  const renderCapture = useRef(0);
 
   const saveTimer = useRef<number | null>(null);
   const revisionRef = useRef(0);
@@ -151,24 +133,43 @@ export function Editor() {
   scopeRef.current = scope;
   latestDraft.current = pendingDraft;
 
-  const load = useCallback(async () => {
+  const openRenderStudio = useCallback(async () => {
+    const startScope = scopeRef.current;
+    const capture = ++renderCapture.current;
+    let source: RenderSourceImage | null = null;
+    if (api) {
+      const kind = design === acknowledged.current?.design && !latestDraft.current && !saveInFlight.current
+        ? "saved-viewport" : "draft-viewport";
+      const revision = kind === "draft-viewport" ? latestDraft.current?.baseRevision ?? revisionRef.current : revisionRef.current;
+      try {
+        const blob = await api.capturePng(1);
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Could not read the viewport image."));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+        source = { base64, kind, revision };
+      } catch { /* The studio can still accept an uploaded image. */ }
+    }
+    if (scopeRef.current === startScope && capture === renderCapture.current) setRenderStudio({ scope: startScope, source });
+  }, [api, design]);
+
+  const load = useCallback(async (discarded?: { document: MergeDocument; revision: number; role: typeof projectRole }) => {
     if (!id || !accountId) return;
     const write = captureLocalWrite(accountId);
     const request = ++loadGeneration.current, currentScope = scopeRef.current;
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     editGeneration.current++;
     setLoaded(false); setLoadError(""); setMergeOpen(false); setSaving(false);
-    try {
-      const project = await getProject(id, accountId);
-      if (request !== loadGeneration.current || currentScope !== scopeRef.current || !localWriteAllowed(accountId, write)) return;
-      const document = projectDocument(project);
+    const isCurrent = () => request === loadGeneration.current && currentScope === scopeRef.current && localWriteAllowed(accountId, write);
+    const openProject = (document: MergeDocument, revision: number, role: typeof projectRole, photo: string | null) => {
       acknowledged.current = document;
-      revisionRef.current = project.revision ?? 0;
-      setRemoteRevision(null); setProjectRole(project.role ?? "owner");
-      void offlineProjectStore.cacheProject(accountId, project, document.design);
-      const recovery = readPendingDraftResult(accountId, id);
+      revisionRef.current = revision;
+      setRemoteRevision(null); setProjectRole(role);
+      const recovery = discarded ? { draft: null, error: undefined } : readPendingDraftResult(accountId, id);
       let recovered = recovery.draft;
-      if (recovered && draftMatchesSavedProject(recovered, project)) {
+      if (recovered && draftMatchesSavedProject(recovered, { ...document, revision })) {
         if (recoveryFromAnotherTab(recovered)) clearRecoveredDraft(accountId, id, recovered);
         else clearPendingDraft(accountId, id);
         recovered = null;
@@ -177,28 +178,36 @@ export function Editor() {
       setPendingDraft(recovered); setRecoveryWarning(recovery.error ?? "");
       pendingBaseRevision.current = recovered?.baseRevision ?? null;
       blockedSaveStatus.current = recovered?.lastSaveStatus;
-      const visibleDraft = project.role === "viewer" ? null : recovered;
+      const visibleDraft = role === "viewer" ? null : recovered;
       setName(visibleDraft?.name ?? document.name); setProjectType(visibleDraft?.projectType ?? document.projectType); setDesign(visibleDraft?.design ?? document.design);
-      setPhotoUrl(project.hasPhoto ? `/api/projects/${id}/photo?v=${project.updatedAt}` : null);
+      setPhotoUrl(photo);
       setLoaded(true);
+    };
+    try {
+      const project = await getProject(id, accountId);
+      if (!isCurrent()) return;
+      const document = projectDocument(project);
+      void offlineProjectStore.cacheProject(accountId, project, document.design);
+      openProject(document, project.revision ?? 0, project.role ?? "owner", project.hasPhoto ? `/api/projects/${id}/photo?v=${project.updatedAt}` : null);
     } catch (err) {
+      let message = err instanceof Error ? err.message : "The project could not be opened.";
       if (err instanceof TypeError) {
         const cached = await offlineProjectStore.getCachedProject(accountId, id);
-        if (cached && request === loadGeneration.current && currentScope === scopeRef.current && localWriteAllowed(accountId, write)) {
-          revisionRef.current = cached.revision;
-          setProjectRole(cached.role);
-          setName(cached.name);
-          setProjectType(cached.projectType);
-          setDesign(cached.design);
-          acknowledged.current = { design: cached.design, name: cached.name, projectType: cached.projectType };
-          setLoaded(true);
-          toast.push({ title: "Opened from offline cache", description: "Network unavailable. Local offline copy loaded.", tone: "info" });
+        if (!isCurrent()) return;
+        if (discarded && (!cached || discarded.revision > cached.revision)) {
+          openProject(discarded.document, discarded.revision, discarded.role, null);
           return;
         }
+        if (cached) {
+          openProject({ name: cached.name, projectType: cached.projectType, design: cached.design }, cached.revision, cached.role, null);
+          toast.push({ title: "Opened from offline cache", description: "The last saved project is available offline.", tone: "info" });
+          return;
+        }
+        message = "Connect to the internet to refresh this project's saved offline copy.";
       }
-      if (request === loadGeneration.current && currentScope === scopeRef.current) {
-        setLoadError(err instanceof Error ? err.message : "The project could not be opened.");
-        toast.push({ title: "Could not open project", description: err instanceof Error ? err.message : undefined, tone: "error" });
+      if (isCurrent()) {
+        setLoadError(message);
+        toast.push({ title: "Could not open project", description: message, tone: "error" });
       }
     }
   }, [id, toast, accountId]);
@@ -287,9 +296,9 @@ export function Editor() {
           if (currentScope !== scopeRef.current || loadAtSave !== loadGeneration.current || !localWriteAllowed(user.id, write)) return;
           revisionRef.current = saved.revision; pendingBaseRevision.current = null; blockedSaveStatus.current = undefined;
           acknowledged.current = { design: d, name: draft.name, projectType: draft.projectType };
-          if (user?.id) {
-            void offlineProjectStore.cacheProject(user.id, { id, name: draft.name, projectType: draft.projectType, revision: saved.revision } as any, d);
-          }
+          void offlineProjectStore.cacheProject(user.id, {
+            id, name: draft.name, projectType: draft.projectType, revision: saved.revision, role: projectRole, hasPhoto: Boolean(photoUrl),
+          }, d);
           if (generation === editGeneration.current) {
             latestDraft.current = null; setPendingDraft(null);
             const cleanup = clearPendingDraft(user.id, id);
@@ -317,7 +326,6 @@ export function Editor() {
               draft.baseRevision,
             );
             if (currentScope !== scopeRef.current || loadAtSave !== loadGeneration.current || !localWriteAllowed(user.id, write)) return;
-            void offlineProjectStore.cacheProject(user.id, { id, name: draft.name, projectType: draft.projectType, revision: draft.baseRevision } as any, d);
             toast.push({ title: "Offline: changes queued safely", description: "Offline queue updated. Will synchronize when reconnected.", tone: "info" });
             void offlineSyncManager.synchronize(user.id);
           } else {
@@ -332,7 +340,7 @@ export function Editor() {
       };
       saveTimer.current = window.setTimeout(() => void attempt(), 1200);
     },
-    [id, name, toast, projectType, user?.id, projectRole],
+    [id, name, toast, projectType, user?.id, projectRole, photoUrl],
   );
 
   const onCollaborationEvent = useCallback((event: CollaborationEvent) => {
@@ -350,11 +358,14 @@ export function Editor() {
     try {
       await offlineSyncManager.discardProjectSaves(user.id, id);
       if (scopeRef.current !== scope) return;
-      clearPendingDraft(user.id, id);
+      const cleanup = clearPendingDraft(user.id, id);
       if (recoveryOrigin.current) clearRecoveredDraft(user.id, id, recoveryOrigin.current);
       latestDraft.current = null;
       setPendingDraft(null);
-      await load();
+      const document = acknowledged.current;
+      if (document) await load({ document, revision: revisionRef.current, role: projectRole });
+      else await load();
+      if (cleanup.error && scopeRef.current === scope) setRecoveryWarning(cleanup.error);
     } catch (error) {
       if (scopeRef.current === scope) {
         toast.push({ title: "Could not discard local changes", description: error instanceof Error ? error.message : undefined, tone: "error" });
@@ -492,7 +503,7 @@ export function Editor() {
         download(`${stem}.dxf`, buildDxf(design), "application/dxf");
       } else if (format === "obj") {
         const { buildObjMtl } = await import("../lib/obj");
-        const { obj, mtl } = buildObjMtl(design);
+        const { obj, mtl } = buildObjMtl(design, `${stem}.mtl`);
         const blob = await zipFiles([{ name: `${stem}.obj`, content: obj }, { name: `${stem}.mtl`, content: mtl }]);
         downloadBlob(`${stem}-blender.zip`, blob);
       } else if (format === "glb") {
@@ -510,7 +521,7 @@ export function Editor() {
         const { validateIfcRoundTrip } = await import("../lib/bim");
         const ifcReport = validateIfcRoundTrip(design);
         if (!ifcReport.valid) throw new Error("IFC validation failed; resolve the reported errors before exporting the coordination package.");
-        const { obj, mtl } = buildObjMtl(design);
+        const { obj, mtl } = buildObjMtl(design, `${stem}.mtl`);
         const entries: { name: string; content: string | Blob }[] = [
           { name: `${stem}.ifc`, content: buildIfcStep(design) },
           { name: `${stem}.ifc.json`, content: buildBimExchange(design) },
@@ -1082,13 +1093,12 @@ export function Editor() {
         onCapture={uploadFile}
       />
 
-      {renderStudioOpen && id && (
+      {renderStudio?.scope === scope && id && (
         <RenderStudioModal
           projectId={id}
-          sourceRevision={remoteRevision ?? 0}
-          initialSourceImageBase64={renderSourceImage}
-          isOpen={renderStudioOpen}
-          onClose={() => setRenderStudioOpen(false)}
+          initialSourceImage={renderStudio.source}
+          isOpen={true}
+          onClose={() => setRenderStudio(null)}
         />
       )}
     </div>

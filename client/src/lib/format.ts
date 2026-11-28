@@ -1,11 +1,12 @@
-export function formatMoney(cents: number, currency: string, digits = 2): string {
-  const value = cents / Math.pow(10, digits);
+export function formatMoney(minorUnits: number, currency: string, digits?: number): string {
+  const precision = digits ?? new Intl.NumberFormat("en-US", { style: "currency", currency }).resolvedOptions().maximumFractionDigits ?? 2;
+  const value = minorUnits / 10 ** precision;
   if (currency === "INR") {
     return new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(
       value,
     );
   }
-  return new Intl.NumberFormat("en-US", { style: "currency", currency, minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value);
+  return new Intl.NumberFormat("en-US", { style: "currency", currency, minimumFractionDigits: precision, maximumFractionDigits: precision }).format(value);
 }
 
 export function formatDate(unix: number | null | undefined): string {

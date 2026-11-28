@@ -202,6 +202,7 @@ export interface PaymentRecord {
   plan: string;
   amount: number;
   currency: string;
+  digits?: number;
   status: string;
   provider_order_id: string | null;
   completed_at: number | null;

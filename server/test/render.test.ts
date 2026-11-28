@@ -156,6 +156,7 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
                 prompt: "Photorealistic glass villa overlooking the valley",
                 stylePreset: "golden-hour",
                 sourceRevision: 0,
+                sourceKind: "reference",
                 sourceImageBase64: sampleBase64,
             }),
         });
@@ -164,12 +165,18 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
             job: {
                 id: string;
                 status: string;
+                sourceKind: string;
+                isRevisionCurrent: boolean;
+                revisionMismatch: boolean;
                 errorCode: string;
                 errorMessage: string;
                 sourceImageArtifactId: string;
             };
         };
         assert.equal(job.status, "unconfigured");
+        assert.equal(job.sourceKind, "reference");
+        assert.equal(job.isRevisionCurrent, false);
+        assert.equal(job.revisionMismatch, false);
         assert.equal(job.errorCode, "PROVIDER_UNCONFIGURED");
         assert.ok(job.errorMessage.includes("AI photorealistic rendering requires"));
         assert.ok(job.sourceImageArtifactId);
@@ -196,6 +203,7 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
     let succeededJobId = "";
     let sourceArtifactId = "";
     let outputArtifactId = "";
+    let retriedJobId = "";
     await t.test("submits durable async render job and generates versioned output artifact", async () => {
         const submitRes = await client.request(`/api/projects/${projectId}/renders`, {
             method: "POST",
@@ -205,6 +213,7 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
                 negativePrompt: "blurry, low quality",
                 stylePreset: "dusk-architectural",
                 sourceRevision: 0,
+                sourceKind: "saved-viewport",
                 sourceImageBase64: sampleBase64,
             }),
         });
@@ -312,6 +321,7 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
             job: {
                 id: string;
                 status: string;
+                sourceKind: string;
                 parameters: {
                     retriedFromJobId: string;
                 };
@@ -319,6 +329,8 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
         };
         // Brand-new job ID
         assert.notEqual(retriedJob.id, succeededJobId);
+        retriedJobId = retriedJob.id;
+        assert.equal(retriedJob.sourceKind, "saved-viewport");
         assert.equal(retriedJob.parameters.retriedFromJobId, succeededJobId);
         // Original job remains intact and succeeded
         const origRes = await client.request(`/api/projects/${projectId}/renders/${succeededJobId}`);
@@ -364,5 +376,26 @@ test("Phase 9 AI photorealistic rendering suite", async (t) => {
         const actor = { userId, sessionId: sessionRow.id };
         assert.deepEqual((await readWorkspaceArtifact(projectId, unconfiguredAttempt.sourceImageArtifactId, actor)).bytes, samplePngBuffer);
         assert.ok((await readWorkspaceArtifact(projectId, outputArtifactId, actor)).bytes.length > 0);
+    });
+    await t.test("explicit cleanup of a finished render frees artifacts and keeps images shared by another job", async () => {
+        const sessionRow = await db.prepare("SELECT id FROM sessions WHERE user_id=? AND status='active'").get(userId) as { id: string };
+        const actor = { userId, sessionId: sessionRow.id };
+        const removed = await client.request(`/api/projects/${projectId}/renders/${succeededJobId}?deleteImages=1`, { method: "DELETE" });
+        assert.equal(removed.status, 204);
+        await assert.rejects(readWorkspaceArtifact(projectId, outputArtifactId, actor), { code: "ARTIFACT_NOT_FOUND" });
+        assert.deepEqual((await readWorkspaceArtifact(projectId, sourceArtifactId, actor)).bytes, samplePngBuffer);
+        let retry: { status: string; outputArtifactId?: string } | undefined;
+        for (let i = 0; i < 30; i++) {
+            const res = await client.json<{ job: { status: string; outputArtifactId?: string } }>(`/api/projects/${projectId}/renders/${retriedJobId}`);
+            retry = res.body.job;
+            if (retry.status === "succeeded") break;
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        assert.equal(retry?.status, "succeeded");
+        assert.ok(retry?.outputArtifactId);
+        const removedRetry = await client.request(`/api/projects/${projectId}/renders/${retriedJobId}?deleteImages=1`, { method: "DELETE" });
+        assert.equal(removedRetry.status, 204);
+        await assert.rejects(readWorkspaceArtifact(projectId, sourceArtifactId, actor), { code: "ARTIFACT_NOT_FOUND" });
+        await assert.rejects(readWorkspaceArtifact(projectId, retry.outputArtifactId, actor), { code: "ARTIFACT_NOT_FOUND" });
     });
 });

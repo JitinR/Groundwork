@@ -195,7 +195,9 @@ All of these values are read by the server and must remain private:
 - Payments: set `PAYMENTS_MODE=live` in production and configure the provider
   being offered: Razorpay uses `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and
   `RAZORPAY_WEBHOOK_SECRET` plus `RAZORPAY_ACCOUNT_ID`; PayPal uses `PAYPAL_CLIENT_ID`,
-  `PAYPAL_CLIENT_SECRET`, `PAYPAL_MERCHANT_ID`, and `PAYPAL_MODE=live`. Register
+  `PAYPAL_CLIENT_SECRET`, `PAYPAL_MERCHANT_ID`, `PAYPAL_MODE=live`, and a fixed
+  HTTPS `PUBLIC_APP_ORIGIN`. Customers approve the order on PayPal and then
+  complete payment on the Groundwork checkout page. Register
   `https://<service-host>/api/payments/webhook` for Razorpay's
   `payment_link.paid` event. Tenant seat checkout also requires the explicit
   price and term settings described in `PHASE-7-ENTERPRISE-AUTHORITY.md`.

@@ -181,6 +181,35 @@ test("operational alerts notify transitions and throttle identical failures for 
   } finally { process.env.ALERT_TO = ""; }
 });
 
+test("database outage alerts can send without database access and throttle parallel attempts", async (t) => {
+  const originalRecipient = process.env.ALERT_TO;
+  process.env.ALERT_TO = "synthetic-database-alert@example.test";
+  let time = Date.now();
+  t.mock.method(Date, "now", () => time);
+  const prepare = t.mock.method(db, "prepare", () => { throw new Error("Synthetic database unavailable"); });
+  let attempts = 0;
+  const send = async (_recipient: string, subject: string, body: string) => {
+    attempts += 1;
+    assert.match(subject, /alert/);
+    assert.match(body, /database_unavailable/);
+    return { delivered: attempts > 1, via: "smtp" as const };
+  };
+  try {
+    const first = await Promise.all([operationalCheck({ send }), operationalCheck({ send })]);
+    assert.deepEqual(first.map(report => report.notification).sort(), ["failed", "throttled"]);
+    assert.equal((await operationalCheck({ send })).notification, "throttled");
+    time += 10 * 60_000;
+    assert.equal((await operationalCheck({ send })).notification, "sent");
+    time += 11 * 60_000;
+    assert.equal((await operationalCheck({ send })).notification, "throttled");
+    assert.equal(attempts, 2);
+    assert.equal(prepare.mock.callCount(), 5);
+  } finally {
+    if (originalRecipient === undefined) delete process.env.ALERT_TO;
+    else process.env.ALERT_TO = originalRecipient;
+  }
+});
+
 test("feature flags have deterministic rollout, atomic compare-and-set audit, and hard worker capability limits", async () => {
   await db.prepare("DELETE FROM runtime_feature_flags").run();
   assert.equal(await featureFlagEnabled("assistant", "synthetic-user"), true);

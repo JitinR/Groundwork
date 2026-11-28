@@ -84,16 +84,38 @@ refresh this evidence. When the health step succeeds and the cadence check
 fails, the workflow sends a separate cadence alert through the configured SMTP
 route.
 
-Run `node scripts/operational-health.mjs --watch-cadence` on an existing
-scheduler outside GitHub Actions to detect gaps while Actions is quiet. Set
-`GITHUB_REPOSITORY`, `OPS_DEFAULT_BRANCH` and a GitHub credential with read-only
-Actions access in that scheduler. The command examines the latest completed
-scheduled run's first attempt and exits nonzero for missing, stale or
-unverifiable evidence. Use the scheduler's own failure notifications or set
-`OPS_SEND_ALERTS=1` with the same allowlisted origin and approved SMTP
-configuration. Install dependencies without credentials in scope if using its
-SMTP option. Verify a missed-check alert and inbox delivery before relying on
-this independent check. [GitHub scheduled run behavior](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflows-running-at-unexpected-times)
+Run the independent probe from an existing Linux host outside both production
+and GitHub Actions. It directly probes the same allowlisted health endpoint and
+records completed checks in a private directory across host restarts. A gap of
+more than 45 minutes generates a cadence failure even when the current health
+probe succeeds. A cadence notification that fails delivery is retried on the
+next invocation.
+
+1. Place the reviewed release at `/opt/groundwork-health-monitor` and install
+   its dependencies with Node 22 using `npm ci --ignore-scripts` before setting
+   secrets. Adjust the service's paths to match the host if necessary.
+2. Configure the exact `OPS_HEALTH_ORIGIN`, `OPS_HEALTH_ALLOWED_ORIGINS`,
+   `OPS_SEND_ALERTS=1`, authorized `OPS_ALERT_TO`, and the existing
+   `MAIL_HOST`, `MAIL_PORT`, `MAIL_FROM`, `MAIL_USER` and `MAIL_PASS` in the
+   root-owned `/etc/groundwork-health-monitor/environment` with mode `0600`.
+3. Install the [service](../ops/systemd/groundwork-health-monitor.service) and
+   [timer](../ops/systemd/groundwork-health-monitor.timer) in
+   `/etc/systemd/system`. Run `systemctl daemon-reload` and
+   `systemctl enable --now groundwork-health-monitor.timer`. Confirm its next
+   run with `systemctl list-timers groundwork-health-monitor.timer` and read
+   the results from the service journal.
+4. Verify two successive completed probes and rehearse a missed probe and
+   SMTP delivery using an authorized isolated target before relying on alerts.
+
+On another scheduler, run
+`node scripts/operational-health.mjs --independent-probe` every 15 minutes
+with `OPS_MONITOR_STATE_DIRECTORY` set to a private persistent directory.
+The optional `--watch-cadence` mode monitors GitHub's own scheduled history.
+It uses `GITHUB_REPOSITORY`, `OPS_DEFAULT_BRANCH` and a read-only Actions
+credential. The primary independent probe uses no GitHub credentials unless
+the optional GitHub backup evidence check is enabled.
+[GitHub scheduled run behavior](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflows-running-at-unexpected-times)
+· [systemd timers](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html)
 
 ## Encrypted offsite PostgreSQL export
 

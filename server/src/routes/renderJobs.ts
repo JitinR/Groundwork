@@ -116,6 +116,7 @@ router.post(
         negativePrompt: req.body.negativePrompt || undefined,
         stylePreset: req.body.stylePreset || undefined,
         sourceRevision: Number(req.body.sourceRevision ?? 0),
+        sourceKind: "reference",
         sourceImageBase64: `data:image/png;base64,${req.file.buffer.toString("base64")}`,
       };
     }
@@ -150,8 +151,9 @@ router.delete("/:jobId", handle(async (req, res) => {
     throw new WorkspaceError(400, "Invalid render job ID", "INVALID_JOB_ID");
   }
   const projectId = routeParam(req, "projectId");
-  await removeRenderHistoryEntry(projectId, jobId, actor(req));
-  await logAudit(req.user?.id ?? null, "render.history.remove", { projectId, jobId }, req);
+  const deleteImages = req.query.deleteImages === "1";
+  await removeRenderHistoryEntry(projectId, jobId, actor(req), deleteImages);
+  await logAudit(req.user?.id ?? null, "render.history.remove", { projectId, jobId, deleteImages }, req);
   res.status(204).end();
 }));
 

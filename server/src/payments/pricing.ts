@@ -15,7 +15,7 @@ export interface CountryInfo {
   symbol: string;
   /** minor units of this currency per 1 INR (e.g. USD cents, JPY yen) */
   unitsPerInr: number;
-  /** decimal digits of the currency (0 for JPY/VND/IDR, 2 otherwise) */
+  /** Decimal digits used when storing prices for this currency. */
   digits: number;
 }
 
@@ -69,6 +69,10 @@ const COUNTRY_MAP = new Map(COUNTRIES.map((c) => [c.iso2, c]));
 
 export function countryInfo(iso2: string | undefined | null): CountryInfo {
   return COUNTRY_MAP.get((iso2 || "IN").toUpperCase()) ?? COUNTRY_MAP.get("IN")!;
+}
+
+export function currencyDigits(currency: string): number | undefined {
+  return COUNTRIES.find(country => country.currency === currency)?.digits;
 }
 
 /** Plan base price per month, in INR main units (₹2,000 / ₹4,000). */

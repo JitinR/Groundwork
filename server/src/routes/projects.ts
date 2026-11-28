@@ -133,7 +133,7 @@ async function canAddActiveProject(userId: string): Promise<boolean> {
   const user = (await db.prepare("SELECT plan, plan_expires_at FROM users WHERE id = ?").get(userId)) as { plan: string; plan_expires_at: number | null } | undefined;
   if (!user) return false;
   if (["pro", "studio"].includes(user.plan) && (user.plan_expires_at === null || user.plan_expires_at > now())) return true;
-  const row = (await db.prepare("SELECT COUNT(*) AS count FROM projects WHERE user_id = ? AND archived = 0").get(userId)) as { count: number };
+  const row = (await db.prepare("SELECT COUNT(*) AS count FROM projects WHERE user_id = ? AND organization_id IS NULL AND archived = 0").get(userId)) as { count: number };
   return Number(row.count) < 1;
 }
 
@@ -383,7 +383,9 @@ router.patch(
       const stored = await db.prepare("SELECT archived,revision,design_data FROM projects WHERE id = ?").get(routeParam(req, "id")) as { archived: number; revision: number; design_data: string | null };
       if (expectedRevision !== null && stored.revision !== expectedRevision) return { status: 409, error: "Project changed elsewhere", code: "REVISION_CONFLICT", currentRevision: stored.revision };
       if (!Number.isSafeInteger(stored.revision) || stored.revision >= Number.MAX_SAFE_INTEGER) return { status: 409, error: "Project revision capacity reached", code: "REVISION_CAPACITY", currentRevision: stored.revision };
-      if (stored.archived && meta.data.archived === false && !await canAddActiveProject(access.ownerId)) return { status: 403, error: ACTIVE_PROJECT_LIMIT, code: "ACTIVE_PROJECT_LIMIT" };
+      if (stored.archived && meta.data.archived === false && !currentAccess.organizationId && !await canAddActiveProject(currentAccess.ownerId)) {
+        return { status: 403, error: ACTIVE_PROJECT_LIMIT, code: "ACTIVE_PROJECT_LIMIT" };
+      }
       if (designPayload !== null) {
         const before: unknown = stored.design_data ? JSON.parse(decryptForUser(stored.design_data, access.ownerId)) : null;
         const lockedObject = await conflictingDesignLock(routeParam(req, "id"), req.user!.id, before, nextDesign);

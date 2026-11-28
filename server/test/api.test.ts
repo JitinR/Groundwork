@@ -659,4 +659,21 @@ test("roadmap API integration slice", async (t) => {
         assert.equal(updatedBilling.body.orders.length, 0);
         assert.equal(updatedBilling.body.transitions.length, 0);
     });
+    await t.test("organization projects leave the personal free-plan slot available", async () => {
+        const { body: { user } } = await client.json<{ user: { id: string } }>("/api/auth/me");
+        await db.prepare("UPDATE users SET plan='free',plan_expires_at=NULL WHERE id=?").run(user.id);
+        const newProject = () => client.json<{ id: string }>("/api/projects", jsonInit("POST", { name: "Plan quota fixture" }, csrfToken));
+        const shared = await newProject();
+        assert.equal(shared.response.status, 201);
+        const tenant = await client.json<{ id: string }>("/api/organizations", jsonInit("POST", { name: "Design practice" }, csrfToken));
+        assert.equal(tenant.response.status, 201);
+        const bound = await client.request(`/api/organizations/${tenant.body.id}/projects`, jsonInit("POST", { projectId: shared.body.id }, csrfToken));
+        assert.equal(bound.status, 200);
+        assert.equal((await newProject()).response.status, 201);
+        assert.equal((await newProject()).response.status, 403);
+        for (const archived of [true, false]) {
+            const patch = await client.json(`/api/projects/${shared.body.id}`, jsonInit("PATCH", { archived }, csrfToken));
+            assert.equal(patch.response.status, 200, JSON.stringify(patch.body));
+        }
+    });
 });
