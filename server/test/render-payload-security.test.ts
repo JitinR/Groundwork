@@ -16,8 +16,8 @@ const directory = mkdtempSync(join(tmpdir(), "groundwork-render-input-"));
 process.env.GROUNDWORK_DATA_DIR = directory;
 delete process.env.DB_PATH;
 const { db, now, withTransaction } = await import("../src/db.js");
-const { createWorkspaceArtifact } = await import("../src/workspaces.js");
-const { submitRenderJob, retryRenderJob, getRenderJob } = await import("../src/renderJobs.js");
+const { createWorkspaceArtifact, readWorkspaceArtifact } = await import("../src/workspaces.js");
+const { submitRenderJob, retryRenderJob, getRenderJob, removeRenderHistoryEntry } = await import("../src/renderJobs.js");
 const { DemoRenderProvider, setRenderProviderForTesting, UnconfiguredRenderProvider } = await import("../src/renderProvider.js");
 setRenderProviderForTesting(new UnconfiguredRenderProvider());
 after(async () => { setRenderProviderForTesting(null); await db.close(); rmSync(directory, { force: true, recursive: true }); });
@@ -47,19 +47,34 @@ test("render submissions and retries encrypt stored inputs and omit prompt copie
   assert.equal(job.prompt, input.prompt); assert.deepEqual(job.parameters, input.parameters);
   const raw = await db.prepare("SELECT prompt,negative_prompt,parameters_json FROM project_render_jobs WHERE id=?").get(job.id) as Record<string, string>;
   for (const value of Object.values(raw)) { assert.ok(value.startsWith("groundwork-render:v1:")); assert.equal(value.includes("private"), false); }
+  const prefix = "groundwork-render:v1:";
+  const { iv, tag, data, metadata } = JSON.parse(raw.parameters_json.slice(prefix.length));
+  assert(metadata);
+  const context = { projectId, jobId: job.id, field: "parameters_json" as const };
+  const codec = createRenderPayloadCodec(master);
+  const legacyEnvelope = prefix + JSON.stringify({ iv, tag, data });
+  assert.deepEqual(JSON.parse(codec.open(legacyEnvelope, context).plaintext), input.parameters);
+  assert.deepEqual(JSON.parse(codec.open(raw.parameters_json, context).metadata!), {
+    sourceKind: "unverified", ownsSourceImage: false,
+  });
   const audits = await db.prepare("SELECT detail FROM organization_audit WHERE action='render.submit'").all() as { detail: string }[];
   assert.equal(audits.length, 1); assert.equal(audits[0].detail.includes("private"), false);
   const retry = await retryRenderJob(projectId, job.id, actor);
   assert.equal(retry.prompt, input.prompt); assert.equal(retry.parameters.retriedFromJobId, job.id);
   const copied = await db.prepare("SELECT prompt FROM project_render_jobs WHERE id=?").get(retry.id) as { prompt: string };
   assert.notEqual(copied.prompt, raw.prompt, "retry ciphertext must be rebound to the new immutable job");
+  await removeRenderHistoryEntry(projectId, retry.id, actor, true);
+  assert.deepEqual((await readWorkspaceArtifact(projectId, source.id, actor)).bytes, png);
 });
 
 test("authorized reads lazily encrypt legacy plaintext and previous-key rows and sanitize old audit copies", async () => {
   const job = await submitRenderJob(projectId, actor, input);
   await db.prepare("UPDATE project_render_jobs SET prompt=?,negative_prompt=?,parameters_json=? WHERE id=?").run(input.prompt, input.negativePrompt, JSON.stringify(input.parameters), job.id);
   await db.prepare("UPDATE organization_audit SET detail=? WHERE action='render.submit' AND detail LIKE ?").run(JSON.stringify({ jobId: job.id, projectId, prompt: input.prompt, parameters: input.parameters, status: "unconfigured" }), `%${job.id}%`);
-  assert.equal((await getRenderJob(projectId, job.id, actor)).prompt, input.prompt);
+  const legacy = await getRenderJob(projectId, job.id, actor);
+  assert.equal(legacy.prompt, input.prompt);
+  assert.equal(legacy.sourceKind, "unverified");
+  assert.equal(legacy.isRevisionCurrent, false);
   const migrated = await db.prepare("SELECT prompt FROM project_render_jobs WHERE id=?").get(job.id) as { prompt: string };
   assert.ok(migrated.prompt.startsWith("groundwork-render:v1:"));
   const audit = await db.prepare("SELECT detail FROM organization_audit WHERE action='render.submit' AND detail LIKE ?").get(`%${job.id}%`) as { detail: string };

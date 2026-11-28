@@ -10,6 +10,7 @@ import { inspectBimGeometry } from "../src/lib/bimValidation";
 import { documentationInventory, documentationScheduleCsv } from "../src/lib/documentationSchedule";
 import { exportIfcMeshObj, exportIfcRoundTrip, ifcGeometryCoverageWarnings, importIfcGeometry } from "../src/lib/ifcGeometry";
 import { buildBillOfMaterials, buildObjMtl } from "../src/lib/obj";
+import { catalogEntry } from "../src/lib/catalog";
 import { buildBoqCsv } from "../src/lib/notes";
 
 const close = (actual: number, expected: number, tolerance = 1e-8) => assert.ok(Math.abs(actual - expected) < tolerance, `${actual} != ${expected}`);
@@ -45,6 +46,47 @@ test("OBJ retains hidden authored mesh dimensions, rotated position and stable i
   close(bounds[0][1] - bounds[0][0], .5, 1e-6); close(bounds[1][1] - bounds[1][0], 4.2, 1e-6); close(bounds[2][1] - bounds[2][0], .6, 1e-6);
   close((bounds[0][0] + bounds[0][1]) / 2, 12); close((bounds[2][0] + bounds[2][1]) / 2, 7);
 });
+
+test("legacy OBJ uses centered room walls, mounted furniture poses and outward faces", () => {
+  const design = defaultDesign();
+  design.room = { ...design.room, widthMm: 6000, depthMm: 4000, wallHeightMm: 2800 };
+  design.furniture = [
+    { id: "sofa-one", name: "Rotated sofa", type: "sofa", x: -900, z: 300, rotationDeg: 90, scale: 1, color: "#ff5500" },
+    { id: "cooler", name: "Wall-mounted unit", type: "air-conditioner", x: 0, z: 400, rotationDeg: 0, scale: 1, color: "#ffffff", mount: "wall", mountWall: "east", mountHeightM: 2.1 },
+  ];
+  const { obj, mtl } = buildObjMtl(design, "coordination-room.mtl");
+  assert.match(obj, /^mtllib coordination-room\.mtl\n/);
+  assert.match(mtl, /newmtl item_sofa-o/);
+  const objects = obj.split(/^o /m).slice(1).map(part => part.split("\n"));
+  const getObject = (name: string) => objects.find(lines => lines[0] === name)!;
+  const vertices = (name: string) => getObject(name).filter(line => line.startsWith("v ")).map(line => line.slice(2).split(" ").map(Number));
+  const bounds = (name: string, axis: number) => {
+    const values = vertices(name).map(point => point[axis]);
+    return [Math.min(...values), Math.max(...values)];
+  };
+  assert.deepEqual(bounds("floor", 0), [-3, 3]);
+  assert.deepEqual(bounds("floor", 2), [-2, 2]);
+  assert.deepEqual(bounds("floor", 1), [-.02, 0]);
+  assert.deepEqual(bounds("wall_north", 2), [1.94, 2.06]);
+  assert.deepEqual(bounds("wall_east", 0), [2.94, 3.06]);
+  const [minX, maxX] = bounds("item_sofa-o", 0), [minZ, maxZ] = bounds("item_sofa-o", 2);
+  const sofa = catalogEntry("sofa")!;
+  close((minX + maxX) / 2, -.9); close((minZ + maxZ) / 2, .3);
+  close(maxX - minX, sofa.d / 1000); close(maxZ - minZ, sofa.w / 1000);
+  const [wallMinX, wallMaxX] = bounds("item_cooler", 0);
+  close((wallMinX + wallMaxX) / 2, 2.84);
+  close(bounds("item_cooler", 1)[0], 2.1);
+  const floor = vertices("floor");
+  const faces = getObject("floor").filter(line => line.startsWith("f "));
+  assert.equal(faces.length, 6);
+  for (const face of faces) {
+    const [a, b, c] = face.slice(2).split(" ").slice(0, 3).map(index => floor[Number(index) - 1]);
+    const u = b.map((value, i) => value - a[i]), v = c.map((value, i) => value - a[i]);
+    const normal = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    assert(normal.reduce((sum, value, i) => sum + value * (a[i] - [0, -.01, 0][i]), 0) > 0, face);
+  }
+});
+
 const footprint = (): DraftElement => ({ ...createCadObject("slab"), w: 4, d: 3, h: .2, rotationDeg: 31, points: [{ x: -2, z: -1.5 }, { x: 2, z: -1.5 }, { x: 2, z: -.5 }, { x: 0, z: -.5 }, { x: 0, z: 1.5 }, { x: -2, z: 1.5 }] });
 const dxfEntities = (source: string) => {
   const lines = source.trim().split(/\r?\n/), entities: { kind: string; values: [number, string][] }[] = [];

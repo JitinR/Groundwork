@@ -75,11 +75,12 @@ test("ordinary cache writes automatically retain queued, failed and draft recove
   removeAccountDrafts(userId); offlineProjectStore.clearActiveUserSession(userId);
 });
 
-test("pre-binding project copies are unavailable until they are refreshed online", async () => {
+test("offline loads require an account-bound and server-confirmed project copy", async () => {
   const userId = "cached-project-owner";
   const legacy = { userId, projectId: "legacy-copy" };
-  const verified = { userId, projectId: "verified-copy", accountBound: true, lastAccessedAt: 1 };
-  const stored = [legacy, verified];
+  const possiblyUnsaved = { userId, projectId: "old-bound-copy", accountBound: true, lastAccessedAt: 1 };
+  const verified = { userId, projectId: "verified-copy", accountBound: true, serverConfirmed: true, lastAccessedAt: 1 };
+  const stored = [legacy, possiblyUnsaved, verified];
   const request = (result: unknown) => {
     const pending: { result: unknown; onsuccess?: () => void } = { result };
     queueMicrotask(() => pending.onsuccess?.());
@@ -98,15 +99,31 @@ test("pre-binding project copies are unavailable until they are refreshed online
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: factory });
   try {
     assert.equal(await offlineProjectStore.getCachedProject(userId, legacy.projectId), null);
+    assert.equal(await offlineProjectStore.getCachedProject(userId, possiblyUnsaved.projectId), null);
     assert.equal((await offlineProjectStore.getCachedProject(userId, verified.projectId))?.projectId, verified.projectId);
     const listed = await offlineProjectStore.listCachedProjects(userId);
-    assert.deepEqual(listed.map(project => project.projectId), [verified.projectId]);
+    assert.deepEqual(listed.map(project => project.projectId), [possiblyUnsaved.projectId, verified.projectId]);
   } finally {
     db.onversionchange();
     offlineProjectStore.clearActiveUserSession(userId);
     if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow); else Reflect.deleteProperty(globalThis, "window");
     if (originalIndexedDB) Object.defineProperty(globalThis, "indexedDB", originalIndexedDB); else Reflect.deleteProperty(globalThis, "indexedDB");
   }
+});
+
+test("a later cache write cannot replace a more recently saved project revision", async () => {
+  const userId = "cached-project-revision-owner";
+  const design = { room: { widthMm: 5000, depthMm: 4000 }, furniture: [] } as unknown as Design;
+  const project = { id: "cache-project", name: "Saved project", projectType: "house", revision: 8, role: "editor", hasPhoto: true } as const;
+  try {
+    await offlineProjectStore.cacheProject(userId, project, design);
+    await offlineProjectStore.cacheProject(userId, { ...project, revision: 7, name: "Older response", hasPhoto: false }, design);
+    const cached = await offlineProjectStore.getCachedProject(userId, project.id);
+    assert.equal(cached?.revision, 8);
+    assert.equal(cached?.name, "Saved project");
+    assert.equal(cached?.role, "editor");
+    assert.equal(cached?.hasPhoto, true);
+  } finally { offlineProjectStore.clearActiveUserSession(userId); }
 });
 
 test("an unreadable durable queue preserves every cached copy instead of evicting from a partial memory view", async (context) => {

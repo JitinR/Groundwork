@@ -5,7 +5,7 @@ import { organizationAudit } from "./organization.js";
 import { canManageProject, canWriteProject, getProjectAccess, type ProjectAccess, type ProjectRole } from "./projectAccess.js";
 import { admitProviderRequest, isBoundedProviderJson, releaseProviderPermit, renderOutputBytes, providerLimits, withProviderDeadline, ProviderResourceError, type ProviderPermit, } from "./providerBudget.js";
 import { getRenderProvider, RENDER_STYLE_PRESETS, type RenderPreset, type RenderProvider, type RenderProviderResult, } from "./renderProvider.js";
-import { artifactIdSchema, createWorkspaceArtifact, readWorkspaceArtifact, WorkspaceError, type WorkspaceActor, } from "./workspaces.js";
+import { artifactIdSchema, createWorkspaceArtifact, deleteWorkspaceArtifact, readWorkspaceArtifact, WorkspaceError, type WorkspaceActor, } from "./workspaces.js";
 import { MASTER_KEY, PREVIOUS_MASTER_KEY } from "./config.js";
 import { createRenderPayloadCodec, type RenderInputField } from "./renderPayload.js";
 const renderPayload = createRenderPayloadCodec(MASTER_KEY, PREVIOUS_MASTER_KEY);
@@ -15,14 +15,24 @@ const MAX_RENDER_HISTORY = 200;
 // Preserve a few diagnostic attempts while the provider is disconnected. They
 // are accounted for separately from configured render history.
 const MAX_UNCONFIGURED_ATTEMPTS = 4;
+const renderSourceKind = z.enum(["saved-viewport", "draft-viewport", "reference", "unverified"]);
+type RenderSourceKind = z.infer<typeof renderSourceKind>;
+const providerParameters = z.record(z.string(), z.unknown()).refine((value) => isBoundedProviderJson(value, 16_384), "Parameters exceed the supported byte or complexity limits");
+const renderMetadataSchema = z.object({
+    sourceKind: renderSourceKind,
+    ownsSourceImage: z.boolean(),
+}).strict();
+type RenderMetadata = z.infer<typeof renderMetadataSchema>;
+type RenderParameters = RenderMetadata & { parameters: Record<string, unknown> };
 export const submitRenderJobSchema = z.object({
     prompt: z.string().trim().min(1, "Prompt cannot be empty").max(2000, "Prompt cannot exceed 2000 characters"),
     negativePrompt: z.string().trim().max(1000).optional(),
     stylePreset: z.string().trim().max(100).optional(),
     sourceRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    sourceKind: renderSourceKind.optional(),
     sourceImageBase64: z.string().max(Math.ceil(32 * 1024 * 1024 / 3) * 4 + 128).optional(),
     sourceImageArtifactId: artifactIdSchema.optional(),
-    parameters: z.record(z.string(), z.unknown()).refine((value) => isBoundedProviderJson(value, 16384), "Parameters exceed the supported byte or complexity limits").optional(),
+    parameters: providerParameters.optional(),
 }).strict().superRefine((val, ctx) => {
     if (!val.sourceImageBase64 && !val.sourceImageArtifactId) {
         ctx.addIssue({
@@ -39,6 +49,7 @@ export interface RenderJobSummary {
     id: string;
     projectId: string;
     sourceRevision: number;
+    sourceKind: RenderSourceKind;
     currentProjectRevision: number;
     isRevisionCurrent: boolean;
     revisionMismatch: boolean;
@@ -122,18 +133,18 @@ async function authorizeProject(projectId: string, actor: WorkspaceActor, write 
     }
     return { access, project: { ...project, role: access.role } };
 }
-function parseParameters(jsonStr: string): Record<string, unknown> {
-    try {
-        const parameters: unknown = JSON.parse(jsonStr);
-        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters) || !isBoundedProviderJson(parameters, 16_384)) throw new Error("Invalid render parameters");
-        return parameters as Record<string, unknown>;
-    }
-    catch {
-        throw new WorkspaceError(500, "Stored render parameters could not be read safely", "RENDER_INPUT_INVALID");
-    }
+function parseRenderMetadata(value?: string): RenderMetadata {
+    return value === undefined
+        ? { sourceKind: "unverified", ownsSourceImage: false }
+        : renderMetadataSchema.parse(JSON.parse(value));
 }
 function sealRenderInput(value: string, projectId: string, jobId: string, field: RenderInputField): string {
     return renderPayload.seal(value, { projectId, jobId, field });
+}
+function sealRenderParameters({ parameters, ...metadata }: RenderParameters, projectId: string, jobId: string): string {
+    // Older readers still decrypt the provider JSON. The authenticated sidecar
+    // is never forwarded as provider parameters or populated by user JSON.
+    return renderPayload.seal(JSON.stringify(parameters), { projectId, jobId, field: "parameters_json" }, JSON.stringify(metadata));
 }
 async function sanitizeLegacyRenderAudits(row: RenderAuditEntry): Promise<void> {
     // Retain the event while removing historical copies of free-form inputs.
@@ -150,38 +161,42 @@ async function sanitizeLegacyRenderAudits(row: RenderAuditEntry): Promise<void> 
         }), audit.id);
     }
 }
-async function openJobInputs(row: RenderJobRow): Promise<{ prompt: string; negativePrompt: string | null; stylePreset: string | null; parameters: Record<string, unknown> }> {
+async function openJobInputs(row: RenderJobRow): Promise<RenderParameters & { prompt: string; negativePrompt: string | null; stylePreset: string | null }> {
     try {
         const context = { projectId: row.project_id, jobId: row.id };
         const prompt = renderPayload.open(row.prompt, { ...context, field: "prompt" });
         const negative = row.negative_prompt === null ? null : renderPayload.open(row.negative_prompt, { ...context, field: "negative_prompt" });
         const style = row.style_preset === null ? null : renderPayload.open(row.style_preset, { ...context, field: "style_preset" });
-        const parameters = renderPayload.open(row.parameters_json, { ...context, field: "parameters_json" });
-        const parsedParameters = parseParameters(parameters.plaintext);
+        const parameterContext = { ...context, field: "parameters_json" as const };
+        const parameters = renderPayload.open(row.parameters_json, parameterContext);
+        const metadata = parseRenderMetadata(parameters.metadata);
+        const parsedParameters = providerParameters.parse(JSON.parse(parameters.plaintext));
         if (prompt.needsRewrite || negative?.needsRewrite || style?.needsRewrite || parameters.needsRewrite) {
             await withTransaction(async () => {
                 await db.prepare("UPDATE project_render_jobs SET prompt=?,negative_prompt=?,style_preset=?,parameters_json=? WHERE id=? AND project_id=?")
                     .run(sealRenderInput(prompt.plaintext, row.project_id, row.id, "prompt"), negative ? sealRenderInput(negative.plaintext, row.project_id, row.id, "negative_prompt") : null,
-                        style ? sealRenderInput(style.plaintext, row.project_id, row.id, "style_preset") : null, sealRenderInput(parameters.plaintext, row.project_id, row.id, "parameters_json"), row.id, row.project_id);
+                        style ? sealRenderInput(style.plaintext, row.project_id, row.id, "style_preset") : null,
+                        renderPayload.seal(parameters.plaintext, parameterContext, parameters.metadata), row.id, row.project_id);
                 await sanitizeLegacyRenderAudits(row);
             });
         }
-        return { prompt: prompt.plaintext, negativePrompt: negative?.plaintext ?? null, stylePreset: style?.plaintext ?? null, parameters: parsedParameters };
+        return { ...metadata, parameters: parsedParameters, prompt: prompt.plaintext, negativePrompt: negative?.plaintext ?? null, stylePreset: style?.plaintext ?? null };
     } catch (error) {
         if (error instanceof WorkspaceError) throw error;
         throw new WorkspaceError(500, "Stored render input could not be authenticated", "RENDER_INPUT_INVALID");
     }
 }
 async function formatJobSummary(row: RenderJobRow, currentProjectRevision: number): Promise<RenderJobSummary> {
-    const isRevisionCurrent = row.source_revision === currentProjectRevision;
     const inputs = await openJobInputs(row);
+    const savedViewport = inputs.sourceKind === "saved-viewport";
     return {
         id: row.id,
         projectId: row.project_id,
         sourceRevision: row.source_revision,
+        sourceKind: inputs.sourceKind,
         currentProjectRevision,
-        isRevisionCurrent,
-        revisionMismatch: !isRevisionCurrent,
+        isRevisionCurrent: savedViewport && row.source_revision === currentProjectRevision,
+        revisionMismatch: savedViewport && row.source_revision !== currentProjectRevision,
         sourceImageArtifactId: row.source_image_artifact_id,
         sourceImageSha256: row.source_image_sha256,
         prompt: inputs.prompt,
@@ -368,6 +383,11 @@ export async function submitRenderJob(projectId: string, actor: WorkspaceActor, 
         const initialStatus: RenderJobState = configured ? "queued" : "unconfigured";
         const errorCode = configured ? null : "PROVIDER_UNCONFIGURED";
         const errorMessage = configured ? null : provider.getUnconfiguredReason();
+        const metadata = sealRenderParameters({
+            parameters: input.parameters ?? {},
+            sourceKind: input.sourceKind ?? "unverified",
+            ownsSourceImage: Boolean(input.sourceImageBase64),
+        }, projectId, jobId);
         await db.prepare(`
       INSERT INTO project_render_jobs (
         id, project_id, source_revision, source_image_artifact_id, source_image_sha256,
@@ -375,7 +395,7 @@ export async function submitRenderJob(projectId: string, actor: WorkspaceActor, 
         output_artifact_id, output_sha256, error_code, error_message, parameters_json,
         created_by, created_at, updated_at, completed_at
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    `).run(jobId, projectId, input.sourceRevision, sourceArtifactId!, sourceSha256, sealRenderInput(input.prompt, projectId, jobId, "prompt"), input.negativePrompt === undefined ? null : sealRenderInput(input.negativePrompt, projectId, jobId, "negative_prompt"), input.stylePreset === undefined ? null : sealRenderInput(input.stylePreset, projectId, jobId, "style_preset"), provider.id, provider.model, provider.version, initialStatus, null, null, errorCode, errorMessage, sealRenderInput(JSON.stringify(input.parameters ?? {}), projectId, jobId, "parameters_json"), actor.userId, timestamp, timestamp, configured ? null : timestamp);
+    `).run(jobId, projectId, input.sourceRevision, sourceArtifactId!, sourceSha256, sealRenderInput(input.prompt, projectId, jobId, "prompt"), input.negativePrompt === undefined ? null : sealRenderInput(input.negativePrompt, projectId, jobId, "negative_prompt"), input.stylePreset === undefined ? null : sealRenderInput(input.stylePreset, projectId, jobId, "style_preset"), provider.id, provider.model, provider.version, initialStatus, null, null, errorCode, errorMessage, metadata, actor.userId, timestamp, timestamp, configured ? null : timestamp);
         await tenantAudit(access, actor, "render.submit", {
             jobId,
             sourceRevision: input.sourceRevision,
@@ -415,25 +435,41 @@ async function reserveRenderHistorySlot(access: ProjectAccess, actor: WorkspaceA
         WHERE project_id=? AND id<>? AND status IN ('failed','cancelled') AND completed_at IS NOT NULL AND output_artifact_id IS NULL
         ORDER BY completed_at, id LIMIT 1`).get(projectId, originalId) as RenderAuditEntry | undefined;
     if (!oldest) {
-        throw new WorkspaceError(409, "Project render history capacity reached. Wait for active renders or remove unsuccessful attempts.", "RENDER_HISTORY_CAPACITY");
+        throw new WorkspaceError(409, "Project render history capacity reached. Wait for active renders or ask a project owner to remove completed renders.", "RENDER_HISTORY_CAPACITY");
     }
     await removeRenderRecord(access, actor, oldest, "retention");
 }
 
-export async function removeRenderHistoryEntry(projectId: string, jobId: string, actor: WorkspaceActor): Promise<void> {
+export async function removeRenderHistoryEntry(projectId: string, jobId: string, actor: WorkspaceActor, deleteImages = false): Promise<void> {
     await withTransaction(async () => {
         const { access } = await authorizeProject(projectId, actor, true);
         if (!canManageProject(access)) {
             throw new WorkspaceError(403, "Owner access required to remove render history", "OWNER_REQUIRED");
         }
-        const row = await db.prepare(`SELECT id,project_id,source_revision,status,completed_at,output_artifact_id
+        const row = await db.prepare(`SELECT id,project_id,source_revision,status,completed_at,output_artifact_id,source_image_artifact_id,parameters_json
             FROM project_render_jobs WHERE project_id=? AND id=?`).get(projectId, jobId) as
-            Pick<RenderJobRow, keyof RenderAuditEntry | "completed_at" | "output_artifact_id"> | undefined;
+            Pick<RenderJobRow, keyof RenderAuditEntry | "completed_at" | "output_artifact_id" | "source_image_artifact_id" | "parameters_json"> | undefined;
         if (!row) throw new WorkspaceError(404, "Render job not found", "JOB_NOT_FOUND");
-        if (row.completed_at === null || row.output_artifact_id !== null || !["failed", "cancelled", "unconfigured"].includes(row.status)) {
-            throw new WorkspaceError(409, "Only completed render attempts without an output can be removed", "INVALID_STATE");
+        if (row.completed_at === null || row.status === "queued" || row.status === "running") {
+            throw new WorkspaceError(409, "Only completed render attempts can be removed", "INVALID_STATE");
+        }
+        if (!deleteImages && (row.output_artifact_id || row.status === "succeeded")) {
+            throw new WorkspaceError(409, "Confirm image cleanup to remove a successful render", "INVALID_STATE");
+        }
+        const images = new Set<string>();
+        if (deleteImages) {
+            if (row.output_artifact_id) images.add(row.output_artifact_id);
+            const metadata = renderPayload.open(row.parameters_json, { projectId, jobId, field: "parameters_json" });
+            if (parseRenderMetadata(metadata.metadata).ownsSourceImage) images.add(row.source_image_artifact_id);
         }
         await removeRenderRecord(access, actor, row, "owner");
+        for (const image of images) {
+            try {
+                await deleteWorkspaceArtifact(projectId, image, actor);
+            } catch (error) {
+                if (!(error instanceof WorkspaceError) || !["ARTIFACT_REFERENCED", "ARTIFACT_NOT_FOUND"].includes(error.code)) throw error;
+            }
+        }
     });
 }
 async function admitRender(projectId: string, actor: WorkspaceActor, input: {
@@ -482,6 +518,9 @@ export async function retryRenderJob(projectId: string, jobId: string, actor: Wo
         const initialStatus: RenderJobState = configured ? "queued" : "unconfigured";
         const errorCode = configured ? null : "PROVIDER_UNCONFIGURED";
         const errorMessage = configured ? null : provider.getUnconfiguredReason();
+        const metadata = sealRenderParameters({
+            parameters: newParams, sourceKind: originalInputs.sourceKind, ownsSourceImage: originalInputs.ownsSourceImage,
+        }, projectId, newJobId);
         await db.prepare(`
       INSERT INTO project_render_jobs (
         id, project_id, source_revision, source_image_artifact_id, source_image_sha256,
@@ -489,7 +528,7 @@ export async function retryRenderJob(projectId: string, jobId: string, actor: Wo
         output_artifact_id, output_sha256, error_code, error_message, parameters_json,
         created_by, created_at, updated_at, completed_at
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    `).run(newJobId, projectId, original.source_revision, original.source_image_artifact_id, original.source_image_sha256, sealRenderInput(originalInputs.prompt, projectId, newJobId, "prompt"), originalInputs.negativePrompt === null ? null : sealRenderInput(originalInputs.negativePrompt, projectId, newJobId, "negative_prompt"), originalInputs.stylePreset === null ? null : sealRenderInput(originalInputs.stylePreset, projectId, newJobId, "style_preset"), provider.id, provider.model, provider.version, initialStatus, null, null, errorCode, errorMessage, sealRenderInput(JSON.stringify(newParams), projectId, newJobId, "parameters_json"), actor.userId, timestamp, timestamp, configured ? null : timestamp);
+    `).run(newJobId, projectId, original.source_revision, original.source_image_artifact_id, original.source_image_sha256, sealRenderInput(originalInputs.prompt, projectId, newJobId, "prompt"), originalInputs.negativePrompt === null ? null : sealRenderInput(originalInputs.negativePrompt, projectId, newJobId, "negative_prompt"), originalInputs.stylePreset === null ? null : sealRenderInput(originalInputs.stylePreset, projectId, newJobId, "style_preset"), provider.id, provider.model, provider.version, initialStatus, null, null, errorCode, errorMessage, metadata, actor.userId, timestamp, timestamp, configured ? null : timestamp);
         await tenantAudit(access, actor, "render.retry", {
             originalJobId: jobId,
             newJobId,

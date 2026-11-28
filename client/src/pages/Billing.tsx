@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth";
 import { createPayment, getPlans, listPayments } from "../api";
 import type { PaymentMethodInfo, PaymentRecord, Plan } from "../types";
@@ -8,6 +8,7 @@ import { useToast } from "../components/Toast";
 import { formatDate, formatMoney } from "../lib/format";
 import { cn } from "../lib/cn";
 import { PageIntro } from "../components/PageIntro";
+import { activePersonalPlan } from "../lib/billing";
 
 const METHOD_ICONS: Record<string, string> = {
   upi: "M11 2h2v5h-2V2zm0 15h2v5h-2v-5zM3 6h4v12H3zM17 6h4v12h-4z",
@@ -67,6 +68,8 @@ export function Billing() {
       const result = await createPayment(plan.id, method);
       if (result.demo) {
         navigate(`/billing/checkout/${result.paymentId}`);
+      } else if (result.provider === "paypal" && result.checkoutUrl) {
+        window.location.assign(result.checkoutUrl);
       } else if (result.checkoutUrl) {
         window.open(result.checkoutUrl, "_blank", "noopener,noreferrer");
         toast.push({ title: "Checkout opened", description: "Complete the payment in the provider window.", tone: "info" });
@@ -79,7 +82,7 @@ export function Billing() {
     }
   };
 
-  const currentPlan = user?.plan ?? "free";
+  const currentPlan = activePersonalPlan(user);
 
   return (
     <div className="space-y-8">
@@ -190,11 +193,12 @@ export function Billing() {
                         <td className="py-2.5 pr-4 text-slate-300">{formatDate(p.created_at)}</td>
                         <td className="py-2.5 pr-4 capitalize text-slate-200">{p.plan}</td>
                         <td className="py-2.5 pr-4 uppercase text-slate-400">{p.method} · {p.provider}</td>
-                        <td className="py-2.5 pr-4 text-slate-200">{formatMoney(p.amount, p.currency, p.currency === "INR" ? 2 : 2)}</td>
+                        <td className="py-2.5 pr-4 text-slate-200">{formatMoney(p.amount, p.currency, p.digits)}</td>
                         <td className="py-2.5">
                           <Badge tone={p.status === "paid" ? "emerald" : p.status === "pending" ? "amber" : "rose"}>
                             {p.status}
                           </Badge>
+                          {p.status === "pending" && p.provider === "paypal" && <Link to={`/billing/checkout/${encodeURIComponent(p.id)}`} className="ml-2 underline">Resume</Link>}
                         </td>
                       </tr>
                     ))}

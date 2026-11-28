@@ -104,6 +104,20 @@ test("gravity review reports invert and slope without pressure or vent claims", 
   assert(Math.abs(review.slopePct! - 2) < 1e-12); assert.equal(review.invertStartM, .95); assert.equal(review.status, "satisfies-supplied-slope");
   assert.throws(() => assessCadGravity(design, "vent" as "sanitary"), /Only sanitary/);
 });
+test("a gravity run must meet the supplied slope on each nonvertical segment", () => {
+  const pipe = addCadNetworkElement(defaultDesign(), "pipe", "sanitary", { x: 0, y: 2, z: 0 }, { end: { x: 10, y: 0, z: 0 } });
+  const design = { ...pipe.design, cadNetworks: {
+    ...cadNetworkState(pipe.design),
+    equipment: cadNetworkState(pipe.design).equipment.map(item => ({ ...item, minimumSlopePct: 1 })),
+  } };
+  const study = (middleY: number) => assessCadGravity(setCadMep(design, {
+    ...cadMep(design),
+    elements: [{ ...pipe.element, route: [{ x: 0, y: 2, z: 0 }, { x: 10, y: middleY, z: 0 }, { x: 10, y: 0, z: 0 }] }],
+  }), "sanitary")[0];
+  assert.equal(study(2).slopePct, 0);
+  assert.equal(study(2).status, "review");
+  assert.equal(study(1.9).status, "satisfies-supplied-slope");
+});
 test("malformed connector metadata cannot make containment a conductor", () => {
   const { design } = electricalFixture();
   const port = cadPorts(design)[0];

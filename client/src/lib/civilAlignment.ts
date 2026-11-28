@@ -63,8 +63,24 @@ export function analyzeAdvancedCivil(alignment: AdvancedAlignment, terrain?: Sur
     let complete = true;
     const daylight = (side: number): { reach: number; sign: number } => { const edge = side * half, g = ground(edge); if (g === undefined) { complete = false; return { reach: half, sign: 0 }; } const sign = top(edge) >= g ? -1 : 1, difference = (distance: number): number | undefined => { const terrainElevation = ground(side * distance); return terrainElevation === undefined ? undefined : top(edge) + sign * (distance - half) / alignment.sideSlopeRatio - terrainElevation; }; let prior = half, previous = top(edge) - g;
       if (Math.abs(previous) < 1e-8) return { reach: half, sign };
-      for (let d = half + alignment.crossSectionIntervalM; d <= half + alignment.maxDaylightM + 1e-8; d += alignment.crossSectionIntervalM) { const current = difference(d); if (current === undefined) { complete = false; return { reach: prior, sign }; } if (previous * current <= 0) { let a = prior, b = d; for (let i = 0; i < 24; i++) { const mid = (a + b) / 2, v = difference(mid); if (v === undefined) { complete = false; break; } if (previous * v <= 0) b = mid; else a = mid; } return { reach: (a + b) / 2, sign }; } prior = d; previous = current; }
-      complete = false; return { reach: half + alignment.maxDaylightM, sign };
+      const limit = half + alignment.maxDaylightM, step = alignment.crossSectionIntervalM;
+      while (prior < limit) {
+        const distance = Math.min(prior + step, limit);
+        const current = difference(distance);
+        if (current === undefined) { complete = false; return { reach: prior, sign }; }
+        if (Math.abs(current) < 1e-8) return { reach: distance, sign };
+        if (previous * current < 0) {
+          let a = prior, b = distance;
+          for (let i = 0; i < 24; i++) {
+            const mid = (a + b) / 2, v = difference(mid);
+            if (v === undefined) { complete = false; break; }
+            if (previous * v <= 0) b = mid; else a = mid;
+          }
+          return { reach: (a + b) / 2, sign };
+        }
+        prior = distance; previous = current;
+      }
+      complete = false; return { reach: limit, sign };
     };
     const left = daylight(-1), right = daylight(1), offsets = new Set<number>([-left.reach, -half, 0, half, right.reach]); for (let o = -left.reach; o <= right.reach; o += alignment.crossSectionIntervalM) offsets.add(o);
     const section: CorridorSection = { stationM: station.stationM, points: [], cutAreaM2: 0, fillAreaM2: 0, complete };

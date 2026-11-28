@@ -117,6 +117,10 @@ export async function recordBackupReport(report: BackupReport): Promise<void> {
   });
 }
 type AlertSender = (recipient: string, subject: string, text: string) => Promise<MailResult>;
+const ALERT_RETRY_SECONDS = 600;
+const ALERT_REPEAT_SECONDS = 6 * 3600;
+let outageAlert: { recipient: string; attemptedAt: number; sentAt?: number } | undefined;
+
 export async function operationalCheck(options: { send?: AlertSender } = {}) {
   const reasons: string[] = [];
   let metrics: Awaited<ReturnType<typeof operationalMetrics>> | null = null;
@@ -133,27 +137,45 @@ export async function operationalCheck(options: { send?: AlertSender } = {}) {
     if (metrics.totals.count >= setting("SLO_MIN_REQUESTS", 20, 1, 1000000) && (metrics.totals.p95Ms ?? 0) > metrics.slo.p95TargetMs) reasons.push("latency_slo_breached");
     if (!lastBackup || !lastBackup.encrypted || now() - lastBackup.completedAt > setting("BACKUP_MAX_AGE_HOURS", 30, 1, 168) * 3600) reasons.push("backup_stale_or_missing");
   } catch { reasons.push("database_unavailable"); }
+  const databaseUnavailable = reasons.includes("database_unavailable");
+  if (!databaseUnavailable) outageAlert = undefined;
   const recipient = process.env.ALERT_TO || "";
   let notification: "unconfigured" | "throttled" | "sent" | "failed" = "unconfigured";
   if (/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(recipient) && (options.send || MAIL.provider === "smtp")) {
     const fingerprint = reasons.join(",") || "healthy";
+    const send = () => (options.send || sendMail)(recipient, reasons.length ? "Groundwork operational alert" : "Groundwork operational recovery",
+      `Status: ${reasons.length ? "attention required" : "healthy"}\nChecks: ${reasons.join(", ") || "all clear"}\nRequests in last hour: ${metrics?.totals.count ?? "unavailable"}\nService errors: ${metrics?.totals.errors ?? "unavailable"}\nP95 latency ms: ${metrics?.totals.p95Ms ?? "unavailable"}\nLast encrypted backup timestamp: ${lastBackup?.completedAt ?? "unavailable"}`);
     try {
-      const claimed = await withTransaction(async () => {
-        const row = await db.prepare("SELECT value FROM operational_state WHERE key='alerts.runtime'").get() as { value: string } | undefined;
-        const state = row ? JSON.parse(row.value) as { lastSentFingerprint?: string; lastNotifiedAt?: number; lastAttemptAt?: number; lastAttemptFingerprint?: string } : {};
-        const actionable = reasons.length > 0 || Boolean(state.lastSentFingerprint && state.lastSentFingerprint !== "healthy");
-        if (!actionable || (state.lastAttemptFingerprint === fingerprint && state.lastAttemptAt && now() - state.lastAttemptAt < 600)
-          || (state.lastSentFingerprint === fingerprint && now() - (state.lastNotifiedAt || 0) < 6 * 3600)) return false;
-        await db.prepare("INSERT INTO operational_state(key,value,updated_at) VALUES('alerts.runtime',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").run(JSON.stringify({ ...state, lastAttemptAt: now(), lastAttemptFingerprint: fingerprint }), now());
-        return true;
-      });
       notification = "throttled";
-      if (claimed) {
-        const result = await (options.send || sendMail)(recipient, reasons.length ? "Groundwork operational alert" : "Groundwork operational recovery",
-          `Status: ${reasons.length ? "attention required" : "healthy"}\nChecks: ${reasons.join(", ") || "all clear"}\nRequests in last hour: ${metrics?.totals.count ?? "unavailable"}\nService errors: ${metrics?.totals.errors ?? "unavailable"}\nP95 latency ms: ${metrics?.totals.p95Ms ?? "unavailable"}\nLast encrypted backup timestamp: ${lastBackup?.completedAt ?? "unavailable"}`);
-        notification = result.delivered ? "sent" : "failed";
-        if (result.delivered) await db.prepare("UPDATE operational_state SET value=?,updated_at=? WHERE key='alerts.runtime'")
-          .run(JSON.stringify({ lastSentFingerprint: fingerprint, lastNotifiedAt: now(), lastAttemptAt: now(), lastAttemptFingerprint: fingerprint }), now());
+      if (databaseUnavailable) {
+        // Reserve locally before awaiting SMTP. No database read or write is
+        // required to notify about the outage itself.
+        const attemptedAt = now();
+        const previous = outageAlert?.recipient === recipient ? outageAlert : undefined;
+        if (!previous || (attemptedAt - previous.attemptedAt >= ALERT_RETRY_SECONDS
+          && (previous.sentAt === undefined || attemptedAt - previous.sentAt >= ALERT_REPEAT_SECONDS))) {
+          const attempt: NonNullable<typeof outageAlert> = { recipient, attemptedAt };
+          outageAlert = attempt;
+          const result = await send();
+          if (result.delivered) attempt.sentAt = now();
+          notification = result.delivered ? "sent" : "failed";
+        }
+      } else {
+        const claimed = await withTransaction(async () => {
+          const row = await db.prepare("SELECT value FROM operational_state WHERE key='alerts.runtime'").get() as { value: string } | undefined;
+          const state = row ? JSON.parse(row.value) as { lastSentFingerprint?: string; lastNotifiedAt?: number; lastAttemptAt?: number; lastAttemptFingerprint?: string } : {};
+          const actionable = reasons.length > 0 || Boolean(state.lastSentFingerprint && state.lastSentFingerprint !== "healthy");
+          if (!actionable || (state.lastAttemptFingerprint === fingerprint && state.lastAttemptAt && now() - state.lastAttemptAt < ALERT_RETRY_SECONDS)
+            || (state.lastSentFingerprint === fingerprint && now() - (state.lastNotifiedAt || 0) < ALERT_REPEAT_SECONDS)) return false;
+          await db.prepare("INSERT INTO operational_state(key,value,updated_at) VALUES('alerts.runtime',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").run(JSON.stringify({ ...state, lastAttemptAt: now(), lastAttemptFingerprint: fingerprint }), now());
+          return true;
+        });
+        if (claimed) {
+          const result = await send();
+          notification = result.delivered ? "sent" : "failed";
+          if (result.delivered) await db.prepare("UPDATE operational_state SET value=?,updated_at=? WHERE key='alerts.runtime'")
+            .run(JSON.stringify({ lastSentFingerprint: fingerprint, lastNotifiedAt: now(), lastAttemptAt: now(), lastAttemptFingerprint: fingerprint }), now());
+        }
       }
     } catch { notification = "failed"; }
   }

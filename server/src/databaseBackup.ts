@@ -45,11 +45,14 @@ export async function checkpointDatabase(mode: "PASSIVE" | "FULL" | "RESTART" | 
 /** Verify integrity of a SQLite database file using PRAGMA integrity_check. */
 export function verifyDatabaseIntegrity(filePath: string): { ok: boolean; status: string } {
   try {
-    const backupDb = new DatabaseSync(filePath);
-    const result = backupDb.prepare("PRAGMA integrity_check;").get() as { integrity_check?: string } | undefined;
-    const status = result?.integrity_check || "unknown";
-    backupDb.close();
-    return { ok: status === "ok", status };
+    const backupDb = new DatabaseSync(filePath, { readOnly: true });
+    try {
+      const result = backupDb.prepare("PRAGMA integrity_check;").get() as { integrity_check?: string } | undefined;
+      const status = result?.integrity_check || "unknown";
+      return { ok: status === "ok", status };
+    } finally {
+      backupDb.close();
+    }
   } catch (error) {
     return { ok: false, status: error instanceof Error ? error.message : String(error) };
   }
@@ -134,8 +137,6 @@ export async function pruneOldBackups(keepCount = 10): Promise<number> {
 }
 
 /** Background scheduler for automated checkpoints and backups. */
-let schedulerInterval: NodeJS.Timeout | null = null;
-
 export function startDatabaseScheduler(options?: {
   checkpointIntervalMs?: number;
   backupIntervalMs?: number;
@@ -146,36 +147,39 @@ export function startDatabaseScheduler(options?: {
   const backupMs = options?.backupIntervalMs ?? 12 * 60 * 60 * 1000; // 12 hours
   const maxRetained = options?.maxRetained ?? 14; // keep 14 backups (1 week of 12h backups)
 
-  let lastBackup = Date.now();
+  let lastBackup: number | undefined;
   let running = false;
+  let stopped = false;
 
-  const timer = setInterval(async () => {
-    if (running) return;
+  const maintain = async () => {
+    if (stopped || running) return;
     running = true;
     try {
-      // Periodic WAL truncate
-      await checkpointDatabase("TRUNCATE");
-
-      // Check if scheduled backup is due
-      if (Date.now() - lastBackup >= backupMs) {
-        lastBackup = Date.now();
-        const result = await performDatabaseBackup({ label: "scheduled", pruneCount: maxRetained });
-        console.log(`[groundwork] Automated backup completed: ${result.backupFile} (${(result.sizeBytes / 1024).toFixed(1)} KB)`);
+      if (lastBackup === undefined) {
+        const startedAt = Date.now();
+        const recent = (await listDatabaseBackups()).find(item =>
+          item.createdAt <= startedAt && startedAt - item.createdAt < backupMs && item.sizeBytes > 0
+          && verifyDatabaseIntegrity(path.join(BACKUP_DIR, item.filename)).ok,
+        );
+        lastBackup = recent?.createdAt ?? -Infinity;
       }
+      if (stopped) return;
+
+      if (Date.now() - lastBackup >= backupMs) {
+        const result = await performDatabaseBackup({ label: "scheduled", pruneCount: maxRetained });
+        lastBackup = result.timestamp;
+        console.log(`[groundwork] Automated backup completed: ${result.backupFile} (${(result.sizeBytes / 1024).toFixed(1)} KB)`);
+      } else await checkpointDatabase("TRUNCATE");
     } catch (err) {
       console.error("[groundwork] Scheduled database maintenance error", { type: err instanceof Error ? err.name : "UnknownError" });
     } finally { running = false; }
-  }, checkpointMs);
+  };
 
-  if (typeof timer.unref === "function") {
-    timer.unref();
-  }
-  schedulerInterval = timer;
-
+  const timer = setInterval(() => void maintain(), checkpointMs);
+  timer.unref?.();
+  void maintain();
   return () => {
-    if (schedulerInterval) {
-      clearInterval(schedulerInterval);
-      schedulerInterval = null;
-    }
+    stopped = true;
+    clearInterval(timer);
   };
 }

@@ -20,7 +20,7 @@ const { db, now } = await import("../src/db.js");
 const { createSession } = await import("../src/security.js");
 const { randomId } = await import("../src/crypto.js");
 const { createWorkspaceArtifact, readWorkspace, readWorkspaceArtifact, saveWorkspace } = await import("../src/workspaces.js");
-const { claimNativeJob, finishNativeJob, listNativeJobs, readNativeJob, readNativeJobArtifact, renewNativeJob } = await import("../src/nativeJobs.js");
+const { cancelNativeJob, claimNativeJob, deleteNativeJob, finishNativeJob, listNativeJobs, readNativeJob, readNativeJobArtifact, renewNativeJob } = await import("../src/nativeJobs.js");
 const { reserveProjectSubscription, releaseProjectSubscription, subscribeProject } = await import("../src/collaboration.js");
 const server = app.listen(0, "127.0.0.1");
 await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -213,6 +213,34 @@ test("native claims, heartbeats, publication and artifact reads recheck session 
     }
   }
   assert.equal((await db.prepare("SELECT COUNT(*) AS count FROM project_native_job_artifacts WHERE project_id=?").get(id) as { count: number }).count, 1);
+});
+
+test("project reads and cancellation settle expired native jobs without a worker claim", async () => {
+  const id = await project(), actor = actors[0];
+  const source = await createWorkspaceArtifact(id, "engineering", actor, "native-recovery.json", Buffer.from("{}"));
+  const timestamp = now();
+  const seed = async (state: "queued" | "running", attempts: number, claimUntil: number, expiresAt: number) => {
+    const jobId = randomId();
+    await db.prepare(`INSERT INTO project_native_jobs(id,project_id,kind,workspace_kind,state,input_artifact_id,input_sha256,source_revision,idempotency_key,request_hash,created_by,session_id,created_at,updated_at,expires_at,attempts,claim_token,claim_until)
+      VALUES (?,?,'opensees-static','engineering',?,?,?,0,?,?,?,?,?,?,?,?,?,?)`)
+      .run(jobId, id, state, source.id, source.sha256, randomId(), "synthetic-worker-recovery", actor.userId, actor.sessionId,
+        timestamp, timestamp, expiresAt, attempts, state === "running" ? randomId() : null, claimUntil);
+    return jobId;
+  };
+  const queued = await seed("queued", 0, 0, timestamp - 1);
+  const exhausted = await seed("running", 2, timestamp - 1, timestamp + 100);
+  const retry = await seed("running", 1, timestamp - 1, timestamp + 100);
+  const cancellable = await seed("running", 1, timestamp - 1, timestamp + 100);
+  const active = await seed("running", 1, timestamp + 60, timestamp + 100);
+  assert.equal((await readNativeJob(id, retry, actor)).state, "queued");
+  assert.equal((await cancelNativeJob(id, cancellable, actor)).state, "cancelled");
+  const records = new Map((await listNativeJobs(id, actor)).jobs.map(job => [job.id, job]));
+  assert.equal(records.get(queued)?.error?.code, "QUEUE_EXPIRED");
+  assert.equal(records.get(exhausted)?.error?.code, "LEASE_EXPIRED");
+  assert.equal(records.get(active)?.state, "running");
+  await deleteNativeJob(id, exhausted, actor);
+  await assert.rejects(readNativeJob(id, exhausted, actor), { code: "JOB_NOT_FOUND" });
+  await assert.rejects(deleteNativeJob(id, active, actor), { code: "JOB_ACTIVE" });
 });
 
 test("concurrent SSE reservations admit at most ten connections and expired leases never restore capacity", async () => {

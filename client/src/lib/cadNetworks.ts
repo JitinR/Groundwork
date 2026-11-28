@@ -190,9 +190,20 @@ export function assessCadGravity(design: Design, system: "sanitary" | "stormwate
   const state = cadNetworkState(design), elements = new Map(cadMep(design).elements.map(item => [item.id, item]));
   return state.equipment.filter(item => item.system === system && ["pipe", "riser"].includes(item.type)).map(item => {
     const element = elements.get(item.elementId)!; const start = element.route[0], end = element.route[element.route.length - 1];
-    const horizontalM = element.route.reduce((sum, point, i) => i ? sum + Math.hypot(point.x - element.route[i - 1].x, point.z - element.route[i - 1].z) : 0, 0);
-    const slopePct = horizontalM > 1e-9 ? (start.y - end.y) / horizontalM * 100 : null;
-    const reverseSegments = element.route.filter((point, i) => i && point.y > element.route[i - 1].y + 1e-6).length;
-    return { elementId: item.elementId, name: element.name, invertStartM: start.y - element.diameter / 2, invertEndM: end.y - element.diameter / 2, slopePct, minimumSlopePct: item.minimumSlopePct, status: item.minimumSlopePct === undefined ? "incomplete" : reverseSegments || slopePct !== null && slopePct < item.minimumSlopePct ? "review" : "satisfies-supplied-slope", scope: "Geometry slope only; no drainage capacity, venting, trap, surcharge or national-code assessment" };
+    let slopePct: number | null = null;
+    let reverseSlope = false;
+    for (let i = 1; i < element.route.length; i++) {
+      const a = element.route[i - 1], b = element.route[i];
+      const drop = a.y - b.y;
+      if (drop < -1e-6) reverseSlope = true;
+      const run = Math.hypot(b.x - a.x, b.z - a.z);
+      if (run <= 1e-9) continue;
+      const segmentSlope = drop / run * 100;
+      slopePct = Math.min(slopePct ?? segmentSlope, segmentSlope);
+    }
+    const { minimumSlopePct } = item;
+    const status = minimumSlopePct === undefined ? "incomplete"
+      : reverseSlope || (slopePct !== null && slopePct + 1e-9 < minimumSlopePct) ? "review" : "satisfies-supplied-slope";
+    return { elementId: item.elementId, name: element.name, invertStartM: start.y - element.diameter / 2, invertEndM: end.y - element.diameter / 2, slopePct, minimumSlopePct, status, scope: "Geometry slope only; no drainage capacity, venting, trap, surcharge or national-code assessment" };
   });
 }

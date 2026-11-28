@@ -7,6 +7,7 @@ import { exportAccountDrafts } from "./offlineDraft";
 export interface CachedProjectRecord {
   userId: string;
   accountBound: true;
+  serverConfirmed?: true;
   projectId: string;
   name: string;
   projectType: ProjectType;
@@ -118,7 +119,7 @@ class OfflineProjectStore {
    */
   async cacheProject(
     userId: string,
-    project: Project,
+    project: Pick<Project, "id" | "name" | "projectType" | "revision" | "hasPhoto" | "role">,
     design: Design,
     protectedProjectIds: Set<string> = new Set(),
   ): Promise<void> {
@@ -132,6 +133,7 @@ class OfflineProjectStore {
     const record: CachedProjectRecord = {
       userId,
       accountBound: true,
+      serverConfirmed: true,
       projectId: project.id,
       name: project.name,
       projectType: (project.projectType || "house") as ProjectType,
@@ -154,6 +156,8 @@ class OfflineProjectStore {
     } catch (err) {
       if (protectedIds && (typeof window === "undefined" || !("indexedDB" in window))) {
         try {
+          const current = this.memoryCache.get(cacheKey);
+          if (current?.serverConfirmed && current.revision > record.revision) return;
           const plan = planCacheWrite(this.exportUserMemory(userId), [], { project: record }, protectedIds, this.budget);
           if (!localWriteAllowed(userId, write)) return;
           for (const id of plan.removeProjects) this.memoryCache.delete(`${userId}:${id}`);
@@ -176,7 +180,7 @@ class OfflineProjectStore {
 
     const cacheKey = `${userId}:${projectId}`;
     const inMem = this.memoryCache.get(cacheKey);
-    if (inMem && inMem.userId === userId) {
+    if (inMem?.serverConfirmed && inMem.userId === userId) {
       inMem.lastAccessedAt = Date.now();
       return inMem;
     }
@@ -192,9 +196,9 @@ class OfflineProjectStore {
         req.onerror = () => reject(req.error);
       });
 
-      // Older entries have no authenticated account binding. Opening the
-      // project online replaces the entry without discarding saved drafts.
-      if (record?.accountBound === true && record.userId === userId && localWriteAllowed(userId, write)) {
+      // Earlier releases could cache a draft as if it were the saved project.
+      // An online read refreshes the saved copy while keeping recovery records.
+      if (record?.accountBound === true && record.serverConfirmed === true && record.userId === userId && localWriteAllowed(userId, write)) {
         record.lastAccessedAt = Date.now();
         store.put(record);
         this.memoryCache.set(cacheKey, record);
@@ -377,17 +381,23 @@ class OfflineProjectStore {
       const pStore = tx.objectStore(STORE_PROJECTS), sStore = tx.objectStore(STORE_SNAPSHOTS);
       const pRequest = pStore.index("by_user").getAll(userId), sRequest = sStore.index("by_user").getAll(userId);
       let remaining = 2, failure: unknown, plan: ReturnType<typeof planCacheWrite> | undefined;
+      let savedProject: CachedProjectRecord | undefined;
       const prepare = () => {
         if (--remaining) return;
         try {
           if (!localWriteAllowed(userId, write)) throw new Error("Local cache write was cancelled during account transition.");
           const projects = (pRequest.result as CachedProjectRecord[]).filter(item => item.userId === userId);
           const snapshots = (sRequest.result as CachedSnapshotRecord[]).filter(item => item.userId === userId);
+          const current = projects.find(item => item.projectId === incoming.project?.projectId);
+          if (incoming.project && current?.serverConfirmed && current.revision > incoming.project.revision) return;
           this.protectDraftProjects(userId, protectedIds);
           plan = planCacheWrite(projects, snapshots, incoming, protectedIds, this.budget);
           for (const id of plan.removeProjects) pStore.delete([userId, id]);
           for (const item of plan.removeSnapshots) sStore.delete([userId, item.projectId, item.snapshotId]);
-          if (incoming.project) pStore.put(incoming.project);
+          if (incoming.project) {
+            pStore.put(incoming.project);
+            savedProject = incoming.project;
+          }
           if (incoming.snapshot) sStore.put(incoming.snapshot);
         } catch (error) { failure = error; tx.abort(); }
       };
@@ -395,7 +405,7 @@ class OfflineProjectStore {
       tx.oncomplete = () => {
         if (localWriteAllowed(userId, write)) {
           for (const id of plan?.removeProjects ?? []) this.memoryCache.delete(`${userId}:${id}`);
-          if (incoming.project) this.memoryCache.set(`${userId}:${incoming.project.projectId}`, incoming.project);
+          if (savedProject) this.memoryCache.set(`${userId}:${savedProject.projectId}`, savedProject);
         }
         resolve();
       };

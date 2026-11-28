@@ -15,6 +15,7 @@ export interface LatLng {
 const EARTH_R = 6371008.8;
 const rad = (d: number) => (d * Math.PI) / 180;
 const rounded = (n: number, d = 2) => Math.round((Number.isFinite(n) ? n : 0) * 10 ** d) / 10 ** d;
+const wrapLongitude = (degrees: number) => Math.abs(degrees) <= 180 ? degrees : ((degrees % 360) + 540) % 360 - 180;
 
 export function haversine(a: LatLng, b: LatLng): number {
   const dLat = rad(b.lat - a.lat);
@@ -27,23 +28,25 @@ export function haversine(a: LatLng, b: LatLng): number {
 
 export function centroid(points: LatLng[]): LatLng {
   const n = points.length || 1;
+  const referenceLongitude = points[0]?.lng ?? 0;
   return {
     lat: points.reduce((s, p) => s + p.lat, 0) / n,
-    lng: points.reduce((s, p) => s + p.lng, 0) / n,
+    lng: wrapLongitude(referenceLongitude + points.reduce((s, p) => s + wrapLongitude(p.lng - referenceLongitude), 0) / n),
   };
 }
 
 /** Metres east/north of an origin, good enough over a single plot. */
 export function toLocalMetres(p: LatLng, origin: LatLng): { x: number; y: number } {
-  const x = rad(p.lng - origin.lng) * EARTH_R * Math.cos(rad((p.lat + origin.lat) / 2));
+  const x = rad(wrapLongitude(p.lng - origin.lng)) * EARTH_R * Math.cos(rad((p.lat + origin.lat) / 2));
   const y = rad(p.lat - origin.lat) * EARTH_R;
   return { x, y };
 }
 
 export function localToLatLng(x: number, y: number, origin: LatLng): LatLng {
   const lat = origin.lat + (y / EARTH_R) * (180 / Math.PI);
-  const lng = origin.lng + (x / (EARTH_R * Math.cos(rad((lat + origin.lat) / 2)))) * (180 / Math.PI);
-  return { lat, lng };
+  const offset = (x / (EARTH_R * Math.cos(rad((lat + origin.lat) / 2)))) * (180 / Math.PI);
+  // Beyond the shortest longitude arc the local projection cannot round-trip.
+  return { lat, lng: Math.abs(offset) <= 180 ? wrapLongitude(origin.lng + offset) : NaN };
 }
 
 /** Shoelace area of a plot boundary, m². */
