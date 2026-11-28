@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { allowedOrigin, probe, alert, backupFreshness, monitorCadence, checkMonitorCadence } from './operational-health.mjs';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { allowedOrigin, probe, alert, backupFreshness, monitorCadence, checkMonitorCadence, checkIndependentHealth } from './operational-health.mjs';
 import { measure, percentile } from './operational-performance.mjs';
 
 test('operational probes require exact allowlisted origins and isolated performance targets', async () => {
@@ -98,4 +101,57 @@ test('independent cadence check detects overdue Actions without a current GitHub
   assert.equal(deliveries, 1);
   const unavailable = await checkMonitorCadence(env, { ...stale, request: async () => new Response(null, { status: 503 }), notify: async () => { throw new Error('SMTP internal detail'); } });
   assert.deepEqual(unavailable, { ok: false, reason: 'monitor_evidence_unavailable', alert: { sent: false, reason: 'alert_delivery_failed' } });
+});
+
+test('the independent scheduler probes health without Actions and retries a missed-probe alert', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'groundwork-probe-state-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const origin = 'https://fixture.example', statePath = join(directory, 'probe-state.json');
+  const env = { OPS_HEALTH_ORIGIN: origin, OPS_HEALTH_ALLOWED_ORIGINS: origin, STATE_DIRECTORY: directory, OPS_SEND_ALERTS: '1' };
+  let timestamp = Date.parse('2026-11-06T10:00:00Z'), requests = 0, deliveries = 0, healthy = true;
+  const options = {
+    now: () => timestamp, wait: async () => {},
+    request: async (url, requestOptions) => {
+      requests++;
+      assert.equal(url, `${origin}/api/health`);
+      assert.equal(requestOptions.redirect, 'error');
+      return Response.json({ ok: healthy }, { status: healthy ? 200 : 503 });
+    },
+    notify: async (report) => {
+      deliveries++;
+      if (healthy) {
+        assert.equal(report.reason, 'independent_monitor_cadence_gap');
+        assert.equal(report.ageMinutes, 60);
+        assert.equal(report.samples.length, 0);
+        return { sent: deliveries > 1 };
+      }
+      assert.equal(report.reason, 'health_response');
+      assert.equal(report.samples.length, 3);
+      return { sent: true };
+    },
+  };
+  const first = await checkIndependentHealth(env, options);
+  assert.equal(first.ok, true);
+  assert.equal(first.cadence.reason, 'independent_monitor_first_probe');
+  timestamp += 15 * 60000;
+  assert.equal((await checkIndependentHealth(env, options)).cadence.reason, 'independent_monitor_cadence_fresh');
+  timestamp += 60 * 60000;
+  const gap = await checkIndependentHealth(env, options);
+  assert.equal(gap.ok, false);
+  assert.deepEqual(gap.alert, { sent: false });
+  timestamp += 15 * 60000;
+  assert.deepEqual((await checkIndependentHealth(env, options)).alert, { sent: true });
+  timestamp += 15 * 60000;
+  assert.equal((await checkIndependentHealth(env, options)).ok, true);
+  assert.deepEqual(JSON.parse(await readFile(statePath, 'utf8')), { origin, checkedAt: new Date(timestamp).toISOString() });
+  assert.equal((await stat(statePath)).mode & 0o077, 0);
+
+  healthy = false;
+  timestamp += 15 * 60000;
+  const outage = await checkIndependentHealth(env, options);
+  assert.equal(outage.ok, false);
+  assert.equal(outage.cadence.ok, true);
+  assert.deepEqual(outage.alert, { sent: true });
+  assert.equal(requests, 8);
+  assert.equal(deliveries, 3);
 });

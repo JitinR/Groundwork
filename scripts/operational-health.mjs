@@ -1,11 +1,14 @@
 import { performance } from 'node:perf_hooks';
-import { resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
+import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { requestReleaseJson } from './release-readiness.mjs';
 
 // Resolve the mail transport from its owning workspace, including nested installs.
 const requireServer = createRequire(new URL('../server/package.json', import.meta.url));
+const MAX_PROBE_GAP_MS = 45 * 60000;
 
 export function allowedOrigin(value, allowlist, { isolated = false } = {}) {
   let url;
@@ -87,7 +90,7 @@ export async function monitorCadence(env = process.env, request = fetch, now = D
     if (!Number.isFinite(completed) || completed < Date.parse(previous.created_at) || completed > now) return failed('monitor_probe_unverified');
     const ageMs = now - completed;
     const ageMinutes = Math.round(ageMs / 60000);
-    if (ageMs > 45 * 60000) return { ...failed('monitor_cadence_gap'), ageMinutes };
+    if (ageMs > MAX_PROBE_GAP_MS) return { ...failed('monitor_cadence_gap'), ageMinutes };
     return { ok: true, reason: 'monitor_cadence_fresh', ageMinutes };
   } catch { return failed('monitor_evidence_unavailable'); }
 }
@@ -102,22 +105,72 @@ export async function checkMonitorCadence(env = process.env, { request = fetch, 
     return { ...report, alert: { sent: false, reason: 'alert_delivery_failed' } };
   }
 }
-export async function checkHealth(env = process.env) {
+async function inspectHealth(env, { request = fetch, now = Date.now, wait = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   const origin = allowedOrigin(env.OPS_HEALTH_ORIGIN, env.OPS_HEALTH_ALLOWED_ORIGINS);
   const samples = [];
   for (let index = 0; index < 3; index++) {
-    samples.push(await probe(origin));
+    samples.push(await probe(origin, { fetcher: request }));
     if (samples.at(-1).ok) break;
-    if (index < 2) await new Promise(resolve => setTimeout(resolve, 3000));
+    if (index < 2) await wait(3000);
   }
-  const backup = await backupFreshness(env);
-  const report = { ok: samples.at(-1).ok && backup.ok !== false, origin, checkedAt: new Date().toISOString(), reason: backup.ok === false ? backup.reason : samples.at(-1).reason, samples, backup };
+  const checkedAt = new Date(now()).toISOString();
+  const backup = await backupFreshness(env, request, now());
+  return { ok: samples.at(-1).ok && backup.ok !== false, origin, checkedAt, reason: backup.ok === false ? backup.reason : samples.at(-1).reason, samples, backup };
+}
+export async function checkHealth(env = process.env) {
+  const report = await inspectHealth(env);
   if (!report.ok) report.alert = await alert(report, env);
   return report;
 }
+
+async function lastIndependentProbe(path, origin, startedAt, retryAlerts) {
+  try {
+    const previous = JSON.parse(await readFile(path, 'utf8'));
+    const completedAt = Date.parse(previous.checkedAt);
+    if (previous.origin !== origin || !Number.isFinite(completedAt) || completedAt > startedAt)
+      return { ok: false, reason: 'independent_monitor_state_invalid' };
+    const age = startedAt - completedAt;
+    const ageMinutes = Math.round(age / 60000);
+    if (age <= MAX_PROBE_GAP_MS && retryAlerts && previous.pendingCadence?.ok === false
+      && ['independent_monitor_cadence_gap', 'independent_monitor_state_invalid'].includes(previous.pendingCadence.reason))
+      return previous.pendingCadence;
+    return { ok: age <= MAX_PROBE_GAP_MS, reason: age <= MAX_PROBE_GAP_MS ? 'independent_monitor_cadence_fresh' : 'independent_monitor_cadence_gap', ageMinutes };
+  } catch (error) {
+    if (error.code === 'ENOENT') return { ok: true, reason: 'independent_monitor_first_probe' };
+    if (error instanceof SyntaxError || error instanceof TypeError) return { ok: false, reason: 'independent_monitor_state_invalid' };
+    throw error;
+  }
+}
+
+/** Drive the health probe directly from a separate host, rather than relying
+ * on GitHub to schedule a run or make its API available. */
+export async function checkIndependentHealth(env = process.env, { request = fetch, now = Date.now, wait, notify = alert } = {}) {
+  const origin = allowedOrigin(env.OPS_HEALTH_ORIGIN, env.OPS_HEALTH_ALLOWED_ORIGINS);
+  const directory = env.OPS_MONITOR_STATE_DIRECTORY || env.STATE_DIRECTORY;
+  if (!directory || !isAbsolute(directory)) throw new Error('An absolute monitor state directory is required');
+  const path = join(directory, 'probe-state.json');
+  const alertsEnabled = env.OPS_SEND_ALERTS === '1';
+  const cadence = await lastIndependentProbe(path, origin, now(), alertsEnabled);
+  const health = await inspectHealth(env, { request, now, wait });
+  const report = { ...health, ok: health.ok && cadence.ok, reason: health.ok && !cadence.ok ? cadence.reason : health.reason, cadence };
+  if (!report.ok && alertsEnabled) {
+    try {
+      report.alert = await notify(health.ok ? { ...report, samples: [], ageMinutes: cadence.ageMinutes } : report, env);
+    } catch { report.alert = { sent: false, reason: 'alert_delivery_failed' }; }
+  }
+  const pendingCadence = alertsEnabled && !cadence.ok && (!health.ok || !report.alert?.sent) ? cadence : undefined;
+  const temporary = join(directory, `.probe-state-${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, JSON.stringify({ origin, checkedAt: health.checkedAt, pendingCadence }), { flag: 'wx', mode: 0o600 });
+    await rename(temporary, path);
+  } finally { await rm(temporary, { force: true }); }
+  return report;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const mode = process.argv[2];
   const check = mode === '--cadence' ? checkMonitorCadence
-    : mode === '--watch-cadence' ? () => checkMonitorCadence(process.env, { independent: true }) : checkHealth;
+    : mode === '--watch-cadence' ? () => checkMonitorCadence(process.env, { independent: true })
+    : mode === '--independent-probe' ? checkIndependentHealth : checkHealth;
   check().then(result => { console.log(JSON.stringify(result)); if (!result.ok) process.exitCode = 1; }).catch(() => { console.error('External monitoring failed: check the explicit origin allowlist and private alert configuration.'); process.exitCode = 1; });
 }

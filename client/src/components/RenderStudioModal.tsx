@@ -11,28 +11,37 @@ import {
   type RenderCapabilities,
   type RenderJobSummary,
   type RenderPreset,
+  type RenderSourceImage,
+  type RenderSourceKind,
 } from "../lib/renderApi";
 import { downloadBlob } from "../lib/download";
 
 interface RenderStudioModalProps {
   projectId: string;
-  sourceRevision: number;
-  initialSourceImageBase64?: string | null;
+  initialSourceImage?: RenderSourceImage | null;
   isOpen: boolean;
   onClose: () => void;
 }
 
+function sourceLabel(kind: RenderSourceKind, revision: number): string {
+  switch (kind) {
+    case "saved-viewport": return `Saved viewport · Rev ${revision}`;
+    case "draft-viewport": return `Unsaved viewport · Based on Rev ${revision}`;
+    case "reference": return "Reference image";
+    default: return "Unverified source";
+  }
+}
+
 export function RenderStudioModal({
   projectId,
-  sourceRevision,
-  initialSourceImageBase64,
+  initialSourceImage,
   isOpen,
   onClose,
 }: RenderStudioModalProps) {
   const [capabilities, setCapabilities] = useState<RenderCapabilities | null>(null);
   const [jobs, setJobs] = useState<RenderJobSummary[]>([]);
-  const [canRemoveAttempts, setCanRemoveAttempts] = useState(false);
-  const [currentProjectRevision, setCurrentProjectRevision] = useState(sourceRevision);
+  const [canRemove, setCanRemove] = useState(false);
+  const [currentProjectRevision, setCurrentProjectRevision] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,7 +50,7 @@ export function RenderStudioModal({
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
   const [selectedPreset, setSelectedPreset] = useState<string>("photorealistic-daylight");
-  const [sourceImageBase64, setSourceImageBase64] = useState<string | null>(initialSourceImageBase64 || null);
+  const [sourceImage, setSourceImage] = useState<RenderSourceImage | null>(initialSourceImage ?? null);
   const [selectedPreviewJob, setSelectedPreviewJob] = useState<RenderJobSummary | null>(null);
 
   const pollTimerRef = useRef<number | null>(null);
@@ -64,10 +73,10 @@ export function RenderStudioModal({
     scopeGeneration.current += 1;
     requestGeneration.current += 1;
     setCapabilities(null); setJobs([]); setSelectedPreviewJob(null); setError(null);
-    setCanRemoveAttempts(false);
-    setCurrentProjectRevision(sourceRevision); setLoading(false); setSubmitting(false);
+    setCanRemove(false);
+    setCurrentProjectRevision(null); setLoading(false); setSubmitting(false);
     setBusyJob(null); busyJobRef.current = null;
-    setSourceImageBase64(initialSourceImageBase64 || null);
+    setSourceImage(initialSourceImage ?? null);
     fileReaderRef.current?.abort(); fileReaderRef.current = null;
     return () => { scopeGeneration.current += 1; requestGeneration.current += 1; };
   }, [projectId, isOpen]);
@@ -86,7 +95,7 @@ export function RenderStudioModal({
       if (!isCurrent()) return;
       setCapabilities(caps);
       setJobs(jobData.jobs);
-      setCanRemoveAttempts(jobData.project.role === "owner");
+      setCanRemove(jobData.project.role === "owner");
       setCurrentProjectRevision(jobData.project.revision);
       setError(null);
     } catch (err: unknown) {
@@ -99,16 +108,13 @@ export function RenderStudioModal({
   useEffect(() => {
     if (isOpen) {
       void loadData();
-      if (initialSourceImageBase64) {
-        setSourceImageBase64(initialSourceImageBase64);
-      }
     } else {
       if (pollTimerRef.current) {
         window.clearTimeout(pollTimerRef.current);
         pollTimerRef.current = null;
       }
     }
-  }, [isOpen, loadData, initialSourceImageBase64]);
+  }, [isOpen, loadData]);
 
   // Polling while any job is active
   useEffect(() => {
@@ -121,7 +127,7 @@ export function RenderStudioModal({
         void listRenderJobs(projectId).then((data) => {
           if (!isCurrent()) return;
           setJobs(data.jobs);
-          setCanRemoveAttempts(data.project.role === "owner");
+          setCanRemove(data.project.role === "owner");
           setCurrentProjectRevision(data.project.revision);
         }).catch((cause: unknown) => {
           if (isCurrent()) setError(cause instanceof Error ? cause.message : "Couldn't refresh rendering progress. Use Refresh to try again.");
@@ -154,7 +160,7 @@ export function RenderStudioModal({
     fileReaderRef.current = reader;
     reader.onload = () => {
       if (aliveRef.current && scope === scopeGeneration.current && scopeRef.current.isOpen && fileReaderRef.current === reader && typeof reader.result === "string") {
-        setSourceImageBase64(reader.result);
+        setSourceImage({ base64: reader.result, kind: "reference" });
       }
     };
     reader.onerror = () => { if (aliveRef.current && scope === scopeGeneration.current && scopeRef.current.isOpen) setError("Couldn't read this image. Choose another file."); };
@@ -168,10 +174,11 @@ export function RenderStudioModal({
       setError("Please describe the desired photorealistic architectural render.");
       return;
     }
-    if (!sourceImageBase64) {
+    if (!sourceImage) {
       setError("Please provide a source design image from the viewport or file upload.");
       return;
     }
+    if (currentProjectRevision === null) return;
 
     const scope = scopeGeneration.current;
     const isCurrent = () => aliveRef.current && scopeRef.current.projectId === projectId && scopeRef.current.isOpen && scope === scopeGeneration.current;
@@ -182,8 +189,9 @@ export function RenderStudioModal({
         prompt: prompt.trim(),
         negativePrompt: negativePrompt.trim() || undefined,
         stylePreset: selectedPreset,
-        sourceRevision: currentProjectRevision,
-        sourceImageBase64,
+        sourceRevision: sourceImage.revision ?? currentProjectRevision,
+        sourceKind: sourceImage.kind,
+        sourceImageBase64: sourceImage.base64,
       });
       if (!isCurrent()) return;
       requestGeneration.current += 1;
@@ -236,21 +244,21 @@ export function RenderStudioModal({
   };
 
   const handleRemove = async (jobId: string) => {
-    if (busyJobRef.current || !window.confirm("Remove this attempt from render history? Its source image will remain in the project files.")) return;
+    if (busyJobRef.current || !window.confirm("Remove this render from history and permanently delete its render images that aren't used elsewhere?")) return;
     const scope = scopeGeneration.current;
     const isCurrent = () => aliveRef.current && scopeRef.current.projectId === projectId && scopeRef.current.isOpen && scope === scopeGeneration.current;
     busyJobRef.current = jobId;
     setBusyJob(`remove-${jobId}`);
     try {
       setError(null);
-      await removeRenderHistoryEntry(projectId, jobId);
+      await removeRenderHistoryEntry(projectId, jobId, true);
       if (isCurrent()) {
         requestGeneration.current += 1;
         setLoading(false);
         setJobs((prev) => prev.filter((job) => job.id !== jobId));
       }
     } catch (err: unknown) {
-      if (isCurrent()) setError(err instanceof Error ? err.message : "Couldn't remove the render attempt");
+      if (isCurrent()) setError(err instanceof Error ? err.message : "Couldn't remove the render");
     } finally {
       if (isCurrent()) {
         busyJobRef.current = null;
@@ -268,7 +276,8 @@ export function RenderStudioModal({
       if (!resp.ok) throw new Error("Could not download rendered image");
       const blob = await resp.blob();
       if (!isCurrent()) return;
-      downloadBlob(`render-rev${job.sourceRevision}-${job.id.slice(0, 8)}.png`, blob);
+      const baseName = job.sourceKind === "saved-viewport" ? `render-rev${job.sourceRevision}` : "render";
+      downloadBlob(`${baseName}-${job.id.slice(0, 8)}.png`, blob);
     } catch (err: unknown) {
       if (isCurrent()) setError(err instanceof Error ? err.message : "Download failed");
     }
@@ -278,7 +287,7 @@ export function RenderStudioModal({
     <>
       <Modal open={isOpen && !selectedPreviewJob} onClose={onClose} title="AI rendering studio" wide>
         <div className="space-y-6">
-          <p className="text-xs leading-relaxed text-slate-400">Explore photorealistic interpretations of your design. Your source model stays unchanged, and each output keeps its project revision.</p>
+          <p className="text-xs leading-relaxed text-slate-400">Use a viewport capture or upload a reference image to create a photorealistic rendering.</p>
           {error && (
             <div role="alert" className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-3.5 text-xs text-rose-300">
               {error}
@@ -301,7 +310,7 @@ export function RenderStudioModal({
                   <><p className="font-semibold">Rendering is not connected yet.</p><p className="mt-1 leading-relaxed">Your workspace administrator can connect a rendering service to enable this feature.</p>{capabilities.unconfiguredReason && <details className="mt-2"><summary className="cursor-pointer">Connection details</summary><p className="mt-2 leading-relaxed">{capabilities.unconfiguredReason}</p></details>}</>
                 )}
               </div>
-              <span className="text-[11px] opacity-75">Project Rev {currentProjectRevision}</span>
+              {currentProjectRevision !== null && <span className="text-[11px] opacity-75">Project Rev {currentProjectRevision}</span>}
             </div>
           )}
 
@@ -315,18 +324,18 @@ export function RenderStudioModal({
               <div className="space-y-2">
                 <p className="text-xs text-slate-400 font-medium">Source image</p>
                 <div className="relative aspect-video rounded-xl border border-slate-800 bg-slate-900/60 flex items-center justify-center overflow-hidden">
-                  {sourceImageBase64 ? (
+                  {sourceImage ? (
                     <img
-                      src={sourceImageBase64}
-                      alt="Source Snapshot"
+                      src={sourceImage.base64}
+                      alt="Rendering source"
                       className="w-full h-full object-cover"
                     />
                   ) : (
                     <span className="text-xs text-slate-500">No source image provided</span>
                   )}
-                  <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-slate-950/80 text-[10px] text-slate-300">
-                    Bound Rev {currentProjectRevision}
-                  </span>
+                  {sourceImage && <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-slate-950/80 text-[10px] text-slate-300">
+                    {sourceLabel(sourceImage.kind, sourceImage.revision ?? 0)}
+                  </span>}
                 </div>
                 <Input
                   aria-label="Upload source image as PNG or JPEG"
@@ -393,7 +402,7 @@ export function RenderStudioModal({
                   <Button
                     type="submit"
                     loading={submitting}
-                    disabled={loading || !capabilities || !sourceImageBase64 || !prompt.trim()}
+                    disabled={loading || !capabilities || currentProjectRevision === null || !sourceImage || !prompt.trim()}
                     className="text-xs px-4"
                   >
                     {submitting ? "Creating…" : "Create rendering"}
@@ -422,8 +431,9 @@ export function RenderStudioModal({
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {jobs.map((job) => {
-                  const isStale = job.sourceRevision !== currentProjectRevision;
+                  const isStale = job.sourceKind === "saved-viewport" && job.sourceRevision !== currentProjectRevision;
                   const unsuccessful = job.status === "failed" || job.status === "cancelled" || job.status === "unconfigured";
+                  const removable = canRemove && job.completedAt !== null && (unsuccessful || job.status === "succeeded");
                   return (
                     <Card
                       key={job.id}
@@ -448,19 +458,10 @@ export function RenderStudioModal({
                             {job.status}
                           </span>
 
-                          {/* Stale Revision Badge */}
-                          {isStale ? (
-                            <span
-                              className="text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30"
-                              title={`Rendered at project revision ${job.sourceRevision}, but project is now at revision ${currentProjectRevision}`}
-                            >
-                              Stale: Rev {job.sourceRevision} (Now Rev {currentProjectRevision})
-                            </span>
-                          ) : (
-                            <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-300">
-                              Current Rev {job.sourceRevision}
-                            </span>
-                          )}
+                          <span className={`text-[10px] px-2 py-0.5 rounded ${isStale ? "bg-amber-500/10 text-amber-300 border border-amber-500/30" : "bg-slate-800 text-slate-300"}`}>
+                            {sourceLabel(job.sourceKind, job.sourceRevision)}
+                            {isStale && ` (now Rev ${currentProjectRevision})`}
+                          </span>
                         </div>
 
                         {/* Image Preview */}
@@ -537,7 +538,7 @@ export function RenderStudioModal({
                             Retry
                           </Button>
                         )}
-                        {canRemoveAttempts && unsuccessful && !job.outputArtifactId && job.completedAt !== null && (
+                        {removable && (
                           <Button
                             variant="ghost"
                             size="sm"
@@ -546,7 +547,7 @@ export function RenderStudioModal({
                             onClick={() => void handleRemove(job.id)}
                             className="text-xs h-7"
                           >
-                            Remove attempt
+                            {job.status === "succeeded" ? "Remove rendering" : "Remove attempt"}
                           </Button>
                         )}
                         <span className="ml-auto text-[10px] text-slate-500 font-mono">

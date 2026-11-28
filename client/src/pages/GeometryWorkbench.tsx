@@ -310,8 +310,7 @@ export function GeometryWorkbench() {
     {showRenderStudio && projectId && (
       <RenderStudioModal
         projectId={projectId}
-        sourceRevision={production?.sourceRevision ?? 0}
-        initialSourceImageBase64={image?.dataUrl || null}
+        initialSourceImage={image?.dataUrl ? { base64: image.dataUrl, kind: "reference" } : null}
         isOpen={showRenderStudio}
         onClose={() => setShowRenderStudio(false)}
       />

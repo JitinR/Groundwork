@@ -16,7 +16,7 @@ import {
   type Plan,
   type Provider,
 } from "../payments/providers.js";
-import { COUNTRIES, countryInfo, localPriceMinor } from "../payments/pricing.js";
+import { countryInfo, currencyDigits, localPriceMinor } from "../payments/pricing.js";
 import { randomId } from "../crypto.js";
 import { z } from "zod";
 import { BillingError } from "../organization.js";
@@ -64,8 +64,8 @@ router.get("/", asyncHandler(async (req: AuthedRequest, res) => {
     .prepare(
       "SELECT id, provider, method, plan, amount, currency, status, provider_order_id, completed_at, created_at FROM payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 50",
     )
-    .all(req.user!.id));
-  res.json({ payments: rows });
+    .all(req.user!.id)) as Array<{ currency: string }>;
+  res.json({ payments: rows.map(payment => ({ ...payment, digits: currencyDigits(payment.currency) })) });
 }));
 
 router.get(
@@ -73,12 +73,12 @@ router.get(
   asyncHandler(async (req: AuthedRequest, res) => {
     const row = (await db
       .prepare("SELECT * FROM payments WHERE id = ? AND user_id = ?")
-      .get(routeParam(req, "id"), req.user!.id));
+      .get(routeParam(req, "id"), req.user!.id)) as { currency: string } | undefined;
     if (!row) {
       res.status(404).json({ error: "Payment not found" });
       return;
     }
-    res.json({ payment: row });
+    res.json({ payment: { ...row, digits: currencyDigits(row.currency) } });
   }),
 );
 
@@ -199,7 +199,7 @@ async function markPaid(userId: string, paymentId: string, receipt: PersonalRece
 
     (await db.prepare("UPDATE users SET plan = ?, plan_expires_at = ?, updated_at = ? WHERE id = ?")
       .run(plan.id, t + plan.periodDays * 86400, t, userId));
-    return { plan: plan.id, amount: payment.amount / 100, currency: payment.currency, organizationId: payment.organization_id };
+    return { plan: plan.id, amount: payment.amount / 10 ** (currencyDigits(payment.currency) ?? 2), currency: payment.currency, organizationId: payment.organization_id };
   }));
   if (completed) (await logAudit(userId, "payment.completed", completed, undefined));
 }
@@ -267,6 +267,10 @@ router.post(
       res.json({ ok: true });
       return;
     }
+    if (payment.status !== "pending") {
+      res.status(409).json({ error: "Payment is no longer pending", code: "payment_closed" });
+      return;
+    }
 
     const base = process.env.PAYPAL_MODE === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
     const clientId = process.env.PAYPAL_CLIENT_ID!;
@@ -303,11 +307,16 @@ router.post(
     const captured: unknown = JSON.parse(fetched.text);
     const object = (value: unknown): Record<string, unknown> | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
     const result = object(captured), units = result?.purchase_units;
+    if (result?.id === payment.provider_order_id &&
+        (result.status === "CREATED" || result.status === "PAYER_ACTION_REQUIRED" || result.status === "SAVED")) {
+      res.status(409).json({ error: "Approve this order in PayPal before completing your payment.", code: "paypal_approval_required" });
+      return;
+    }
     const unit = Array.isArray(units) && units.length === 1 ? object(units[0]) : null;
     const captures = object(unit?.payments)?.captures;
     const capture = Array.isArray(captures) && captures.length === 1 ? object(captures[0]) : null;
     const amount = object(capture?.amount), unitAmount = object(unit?.amount), payee = object(unit?.payee);
-    const digits = COUNTRIES.find((country) => country.currency === payment.currency)?.digits;
+    const digits = currencyDigits(payment.currency);
     const value = amount?.value;
     let amountMinor: number | null = null;
     if (typeof value === "string" && digits !== undefined && /^\d+(?:\.\d{1,3})?$/.test(value)) {

@@ -1,0 +1,19 @@
+[Unit]
+Description=Groundwork independent external health probe
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=groundwork-health-monitor
+StateDirectoryMode=0700
+EnvironmentFile=/etc/groundwork-health-monitor/environment
+WorkingDirectory=/opt/groundwork-health-monitor
+ExecStart=/usr/bin/node /opt/groundwork-health-monitor/scripts/operational-health.mjs --independent-probe
+TimeoutStartSec=2min
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes

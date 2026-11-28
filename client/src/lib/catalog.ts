@@ -1,4 +1,7 @@
 import * as THREE from "three";
+import type { Design, FurnitureItem } from "../types";
+
+export const ROOM_WALL_THICKNESS_MM = 120;
 
 export interface CatalogEntry {
   id: string;
@@ -480,6 +483,28 @@ export function furnitureMount(type: string): "unassigned" | "floor" | "wall" | 
   if (type === "air-conditioner") return "wall";
   if (type === "wall-mirror" || type === "vanity-sink") return "unassigned";
   return "floor";
+}
+
+/** Shared pose for the legacy room viewport and its geometry export. */
+export function roomFurniturePose(item: FurnitureItem, room: Design["room"]) {
+  const mount = item.mount ?? furnitureMount(item.type);
+  const wall = item.mountWall ?? "north";
+  const heightMm = (catalogEntry(item.type)?.h ?? 0) * item.scale;
+  const mountHeightMm = item.mountHeightM == null ? undefined : item.mountHeightM * 1000;
+  let xMm = item.x, yMm = 0, zMm = item.z;
+  let rotationY = item.rotationDeg * Math.PI / 180;
+  if (mount === "ceiling") {
+    yMm = mountHeightMm ?? Math.max(room.wallHeightMm - heightMm, 200);
+  } else if (mount === "wall") {
+    yMm = mountHeightMm ?? Math.max(room.wallHeightMm - heightMm - 250, 300);
+    if (wall === "north" || wall === "south") {
+      zMm = (room.depthMm / 2 - 160) * (wall === "north" ? 1 : -1);
+    } else {
+      xMm = (room.widthMm / 2 - 160) * (wall === "east" ? 1 : -1);
+      rotationY += Math.PI / 2;
+    }
+  }
+  return { xMm, yMm, zMm, rotationY };
 }
 
 export function applyFinish(group: THREE.Group, color: string) {

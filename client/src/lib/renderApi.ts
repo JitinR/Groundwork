@@ -17,11 +17,17 @@ export interface RenderCapabilities {
 }
 
 export type RenderJobState = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "unconfigured";
+export type RenderSourceKind = "saved-viewport" | "draft-viewport" | "reference" | "unverified";
+export type RenderSourceImage = { base64: string } & (
+  { kind: "saved-viewport" | "draft-viewport"; revision: number } |
+  { kind: "reference"; revision?: never }
+);
 
 export interface RenderJobSummary {
   id: string;
   projectId: string;
   sourceRevision: number;
+  sourceKind: RenderSourceKind;
   currentProjectRevision: number;
   isRevisionCurrent: boolean;
   revisionMismatch: boolean;
@@ -50,6 +56,7 @@ export interface SubmitRenderJobPayload {
   negativePrompt?: string;
   stylePreset?: string;
   sourceRevision: number;
+  sourceKind?: RenderSourceKind;
   sourceImageBase64?: string;
   sourceImageArtifactId?: string;
   parameters?: Record<string, unknown>;
@@ -140,13 +147,13 @@ export async function cancelRenderJob(projectId: string, jobId: string): Promise
   return res.json();
 }
 
-export async function removeRenderHistoryEntry(projectId: string, jobId: string): Promise<void> {
-  const res = await fetch(`/api/projects/${projectId}/renders/${jobId}`, {
+export async function removeRenderHistoryEntry(projectId: string, jobId: string, deleteImages = false): Promise<void> {
+  const res = await fetch(`/api/projects/${projectId}/renders/${jobId}${deleteImages ? "?deleteImages=1" : ""}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
   if (!res.ok) {
-    const errorData = await res.json().catch(() => ({ error: "Failed to remove render attempt" }));
+    const errorData = await res.json().catch(() => ({ error: "Failed to remove render" }));
     throw new Error(errorData.error || `HTTP ${res.status}`);
   }
 }

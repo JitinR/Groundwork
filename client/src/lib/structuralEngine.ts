@@ -1,7 +1,8 @@
-import type { CommunityDesign, DraftElement, StructuralLoadCombination } from "../types";
+import type { CommunityDesign, StructuralLoadCombination } from "../types";
 import { structuralSettings } from "./structural";
 import { engineeringExchangeProvenance } from "./exchangeProvenance";
 import type { EngineeringDesignBasis } from "./engineeringBasis";
+import { resolveDraft } from "./parametric";
 
 export type StructuralNodeKind = "grid-intersection" | "column-base" | "column-top";
 export type StructuralMemberKind = "column" | "beam" | "brace" | "wall" | "slab";
@@ -70,19 +71,17 @@ export interface StructuralDesignPackage {
   };
 }
 
-function draftHeight(draft: DraftElement, fallback = 3): number {
-  return Math.max(draft.h ?? fallback, 0.05);
-}
-
 export function buildStructuralFrameModel(design: CommunityDesign): StructuralFrameModel {
-  const levels = (design.levels?.length ? design.levels : [{ id: "ground", name: "Ground", elevation: 0, floorHeight: 3.2 }])
-    .map((level) => ({ id: level.id, elevationM: level.elevation, heightM: level.floorHeight }));
+  const buildingLevels = design.levels?.length ? design.levels : [{ id: "ground", name: "Ground", elevation: 0, floorHeight: 3.2 }];
+  const levels = buildingLevels.map((level) => ({ id: level.id, elevationM: level.elevation, heightM: level.floorHeight }));
   const nodes: StructuralNode[] = [];
   const members: StructuralMember[] = [];
   const warnings: string[] = [];
+  const authoredBeamSpans = new Set<string>();
+  const spanKey = (a: string, b: string) => JSON.stringify(a < b ? [a, b] : [b, a]);
   const nodeIndex = new Map<string, StructuralNode>();
   const addNode = (node: StructuralNode) => {
-    const key = `${node.x.toFixed(4)}|${node.y.toFixed(4)}|${node.z.toFixed(4)}`;
+    const key = [node.x, node.y, node.z].map(value => Math.round(value * 10000)).join("|");
     const existing = nodeIndex.get(key);
     if (existing) return existing;
     nodeIndex.set(key, node);
@@ -98,19 +97,22 @@ export function buildStructuralFrameModel(design: CommunityDesign): StructuralFr
 
   const settings = structuralSettings(design.structural);
   for (const draft of design.drafts ?? []) {
-    if (!["column", "wall", "slab"].includes(draft.kind)) continue;
+    if (draft.kind !== "column" && draft.kind !== "beam" && draft.kind !== "wall" && draft.kind !== "slab") continue;
     const level = levels.find((item) => item.id === draft.family?.levelId) ?? levels[0];
+    const { elevation, height, width, depth } = resolveDraft(draft, buildingLevels);
     if (draft.kind === "column") {
-      const base = addNode({ id: `${draft.id}_base`, x: draft.x, y: level.elevationM + (draft.elevationM ?? 0), z: draft.z, kind: "column-base" });
-      const height = draftHeight(draft, level.heightM);
+      const base = addNode({ id: `${draft.id}_base`, x: draft.x, y: elevation, z: draft.z, kind: "column-base" });
       const top = addNode({ id: `${draft.id}_top`, x: draft.x, y: base.y + height, z: draft.z, kind: "column-top" });
-      members.push({ id: draft.id, kind: "column", startNodeId: base.id, endNodeId: top.id, levelId: level.id, widthM: Math.max(draft.w, 0.1), depthM: Math.max(draft.d, 0.1), lengthM: height, sourceId: draft.id });
+      members.push({ id: draft.id, kind: "column", startNodeId: base.id, endNodeId: top.id, levelId: level.id, widthM: width, depthM: depth, lengthM: height, sourceId: draft.id });
     } else {
       const angle = draft.rotationDeg * Math.PI / 180;
-      const dx = Math.cos(angle) * draft.w / 2, dz = -Math.sin(angle) * draft.w / 2;
-      const start = addNode({ id: `${draft.id}_start`, x: draft.x - dx, y: level.elevationM + (draft.elevationM ?? 0), z: draft.z - dz, kind: "grid-intersection" });
+      const dx = Math.cos(angle) * width / 2, dz = -Math.sin(angle) * width / 2;
+      const start = addNode({ id: `${draft.id}_start`, x: draft.x - dx, y: elevation, z: draft.z - dz, kind: "grid-intersection" });
       const end = addNode({ id: `${draft.id}_end`, x: draft.x + dx, y: start.y, z: draft.z + dz, kind: "grid-intersection" });
-      members.push({ id: draft.id, kind: draft.kind === "wall" ? "wall" : "slab", startNodeId: start.id, endNodeId: end.id, levelId: level.id, widthM: Math.max(draft.kind === "slab" ? draft.d : draft.w, 0.1), depthM: Math.max(draft.kind === "slab" ? (draft.h ?? 0.2) : draft.d, 0.1), lengthM: Math.max(draft.w, 0.1), sourceId: draft.id, tributaryWidthM: Math.max(draft.d, 0.1) });
+      if (draft.kind === "beam") authoredBeamSpans.add(spanKey(start.id, end.id));
+      const sectionWidth = draft.kind === "wall" ? width : depth;
+      const sectionDepth = draft.kind === "wall" ? depth : height;
+      members.push({ id: draft.id, kind: draft.kind, startNodeId: start.id, endNodeId: end.id, levelId: level.id, widthM: sectionWidth, depthM: sectionDepth, lengthM: width, sourceId: draft.id, tributaryWidthM: depth });
     }
   }
 
@@ -125,6 +127,7 @@ export function buildStructuralFrameModel(design: CommunityDesign): StructuralFr
     warnings.push("Columns were inferred from structural-grid intersections because no explicit drafted columns were found.");
   }
   if (gridsX.length && gridsZ.length) {
+    const memberCount = members.length;
     const xs = [...gridsX].sort((a, b) => a.position - b.position), zs = [...gridsZ].sort((a, b) => a.position - b.position);
     const tributary = (lines: { position: number }[], index: number) => {
       const left = index > 0 ? lines[index].position - lines[index - 1].position : 0;
@@ -138,12 +141,13 @@ export function buildStructuralFrameModel(design: CommunityDesign): StructuralFr
         if (lengthM < 1e-6) return;
         const a = addNode({ id: `${id}_a`, x: x1, y, z: z1, kind: "grid-intersection" });
         const b = addNode({ id: `${id}_b`, x: x2, y, z: z2, kind: "grid-intersection" });
+        if (authoredBeamSpans.has(spanKey(a.id, b.id))) return;
         members.push({ id, kind: "beam", startNodeId: a.id, endNodeId: b.id, levelId: level.id, widthM: settings.beamWidthM, depthM: settings.beamDepthM, lengthM, tributaryWidthM });
       };
       for (const [index, z] of zs.entries()) for (let i = 1; i < xs.length; i++) addBeam(`beam-x-${level.id}-${xs[i - 1].id}-${xs[i].id}-${z.id}`, xs[i - 1].position, z.position, xs[i].position, z.position, tributary(zs, index));
       for (const [index, x] of xs.entries()) for (let i = 1; i < zs.length; i++) addBeam(`beam-z-${level.id}-${zs[i - 1].id}-${zs[i].id}-${x.id}`, x.position, zs[i - 1].position, x.position, zs[i].position, tributary(xs, index));
     }
-    warnings.push("Grid beams are inferred; joint connectivity, releases and tributary loading require engineer verification.");
+    if (members.length > memberCount) warnings.push("Grid beams are inferred; joint connectivity, releases and tributary loading require engineer verification.");
   }
   if (!members.length) warnings.push("No structural framing geometry is available. Add grid lines or drafted structural elements.");
   return { nodes, members, levels, warnings };

@@ -5,7 +5,18 @@ import { defaultCommunity } from "../src/lib/community";
 import { buildInfraScene, computeInfraTakeoff, defaultInfra, infraExtent, normalizeInfra } from "../src/lib/infra";
 import { communityAtSite, createSiteReference, infraAtSite, siteLocationValue, siteMeasuresInUnit, siteReferenceFields, type SiteReferenceInput } from "../src/lib/siteLocation";
 import { boundaryMetrics, haversine, localToLatLng, toLocalMetres } from "../src/lib/geo";
+import { analyzeCivilAlignment } from "../src/lib/civil";
 import type { AirportDesign, InfraDesign, SiteLocation } from "../src/types";
+
+test("civil chainage and the inverse projection stay local across the date line", () => {
+  const route = [{ lat: 0, lng: 179.999 }, { lat: 0, lng: -179.999 }];
+  const study = analyzeCivilAlignment({ ...defaultInfra("highway"), location: { ...route[0], route } });
+  const distance = haversine(route[0], route[1]);
+  assert(Math.abs(study.lengthM - distance) < .001);
+  const local = toLocalMetres(route[1], route[0]);
+  assert(Math.abs(local.x - distance) < .001);
+  assert(Math.abs(localToLatLng(local.x, local.y, route[0]).lng - route[1].lng) < 1e-9);
+});
 
 test("one community site replacement preserves new coordinates and measured dimensions in every display unit", () => {
   const location: SiteLocation = { lat: 0, lng: 0, boundaryWidthM: 30.48, boundaryDepthM: 60.96, boundaryRotationDeg: 27 };
@@ -64,12 +75,20 @@ test("polygon references derive their own centre, true area and short-side orien
 });
 
 test("invalid measured inputs reject instead of substituting defaults or returning unusable geometry", () => {
-  for (const patch of [{ latitude: "" }, { latitude: "91" }, { longitude: "181" }, { width: "0" }, { depth: "-1" }, { rotation: "NaN" }, { latitude: "90" }, { longitude: "180" }]) {
+  for (const patch of [{ latitude: "" }, { latitude: "91" }, { longitude: "181" }, { width: "0" }, { width: "90000000" }, { depth: "-1" }, { rotation: "NaN" }, { latitude: "90" }]) {
     assert.throws(() => createSiteReference({ ...measured, ...patch }));
   }
   for (const polygon of ["", "0,0\n0,1", "0,0\n91,1\n1,1", "0,0\n0,0\n0,0", "0,0,extra\n0,1\n1,1"]) {
     assert.throws(() => createSiteReference({ ...measured, shape: "polygon", polygon }));
   }
+});
+
+test("a valid measured site can straddle the international date line", () => {
+  const { location } = createSiteReference({ ...measured, longitude: "180" });
+  const boundary = location.boundary!;
+  assert(boundary.some(point => point.lng < 0) && boundary.some(point => point.lng > 0));
+  assert(Math.abs(haversine(boundary[0], boundary[1]) - 80) < .001);
+  assert.equal(boundaryMetrics(boundary)!.areaM2, 4800);
 });
 
 test("corridor bearing uses compass direction of the long axis", () => {

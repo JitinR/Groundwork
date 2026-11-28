@@ -1,5 +1,5 @@
 import type { Design } from "../types";
-import { catalogEntry } from "./catalog";
+import { catalogEntry, roomFurniturePose, ROOM_WALL_THICKNESS_MM } from "./catalog";
 import * as THREE from "three";
 import { cadLevels, cadObjects } from "./cadModel";
 import { cadMep, cadNetworkState } from "./cadNetworks";
@@ -15,11 +15,10 @@ function hexToRgbFloat(hex: string): [number, number, number] {
   return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
 }
 
-export function buildObjMtl(design: Design): { obj: string; mtl: string } {
+export function buildObjMtl(design: Design, materialLibraryName = "design.mtl"): { obj: string; mtl: string } {
   const { widthMm: W, depthMm: D, wallHeightMm: H } = design.room;
-  const obj: string[] = [];
+  const obj = [`mtllib ${materialLibraryName}`];
   const mtl: string[] = [];
-  let base = 0;
   let nextBase = 0;
 
   const addBox = (
@@ -31,6 +30,7 @@ export function buildObjMtl(design: Design): { obj: string; mtl: string } {
     w: number,
     d: number,
     h: number,
+    rotationY = 0,
   ) => {
     const rgb = hexToRgbFloat(color);
     const matName = label;
@@ -43,23 +43,21 @@ export function buildObjMtl(design: Design): { obj: string; mtl: string } {
     );
     obj.push(`o ${label}`, `usemtl ${matName}`);
     const hw = w / 2, hd = d / 2, hh = h / 2;
-    const minX = cx - hw, minY = cy - hh, minZ = cz - hd;
-    const maxX = cx + hw, maxY = cy + hh, maxZ = cz + hd;
     const pts = [
-      [minX, minY, minZ], [maxX, minY, minZ], [maxX, minY, maxZ], [minX, minY, maxZ],
-      [minX, maxY, minZ], [maxX, maxY, minZ], [maxX, maxY, maxZ], [minX, maxY, maxZ],
+      [-hw, -hh, -hd], [hw, -hh, -hd], [hw, -hh, hd], [-hw, -hh, hd],
+      [-hw, hh, -hd], [hw, hh, -hd], [hw, hh, hd], [-hw, hh, hd],
     ];
-    base = nextBase;
-    for (const p of pts) obj.push(`v ${m(p[0])} ${m(p[1])} ${m(p[2])}`);
+    const base = nextBase, c = Math.cos(rotationY), s = Math.sin(rotationY);
+    for (const [x, y, z] of pts) obj.push(`v ${m(cx + x * c + z * s)} ${m(cy + y)} ${m(cz - x * s + z * c)}`);
     nextBase += 8;
     /* Bottom, top, and 4 sides as quads */
     const faces = [
       [0, 1, 2, 3],
-      [4, 5, 6, 7],
-      [0, 1, 5, 4],
-      [1, 2, 6, 5],
-      [2, 3, 7, 6],
-      [3, 0, 4, 7],
+      [4, 7, 6, 5],
+      [0, 4, 5, 1],
+      [1, 5, 6, 2],
+      [2, 6, 7, 3],
+      [3, 7, 4, 0],
     ];
     for (const f of faces) {
       obj.push(`f ${f.map((i) => base + i + 1).join(" ")}`);
@@ -67,24 +65,26 @@ export function buildObjMtl(design: Design): { obj: string; mtl: string } {
   };
 
   /* Floor plate */
-  addBox("floor", design.room.floorColor, W / 2, 0, D / 2, W, D, 20);
-  /* Two visible walls (north +X, east +Z) */
-  addBox("wall_north", design.room.wallColor, W / 2, H / 2, 0, W, 100, H);
-  addBox("wall_east", design.room.wallColor, 0, H / 2, D / 2, 100, D, H);
+  addBox("floor", design.room.floorColor, 0, -10, 0, W, D, 20);
+  /* Two visible walls (north +Z, east +X) */
+  addBox("wall_north", design.room.wallColor, 0, H / 2, D / 2, W, ROOM_WALL_THICKNESS_MM, H);
+  addBox("wall_east", design.room.wallColor, W / 2, H / 2, 0, ROOM_WALL_THICKNESS_MM, D, H);
 
   /* Furniture as footprint boxes (plan-level fidelity) */
   for (const item of design.furniture) {
     const entry = catalogEntry(item.type);
     if (!entry) continue;
+    const pose = roomFurniturePose(item, design.room);
     addBox(
       `item_${item.id.slice(0, 6)}`,
       item.color,
-      item.x,
-      (entry.h * item.scale) / 2,
-      item.z,
+      pose.xMm,
+      pose.yMm + (entry.h * item.scale) / 2,
+      pose.zMm,
       entry.w * item.scale,
       entry.d * item.scale,
       entry.h * item.scale,
+      pose.rotationY,
     );
   }
 

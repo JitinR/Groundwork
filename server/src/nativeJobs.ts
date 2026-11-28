@@ -163,6 +163,7 @@ async function audit(access: ProjectAccess, userId: string, action: string, deta
 export async function listNativeJobs(projectId: string, actor: WorkspaceActor) {
     return await withTransaction(async () => {
         const { project } = await authorize(projectId, actor);
+        await reconcileExpiredNativeJobs(now(), projectId);
         const rows = await db.prepare("SELECT * FROM project_native_jobs WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT ?").all(projectId, MAX_PROJECT_JOBS) as unknown as JobRow[];
         const jobs: NativeJob[] = [];
         for (const row of rows)
@@ -171,7 +172,10 @@ export async function listNativeJobs(projectId: string, actor: WorkspaceActor) {
     });
 }
 export async function readNativeJob(projectId: string, jobId: string, actor: WorkspaceActor): Promise<NativeJob> {
-    return await withTransaction(async () => { await authorize(projectId, actor); return await metadata(await jobRow(projectId, jobId)); });
+    return await withTransaction(async () => {
+        await authorize(projectId, actor);
+        return await metadata(await refreshNativeJob(projectId, jobId));
+    });
 }
 export async function submitNativeJob(projectId: string, actor: WorkspaceActor, input: JobSubmission): Promise<NativeJob> {
     return await withTransaction(async () => {
@@ -181,7 +185,7 @@ export async function submitNativeJob(projectId: string, actor: WorkspaceActor, 
         if (previous) {
             if (previous.request_hash !== requestHash)
                 throw new WorkspaceError(409, "Retry key belongs to another job request", "IDEMPOTENCY_CONFLICT");
-            return await metadata(previous);
+            return await metadata(await refreshNativeJob(projectId, previous.id));
         }
         if (!nativeJobCapabilities(projectId).find(item => item.kind === input.kind)?.available)
             throw new WorkspaceError(503, "Native runtime or isolation is not configured. Review native job capabilities.", "NATIVE_UNAVAILABLE");
@@ -208,6 +212,7 @@ export async function submitNativeJob(projectId: string, actor: WorkspaceActor, 
             if (!referenced)
                 throw new WorkspaceError(409, "Input is not bound to the declared saved workspace revision", "WORKSPACE_SOURCE_CONFLICT");
         }
+        await reconcileExpiredNativeJobs(now());
         const capacity = await db.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN state IN ('queued','running') THEN 1 ELSE 0 END) AS active FROM project_native_jobs WHERE project_id=?").get(projectId) as {
             total: number;
             active: number | null;
@@ -226,7 +231,7 @@ export async function submitNativeJob(projectId: string, actor: WorkspaceActor, 
 }
 export async function cancelNativeJob(projectId: string, jobId: string, actor: WorkspaceActor): Promise<NativeJob> {
     return await withTransaction(async () => {
-        const { access } = await authorize(projectId, actor, true), row = await jobRow(projectId, jobId);
+        const { access } = await authorize(projectId, actor, true), row = await refreshNativeJob(projectId, jobId);
         if (row.state === "queued")
             await db.prepare("UPDATE project_native_jobs SET state='cancelled',cancel_requested=1,updated_at=? WHERE id=? AND state='queued'").run(now(), jobId);
         else if (row.state === "running")
@@ -237,7 +242,7 @@ export async function cancelNativeJob(projectId: string, jobId: string, actor: W
 }
 export async function deleteNativeJob(projectId: string, jobId: string, actor: WorkspaceActor): Promise<void> {
     await withTransaction(async () => {
-        const { access } = await authorize(projectId, actor, true), row = await jobRow(projectId, jobId);
+        const { access } = await authorize(projectId, actor, true), row = await refreshNativeJob(projectId, jobId);
         if (row.state === "running" || row.state === "queued")
             throw new WorkspaceError(409, "Cancel the job and wait for a terminal state before removing its record", "JOB_ACTIVE");
         await db.prepare("DELETE FROM project_native_jobs WHERE id=? AND project_id=?").run(jobId, projectId);
@@ -258,7 +263,42 @@ async function terminal(row: JobRow, state: "failed" | "cancelled", code: string
     await db.prepare("UPDATE project_native_jobs SET state=?,error_code=?,error_message=?,claim_token=NULL,claim_until=0,updated_at=? WHERE id=?")
         .run(state, code, message, now(), row.id);
 }
-/** Lease recovery and claim share the database's serialized write transaction. */
+
+/** Reconcile in the caller's transaction so status, worker fencing and
+ * capacity can advance even when the last worker has stopped. */
+async function reconcileNativeJob(row: JobRow, timestamp: number): Promise<boolean> {
+    const deadlineExpired = row.expires_at <= timestamp;
+    const leaseExpired = row.claim_until <= timestamp;
+    if (row.state === "queued" && (row.cancel_requested || deadlineExpired)) {
+        await terminal(row, row.cancel_requested ? "cancelled" : "failed", row.cancel_requested ? "CANCELLED" : "QUEUE_EXPIRED",
+            row.cancel_requested ? "Job was cancelled" : "Job exceeded its queue deadline");
+        return true;
+    }
+    if (row.state !== "running" || (!leaseExpired && !deadlineExpired))
+        return false;
+    if (row.cancel_requested)
+        await terminal(row, "cancelled", "CANCELLED", "Job was cancelled");
+    else if (deadlineExpired)
+        await terminal(row, "failed", "JOB_DEADLINE_EXCEEDED", "Job exceeded its overall deadline");
+    else if (row.attempts >= 2)
+        await terminal(row, "failed", "LEASE_EXPIRED", "Worker lease expired before completion");
+    else
+        await db.prepare("UPDATE project_native_jobs SET state='queued',claim_token=NULL,claim_until=0,updated_at=? WHERE id=?").run(timestamp, row.id);
+    return true;
+}
+async function refreshNativeJob(projectId: string, jobId: string): Promise<JobRow> {
+    const row = await jobRow(projectId, jobId);
+    return await reconcileNativeJob(row, now()) ? await jobRow(projectId, jobId) : row;
+}
+async function reconcileExpiredNativeJobs(timestamp: number, projectId?: string): Promise<void> {
+    const rows = await db.prepare(`SELECT * FROM project_native_jobs
+        WHERE ((state='running' AND (claim_until<=? OR expires_at<=?))
+            OR (state='queued' AND (cancel_requested=1 OR expires_at<=?)))
+        ${projectId === undefined ? "" : "AND project_id=?"} LIMIT 64`)
+        .all(timestamp, timestamp, timestamp, ...(projectId === undefined ? [] : [projectId])) as unknown as JobRow[];
+    for (const row of rows) await reconcileNativeJob(row, timestamp);
+}
+
 export async function claimNativeJob(scope?: NativeJobClaimScope): Promise<NativeJobClaim | null> {
     const scoped = scope === undefined ? undefined : z.object({
         projectIds: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,120}$/)).min(1).max(128),
@@ -266,15 +306,7 @@ export async function claimNativeJob(scope?: NativeJobClaimScope): Promise<Nativ
     }).strict().parse(scope);
     return await withTransaction(async () => {
         const timestamp = now();
-        const stale = await db.prepare("SELECT * FROM project_native_jobs WHERE state='running' AND claim_until<=? LIMIT 64").all(timestamp) as unknown as JobRow[];
-        for (const row of stale) {
-            if (row.cancel_requested)
-                await terminal(row, "cancelled", "CANCELLED", "Job was cancelled");
-            else if (row.attempts >= 2 || row.expires_at <= timestamp)
-                await terminal(row, "failed", "LEASE_EXPIRED", "Worker lease expired before completion");
-            else
-                await db.prepare("UPDATE project_native_jobs SET state='queued',claim_token=NULL,claim_until=0,updated_at=? WHERE id=?").run(timestamp, row.id);
-        }
+        await reconcileExpiredNativeJobs(timestamp);
         const running = await db.prepare("SELECT COUNT(*) AS count FROM project_native_jobs WHERE state='running'").get() as {
             count: number;
         };
@@ -286,10 +318,7 @@ export async function claimNativeJob(scope?: NativeJobClaimScope): Promise<Nativ
             ? await db.prepare(`SELECT * FROM project_native_jobs WHERE state='queued' AND project_id IN (${scoped.projectIds.map(() => "?").join(",")}) AND kind IN (${scoped.kinds.map(() => "?").join(",")}) ORDER BY created_at,id LIMIT 64`).all(...scoped.projectIds, ...scoped.kinds) as unknown as JobRow[]
             : await db.prepare("SELECT * FROM project_native_jobs WHERE state='queued' ORDER BY created_at,id LIMIT 64").all() as unknown as JobRow[];
         for (const row of queued) {
-            if (row.cancel_requested || row.expires_at <= timestamp) {
-                await terminal(row, row.cancel_requested ? "cancelled" : "failed", row.cancel_requested ? "CANCELLED" : "QUEUE_EXPIRED", row.cancel_requested ? "Job was cancelled" : "Job exceeded its queue deadline");
-                continue;
-            }
+            if (await reconcileNativeJob(row, timestamp)) continue;
             const actor = { userId: row.created_by, sessionId: row.session_id };
             try {
                 await authorize(row.project_id, actor, true);

@@ -619,6 +619,13 @@ export function confirmDemoPayment(paymentId: string) {
   });
 }
 
+export function completePayPalPayment(paymentId: string, providerOrderId: string) {
+  return request<{ ok: boolean }>("/api/payments/paypal-capture", {
+    method: "POST",
+    body: JSON.stringify({ paymentId, providerOrderId }),
+  });
+}
+
 export function getPayment(id: string): Promise<{ payment: PaymentRecord }> {
   return request<{ payment: PaymentRecord }>(`/api/payments/${id}`, { method: "GET" });
 }

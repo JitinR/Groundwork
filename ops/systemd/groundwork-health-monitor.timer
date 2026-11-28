@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Groundwork external health probe every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:03,18,33,48:00 UTC
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

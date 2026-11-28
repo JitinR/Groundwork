@@ -7,15 +7,13 @@ import { ARButton } from "three/examples/jsm/webxr/ARButton.js";
 import { VRButton } from "three/examples/jsm/webxr/VRButton.js";
 import type { Design, FurnitureItem } from "../types";
 import { addTechnicalEdges } from "../lib/modelcore";
-import { buildFurniture, catalogEntry, furnitureMount } from "../lib/catalog";
+import { buildFurniture, furnitureMount, roomFurniturePose, ROOM_WALL_THICKNESS_MM as WALL_THICKNESS } from "../lib/catalog";
 import { buildMepScene } from "../lib/mep";
 import { phaseVisible, visualizationSettings } from "../lib/visualization";
 import { createPresentationController, type PresentationApi } from "../lib/presentation";
 import { ViewportGizmo3D } from "../components/ViewportGizmo3D";
 
 const MM = 0.001;
-const WALL_THICKNESS = 120;
-
 export interface EditorApi extends PresentationApi {
   resetView(): void;
   topView(): void;
@@ -703,24 +701,7 @@ export function Canvas3D({
             o.receiveShadow = true;
           }
         });
-        const mount = item.mount ?? furnitureMount(item.type);
-        const room = designRef.current.room;
-        const itemHeight = (catalogEntry(item.type)?.h ?? 0) * MM * item.scale;
-        const wall = item.mountWall ?? "north";
-        const halfW = room.widthMm * MM / 2;
-        const halfD = room.depthMm * MM / 2;
-        if (mount === "ceiling") {
-          group.position.set(item.x * MM, item.mountHeightM ?? Math.max(room.wallHeightMm * MM - itemHeight, 0.2), item.z * MM);
-        } else if (mount === "wall") {
-          const y = item.mountHeightM ?? Math.max(room.wallHeightMm * MM - itemHeight - 0.25, 0.3);
-          if (wall === "north") group.position.set(item.x * MM, y, halfD - 0.16);
-          if (wall === "south") group.position.set(item.x * MM, y, -halfD + 0.16);
-          if (wall === "east") group.position.set(halfW - 0.16, y, item.z * MM);
-          if (wall === "west") group.position.set(-halfW + 0.16, y, item.z * MM);
-        } else {
-          group.position.set(item.x * MM, 0, item.z * MM);
-        }
-        group.rotation.y = (item.rotationDeg * Math.PI) / 180 + (mount === "wall" && (wall === "east" || wall === "west") ? Math.PI / 2 : 0);
+        groupSync(group, item, sig, design.room);
         scene.add(group);
         rec = { group, sig };
         itemGroups.current.set(item.id, rec);
@@ -791,23 +772,9 @@ export function Canvas3D({
 }
 
 function groupSync(group: THREE.Group, item: FurnitureItem, sig: string, room: Design["room"]) {
-  const mount = item.mount ?? furnitureMount(item.type);
-  const wall = item.mountWall ?? "north";
-  const itemHeight = (catalogEntry(item.type)?.h ?? 0) * MM * item.scale;
-  const halfW = room.widthMm * MM / 2;
-  const halfD = room.depthMm * MM / 2;
-  if (mount === "ceiling") {
-    group.position.set(item.x * MM, item.mountHeightM ?? Math.max(room.wallHeightMm * MM - itemHeight, 0.2), item.z * MM);
-  } else if (mount === "wall") {
-    const y = item.mountHeightM ?? Math.max(room.wallHeightMm * MM - itemHeight - 0.25, 0.3);
-    if (wall === "north") group.position.set(item.x * MM, y, halfD - 0.16);
-    if (wall === "south") group.position.set(item.x * MM, y, -halfD + 0.16);
-    if (wall === "east") group.position.set(halfW - 0.16, y, item.z * MM);
-    if (wall === "west") group.position.set(-halfW + 0.16, y, item.z * MM);
-  } else {
-    group.position.set(item.x * MM, 0, item.z * MM);
-  }
-  group.rotation.y = (item.rotationDeg * Math.PI) / 180 + (mount === "wall" && (wall === "east" || wall === "west") ? Math.PI / 2 : 0);
+  const pose = roomFurniturePose(item, room);
+  group.position.set(pose.xMm * MM, pose.yMm * MM, pose.zMm * MM);
+  group.rotation.y = pose.rotationY;
   group.userData.sig = sig;
 }
 
